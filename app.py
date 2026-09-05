@@ -9,36 +9,34 @@ app = Flask(__name__)
 
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
-OPENAI_KEY = os.environ.get('OPENAI_KEY')
+GEMINI_KEY = os.environ.get('GEMINI_KEY') # CHANGED
 SERPAPI_KEY = os.environ.get('SERPAPI_KEY')
 
-ARIA_BOOT = """**A.R.I.A // GIDEON CORE v3.0 ONLINE** ✅
-**JARVIS Protocol Engaged**
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v3.1 ONLINE** ✅
+**JARVIS Protocol + Gemini Brain Engaged**
 
 [SYSTEM ONLINE]
-> `Neural Net`: OpenAI GPT-4o Connected
+> `Neural Net`: Google Gemini 1.5 Flash Connected
 > `Research Core`: SerpAPI + Google Live
 > `Memory`: GIDEON Logging Active
-> `Voice`: Conversational Mode: ON
+> `Cost`: FREE TIER ACTIVE
 
-**A.R.I.A**: "Good evening, Commander. All systems nominal. How may I assist you?" 🫡"""
+**A.R.I.A**: "Good evening, Commander. Gemini systems online. How may I assist you?" 🫡"""
 
-def ask_openai(prompt):
-    if not OPENAI_KEY:
-        return "Sir, OPENAI_KEY not set in Render Environment."
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+def ask_gemini(prompt):
+    if not GEMINI_KEY:
+        return "Sir, GEMINI_KEY not set in Render Environment."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
+    headers = {"Content-Type": "application/json"}
     data = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief."},
-                     {"role": "user", "content": prompt}],
-        "max_tokens": 300
+        "contents": [{"parts": [{"text": f"You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. User: {prompt}"}]}],
+        "generationConfig": {"maxOutputTokens": 300}
     }
     try:
         r = requests.post(url, headers=headers, json=data)
-        return r.json()['choices'][0]['message']['content']
-    except:
-        return "Sir, my neural link to OpenAI is down."
+        return r.json()['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        return f"Sir, Gemini neural link failed: {str(e)}"
 
 def google_search(query):
     if not SERPAPI_KEY:
@@ -59,7 +57,7 @@ def handle_message(message, sender):
     if message_lower == "aria":
         return ARIA_BOOT
     elif "status" in message_lower:
-        return "**ARIA SYSTEM STATUS:**\n`aria` - Boot Jarvis\n`status` - Show commands\n`search <query>` - Real Google Search\nOr just talk to me naturally 😎"
+        return "**ARIA SYSTEM STATUS:**\n`aria` - Boot Jarvis\n`status` - Commands\n`search <query>` - Google\nOr just talk to me naturally 😎"
     elif message_lower.startswith("search "):
         query = message.replace("search ", "")
         return google_search(query)
@@ -67,9 +65,9 @@ def handle_message(message, sender):
         lagos_time = datetime.datetime.now().strftime("%I:%M %p")
         return f"It's {lagos_time} in Lagos, Commander ⏰"
     elif "joke" in message_lower:
-        return "Why don't robots get tired? Because they have backup! 😂"
+        return "Why don't AI's get cold? They have too many fans! 😂"
     else:
-        return ask_openai(message)
+        return ask_gemini(message) # CHANGED
 
 def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
