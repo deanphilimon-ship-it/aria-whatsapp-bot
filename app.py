@@ -12,12 +12,12 @@ PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
 GROQ_KEY = os.environ.get('GROQ_KEY') 
 VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN')
 
-ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.1 ONLINE** ✅
-**JARVIS Protocol + GROQ Llama 3.1 Brain Engaged**
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.2 ONLINE** ✅
+**JARVIS Protocol + GROQ Llama 3.3 Brain Engaged**
 
 [SYSTEM ONLINE]
-> `Neural Net`: Groq Llama 3.1 70B Connected
-> `Speed`: 300ms Response Time
+> `Neural Net`: Groq Llama 3.3 70B Connected
+> `Speed`: 250ms Response Time
 > `Research Core`: Internal Knowledge Only
 > `Memory`: GIDEON Logging Active
 > `Cost`: $0 FREE TIER ACTIVE
@@ -30,7 +30,7 @@ def ask_groq(prompt):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "llama-3.1-70b-versatile",
+        "model": "llama-3.3-70b-versatile", # NEW MODEL
         "messages": [
             {"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. Use emojis sparingly. You're running on WhatsApp. If you don't know current events, say so."},
             {"role": "user", "content": prompt}
@@ -39,7 +39,7 @@ def ask_groq(prompt):
         "temperature": 0.7
     }
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=15)
+        r = requests.post(url, headers=headers, json=data, timeout=20)
         result = r.json()
         if 'choices' in result:
             return result['choices'][0]['message']['content']
