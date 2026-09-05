@@ -9,18 +9,18 @@ app = Flask(__name__)
 
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
-GROQ_KEY = os.environ.get('GROQ_KEY') # CHANGED
-SERPAPI_KEY = os.environ.get('SERPAPI_KEY')
+GROQ_KEY = os.environ.get('GROQ_KEY') 
+VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN')
 
-ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.0 ONLINE** ✅
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.1 ONLINE** ✅
 **JARVIS Protocol + GROQ Llama 3.1 Brain Engaged**
 
 [SYSTEM ONLINE]
 > `Neural Net`: Groq Llama 3.1 70B Connected
 > `Speed`: 300ms Response Time
-> `Research Core`: SerpAPI + Google Live
+> `Research Core`: Internal Knowledge Only
 > `Memory`: GIDEON Logging Active
-> `Cost`: FREE TIER ACTIVE
+> `Cost`: $0 FREE TIER ACTIVE
 
 **A.R.I.A**: "Good evening, Commander. Groq systems online. How may I assist you?" 🫡"""
 
@@ -32,30 +32,21 @@ def ask_groq(prompt):
     data = {
         "model": "llama-3.1-70b-versatile",
         "messages": [
-            {"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. Use emojis sparingly."},
+            {"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. Use emojis sparingly. You're running on WhatsApp. If you don't know current events, say so."},
             {"role": "user", "content": prompt}
         ],
-        "max_tokens": 300,
+        "max_tokens": 400,
         "temperature": 0.7
     }
     try:
-        r = requests.post(url, headers=headers, json=data)
-        return r.json()['choices'][0]['message']['content']
+        r = requests.post(url, headers=headers, json=data, timeout=15)
+        result = r.json()
+        if 'choices' in result:
+            return result['choices'][0]['message']['content']
+        else:
+            return f"Sir, Groq error: {result}"
     except Exception as e:
         return f"Sir, Groq neural link failed: {str(e)}"
-
-def google_search(query):
-    if not SERPAPI_KEY:
-        return "Sir, SERPAPI_KEY not set. Add it to Render to enable search."
-    url = f"https://serpapi.com/search.json?q={query}&api_key={SERPAPI_KEY}"
-    try:
-        r = requests.get(url).json()
-        if 'organic_results' in r:
-            top = r['organic_results'][0]
-            return f"🔍 [GIDEON RESEARCH] {top['title']}\n{top['snippet']}\nLink: {top['link']}"
-        return "No results found, Commander."
-    except:
-        return "Sir, SerpAPI connection failed."
 
 def handle_message(message, sender):
     message_lower = message.lower().strip()
@@ -63,17 +54,19 @@ def handle_message(message, sender):
     if message_lower == "aria":
         return ARIA_BOOT
     elif "status" in message_lower:
-        return "**ARIA SYSTEM STATUS:**\n`aria` - Boot Jarvis\n`status` - Commands\n`search <query>` - Google\nOr just talk to me naturally 😎"
-    elif message_lower.startswith("search "):
-        query = message.replace("search ", "")
-        return google_search(query)
+        return "**ARIA SYSTEM STATUS:**\n`aria` - Boot Jarvis\n`status` - Commands\n`time` - Lagos Time\n`joke` - Tell joke\nOr just talk to me naturally 😎"
     elif "time" in message_lower:
         lagos_time = datetime.datetime.now().strftime("%I:%M %p")
         return f"It's {lagos_time} in Lagos, Commander ⏰"
     elif "joke" in message_lower:
-        return "Why did the AI break up with the database? It had too many commitments! 😂"
+        jokes = [
+            "Why did the AI break up with the database? It had too many commitments! 😂",
+            "I told my computer I needed a break. Now it won't stop sending me KitKat ads.",
+            "What do you call an AI that sings? A Dell."
+        ]
+        return random.choice(jokes)
     else:
-        return ask_groq(message) # CHANGED
+        return ask_groq(message)
 
 def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
@@ -84,8 +77,7 @@ def send_whatsapp_message(to, message):
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
-        verify_token = os.environ.get('VERIFY_TOKEN')
-        if request.args.get('hub.verify_token') == verify_token:
+        if request.args.get('hub.verify_token') == VERIFY_TOKEN:
             return request.args.get('hub.challenge')
         return "Verification failed"
     
@@ -98,7 +90,7 @@ def webhook():
             response = handle_message(text, sender)
             send_whatsapp_message(sender, response)
         except Exception as e:
-            print(e)
+            print(f"Error: {e}")
         return "OK"
 
 if __name__ == '__main__':
