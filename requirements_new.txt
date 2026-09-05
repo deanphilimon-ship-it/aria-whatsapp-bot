@@ -1,0 +1,5 @@
+flask==3.0.2
+requests==2.31.0
+yt-dlp==2024.9.2
+python-dotenv==1.0.1
+gunicorn==21.2.0
