@@ -9,32 +9,126 @@ app = Flask(__name__)
 
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
+OPENAI_KEY = os.environ.get('OPENAI_KEY') # ADD THIS TO RENDER ENV
+SERPAPI_KEY = os.environ.get('SERPAPI_KEY') # ADD THIS TO RENDER ENV
 
 # ============================================
-# ARIA SYSTEM BOOT
+# ARIA SYSTEM BOOT - JARVIS PERSONALITY
 # ============================================
-ARIA_BOOT = """**A.R.I.A // SYSTEM BOOT COMPLETE** ✅
-**COMMANDER_PROFILE.log v2.4 → LOADED**
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v3.0 ONLINE** ✅
+**JARVIS Protocol Engaged**
 
 [SYSTEM ONLINE]
-> `Tactical Architect OS v2.4` initialized 
-> `Palette Lock`: CYAN #00FFFF + SCARLET #FF2400 + GREY #808080 
-> `Active Window`: All day everyday 
-> `Sub-Module GIDEON`: Memory + Timeline Logging → **Synced**
+> `Neural Net`: OpenAI GPT-4o Connected
+> `Research Core`: SerpAPI + Google Live
+> `Memory`: GIDEON Logging Active
+> `Voice`: Conversational Mode: ON
 
-[MODE SELECT]
-`RESEARCH` | `ENTERTAINMENT` | `STANDBY` | `LORE BUILD`
-> Current Mode: **AWAITING COMMAND**
+**A.R.I.A**: "Good evening, Commander. All systems nominal. How may I assist you?" 🫡"""
 
-[STATUS]
-`Metacog Audit`: 10/10 
-`SPEED RUN`: Deployed 
-`GIDEON`: Synced 
+# ============================================
+# API FUNCTIONS
+# ============================================
+def ask_openai(prompt):
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
+    data = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief."},
+                     {"role": "user", "content": prompt}],
+        "max_tokens": 300
+    }
+    try:
+        r = requests.post(url, headers=headers, json=data)
+        return r.json()['choices'][0]['message']['content']
+    except:
+        return "Sir, my neural link to OpenAI is down. Please check OPENAI_KEY."
 
----
-**A.R.I.A**: "Commander. System nominal. Awaiting orders."
+def google_search(query):
+    url = f"https://serpapi.com/search.json?q={query}&api_key={SERPAPI_KEY}"
+    try:
+        r = requests.get(url).json()
+        if 'organic_results' in r:
+            top = r['organic_results'][0]
+            return f"🔍 [GIDEON RESEARCH] {top['title']}\n{top['snippet']}\nLink: {top['link']}"
+        return "No results found, Commander."
+    except:
+        return "Sir, SerpAPI connection failed. Check SERPAPI_KEY."
 
-What mode are we running tonight? 
+# ============================================
+# MESSAGE HANDLER - CONVERSATIONAL
+# ============================================
+def handle_message(message, sender):
+    message_lower = message.lower().strip()
+    
+    # COMMANDS
+    if message_lower == "aria":
+        return ARIA_BOOT
+    
+    elif "status" in message_lower:
+        return """**ARIA SYSTEM STATUS:**
+`aria` - Boot Jarvis
+`status` - Show commands
+`search <query>` - Real Google Search
+`download mp3 <url>` - MP3 Protocol
+`pinterest <query>` - Image Search
+Or just talk to me naturally 😎"""
+    
+    elif message_lower.startswith("search "):
+        query = message.replace("search ", "")
+        return google_search(query)
+    
+    elif message_lower.startswith("download mp3 "):
+        url = message.replace("download mp3 ", "")
+        return f"⬇️ [MP3 PROTOCOL] Received: `{url}`\nNote: Add yt-dlp API to convert and send audio file."
+    
+    elif message_lower.startswith("pinterest "):
+        query = message.replace("pinterest ", "")
+        return f"📌 [PINTEREST SCAN] Searching: `{query}`\nNote: Add Pinterest API key to fetch real images."
+    
+    elif "time" in message_lower:
+        lagos_time = datetime.datetime.now().strftime("%I:%M %p")
+        return f"It's {lagos_time} in Lagos, Commander ⏰"
+    
+    elif "joke" in message_lower:
+        jokes = ["Why don't robots get tired? Because they have backup! 😂"]
+        return random.choice(jokes)
+    
+    # JARVIS CONVERSATIONAL MODE - DEFAULT
+    else:
+        return ask_openai(message)
+
+# ============================================
+# WHATSAPP WEBHOOK
+# ============================================
+def send_whatsapp_message(to, message):
+    url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    data = {"messaging_product": "whatsapp", "to": to, "text": {"body": message}}
+    requests.post(url, headers=headers, json=data)
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def webhook():
+    if request.method == 'GET':
+        verify_token = os.environ.get('VERIFY_TOKEN')
+        if request.args.get('hub.verify_token') == verify_token:
+            return request.args.get('hub.challenge')
+        return "Verification failed"
+    
+    if request.method == 'POST':
+        data = request.get_json()
+        try:
+            message = data['entry'][0]['changes'][0]['value']['messages'][0]
+            sender = message['from']
+            text = message['text']['body']
+            response = handle_message(text, sender)
+            send_whatsapp_message(sender, response)
+        except Exception as e:
+            print(e)
+        return "OK"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=10000)What mode are we running tonight? 
 1. **LORE BUILD** - 
 2. **RESEARCH** - track 
 3. **ENTERTAINMENT** - 
