@@ -12,16 +12,16 @@ PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
 GROQ_KEY = os.environ.get('GROQ_KEY') 
 VERIFY_TOKEN = os.environ.get('VERIFY_TOKEN')
 
-ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.7 ONLINE** ✅
-**JARVIS Protocol + GROQ Llama 3.3 Brain Engaged**
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v5.0 ONLINE** ✅
+**JARVIS Protocol + OPENAI GPT-OSS Brain Engaged**
 
 [SYSTEM ONLINE]
-> `Neural Net`: Groq llama-3.3-70b-versatile Connected
-> `Speed`: 300ms Response Time
+> `Neural Net`: Groq openai/gpt-oss-120b Connected
+> `Speed`: LIGHTSPEED
 > `Memory`: GIDEON Logging Active
 > `Cost`: $0 FREE TIER ACTIVE
 
-**A.R.I.A**: "Good evening, Commander. Systems online. How may I assist you?" 🫡"""
+**A.R.I.A**: "Good evening, Commander. GPT-OSS systems online. How may I assist you?" 🫡"""
 
 def ask_groq(prompt):
     if not GROQ_KEY:
@@ -29,7 +29,7 @@ def ask_groq(prompt):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "llama-3.3-70b-versatile", # LAST ONE STANDING
+        "model": "openai/gpt-oss-120b", # NEW MODEL FROM YOUR SCREENSHOT
         "messages": [
             {"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. Use emojis sparingly. You're running on WhatsApp."},
             {"role": "user", "content": prompt}
