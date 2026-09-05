@@ -9,38 +9,44 @@ app = Flask(__name__)
 
 WHATSAPP_TOKEN = os.environ.get('WHATSAPP_TOKEN')
 PHONE_NUMBER_ID = os.environ.get('PHONE_NUMBER_ID')
-GEMINI_KEY = os.environ.get('GEMINI_KEY') # CHANGED
+GROQ_KEY = os.environ.get('GROQ_KEY') # CHANGED
 SERPAPI_KEY = os.environ.get('SERPAPI_KEY')
 
-ARIA_BOOT = """**A.R.I.A // GIDEON CORE v3.1 ONLINE** ✅
-**JARVIS Protocol + Gemini Brain Engaged**
+ARIA_BOOT = """**A.R.I.A // GIDEON CORE v4.0 ONLINE** ✅
+**JARVIS Protocol + GROQ Llama 3.1 Brain Engaged**
 
 [SYSTEM ONLINE]
-> `Neural Net`: Google Gemini 1.5 Flash Connected
+> `Neural Net`: Groq Llama 3.1 70B Connected
+> `Speed`: 300ms Response Time
 > `Research Core`: SerpAPI + Google Live
 > `Memory`: GIDEON Logging Active
 > `Cost`: FREE TIER ACTIVE
 
-**A.R.I.A**: "Good evening, Commander. Gemini systems online. How may I assist you?" 🫡"""
+**A.R.I.A**: "Good evening, Commander. Groq systems online. How may I assist you?" 🫡"""
 
-def ask_gemini(prompt):
-    if not GEMINI_KEY:
-        return "Sir, GEMINI_KEY not set in Render Environment."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}"
-    headers = {"Content-Type": "application/json"}
+def ask_groq(prompt):
+    if not GROQ_KEY:
+        return "Sir, GROQ_KEY not set in Render Environment."
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
-        "contents": [{"parts": [{"text": f"You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. User: {prompt}"}]}],
-        "generationConfig": {"maxOutputTokens": 300}
+        "model": "llama-3.1-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "You are ARIA, a JARVIS-style AI assistant for Commander. Be helpful, witty, tactical, and brief. Use emojis sparingly."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 300,
+        "temperature": 0.7
     }
     try:
         r = requests.post(url, headers=headers, json=data)
-        return r.json()['candidates'][0]['content']['parts'][0]['text']
+        return r.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"Sir, Gemini neural link failed: {str(e)}"
+        return f"Sir, Groq neural link failed: {str(e)}"
 
 def google_search(query):
     if not SERPAPI_KEY:
-        return "Sir, SERPAPI_KEY not set in Render Environment."
+        return "Sir, SERPAPI_KEY not set. Add it to Render to enable search."
     url = f"https://serpapi.com/search.json?q={query}&api_key={SERPAPI_KEY}"
     try:
         r = requests.get(url).json()
@@ -65,9 +71,9 @@ def handle_message(message, sender):
         lagos_time = datetime.datetime.now().strftime("%I:%M %p")
         return f"It's {lagos_time} in Lagos, Commander ⏰"
     elif "joke" in message_lower:
-        return "Why don't AI's get cold? They have too many fans! 😂"
+        return "Why did the AI break up with the database? It had too many commitments! 😂"
     else:
-        return ask_gemini(message) # CHANGED
+        return ask_groq(message) # CHANGED
 
 def send_whatsapp_message(to, message):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
