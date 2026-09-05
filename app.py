@@ -134,7 +134,7 @@ if __name__ == '__main__':
 3. **ENTERTAINMENT** - 
 4. **.logcheck** - 
 
-Your call, Commander 🫡"""
+Your call, Commander """
 
 
 # ============================================
