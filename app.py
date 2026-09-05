@@ -19,7 +19,7 @@ ARIA_BOOT = """**A.R.I.A // SYSTEM BOOT COMPLETE** ✅
 [SYSTEM ONLINE]
 > `Tactical Architect OS v2.4` initialized 
 > `Palette Lock`: CYAN #00FFFF + SCARLET #FF2400 + GREY #808080 
-> `Active Window`: 20:00 - 03:00 WAT → You’ve got 7 hours 
+> `Active Window`: All day everyday 
 > `Sub-Module GIDEON`: Memory + Timeline Logging → **Synced**
 
 [MODE SELECT]
