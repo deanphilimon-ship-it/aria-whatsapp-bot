@@ -1,7 +1,6 @@
 from flask import Flask, request
 import requests
 import os
-import base64
 import random
 from datetime import datetime
 import pytz
@@ -15,7 +14,6 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-YOUTUBE_KEY = os.getenv("YOUTUBE_KEY") # Add this to Render
 CHAT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "llama-3.2-11b-vision-preview"
 
@@ -41,28 +39,20 @@ def groq_call(prompt, system="You are ARIA. Be helpful and concise. Max 400 word
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
-        return f"AI error: {res.get('error', {}).get('message', 'Unknown')}"
+        return f"AI error"
     except: return "Connection error."
 
-# NEW: VISION FUNCTION
 def groq_vision(image_url, prompt="Describe this image and verify any facts/text in it. Be concise."):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
         "model": VISION_MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": image_url}}
-            ]
-        }],
-        "max_tokens": 500
-    }
+        "messages": [{"role": "user","content": [{"type": "text", "text": prompt},{"type": "image_url", "image_url": {"url": image_url}}]}
+        ],"max_tokens": 500}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=40).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
-        return f"Vision error: {res.get('error', {}).get('message', 'Unknown')}"
+        return f"Vision error"
     except: return "Vision connection error."
 
 def ai_explain(topic, field, from_number):
@@ -89,36 +79,23 @@ def get_unsplash_image(query):
     except: pass
     return None, None
 
-# FIX: MP3 DOWNLOADER WITH 2 FALLBACKS
+# FIX: NO YOUTUBE API KEY NEEDED. USE COBALT DIRECT
 def download_mp3_cobalt(query):
-    # Step 1: Search youtube
-    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={requests.utils.quote(query)}&type=video&key={YOUTUBE_KEY}&maxResults=1"
-    try:
-        search = requests.get(search_url, timeout=10).json()
-        video_id = search['items'][0]['id']['videoId']
-        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-        title = search['items'][0]['snippet']['title']
-    except:
-        return None, "No video found. Add YOUTUBE_KEY to Render"
-    
-    # Step 2: Try Cobalt API
+    youtube_url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
     cobalt_url = "https://api.cobalt.tools/api/json"
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     data = {"url": youtube_url, "isAudioOnly": True, "isMp3": True, "quality": "128"}
     try:
         res = requests.post(cobalt_url, headers=headers, json=data, timeout=20).json()
         if res.get("url"):
-            return res["url"], title
+            return res["url"], query
     except: pass
-    
-    # Step 3: Fallback to SaveTube API
     try:
         savetube = requests.post("https://api.savetube.me/v1/api/convert", json={"url": youtube_url, "format": "mp3"}, timeout=20).json()
         if savetube.get("data", {}).get("downloadUrl"):
-            return savetube["data"]["downloadUrl"], title
+            return savetube["data"]["downloadUrl"], query
     except: pass
-    
-    return None, "All downloaders failed"
+    return None, f"YouTube blocked Sir. Watch here: {youtube_url}"
 
 def get_runtime():
     seconds = int(time.time() - start_time)
@@ -127,7 +104,7 @@ def get_runtime():
 
 def get_menu():
     lt = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
-    return f"""─────〔 *ARIA v9.6* 〕─────
+    return f"""─────〔 *ARIA v9.7* 〕─────
 ◆ *Owner*: Sir
 ◆ *Commands*: 13
 ◆ *Runtime*: {get_runtime()}
@@ -156,7 +133,7 @@ def get_menu():
 『 *TOOLS* 』
 └─ ○.menu
 
-Send image +.verify to test vision Sir."""
+Send image +.describe to test vision Sir."""
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -166,7 +143,7 @@ def webhook():
         msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
         from_number = msg["from"]
         
-        # FIX: REAL IMAGE VISION
+        # FIX: HANDLE IMAGE WITH CAPTION OR REPLY
         if msg.get("type") == "image":
             image_id = msg["image"]["id"]
             caption = msg.get("caption", "").lower()
@@ -175,9 +152,9 @@ def webhook():
             media_info = requests.get(f"https://graph.facebook.com/v20.0/{image_id}", headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).json()
             image_url = media_info.get("url")
             
-            if caption.startswith(".verify") or caption.startswith(".describe"):
+            if "describe" in caption or "verify" in caption:
                 send_text(from_number, "Analyzing image with AI vision...")
-                prompt = "Describe this image in detail. If there is text, read it. If there are facts/claims, verify if they are true or false." if ".verify" in caption else "Describe this image in 4 sentences."
+                prompt = "Describe this image in detail. If there is text, read it. If there are facts/claims, verify if they are true or false." if "verify" in caption else "Describe this image in 4 sentences. What logo is this?"
                 result = groq_vision(image_url, prompt)
                 send_text(from_number, f"〔 *IMAGE ANALYSIS* 〕\n{result}")
                 return "OK", 200
