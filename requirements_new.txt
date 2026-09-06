@@ -3,3 +3,4 @@ requests==2.31.0
 yt-dlp
 python-dotenv==1.0.1
 gunicorn==21.2.0
+ffmpeg-python==0.2.0
