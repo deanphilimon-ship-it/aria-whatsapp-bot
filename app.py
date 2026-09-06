@@ -18,7 +18,7 @@ GROQ_KEY = os.getenv("GROQ_KEY")
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text[:4096]}} # WhatsApp limit
+    data = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text[:4096]}}
     requests.post(url, headers=headers, json=data)
 
 def send_image_url(to, image_url, caption=""):
@@ -39,12 +39,12 @@ def send_audio(to, audio_path):
     requests.post(url, headers=headers, json=data)
     os.remove(audio_path)
 
-# === AI FUNCTIONS - GROQ gpt-oss-120b WITH ERROR HANDLING ===
+# === AI FUNCTIONS - GROQ groq/compound ===
 def groq_call(prompt, system="You are ARIA, a helpful assistant. The user calls you Sir. Be helpful, friendly, and direct."):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "gpt-oss-120b",
+        "model": "groq/compound", # CHANGED TO WORKING MODEL
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt}
@@ -54,11 +54,10 @@ def groq_call(prompt, system="You are ARIA, a helpful assistant. The user calls 
     }
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
-        # PATCH: Check if choices exist before accessing
         if 'choices' in res and len(res['choices']) > 0:
             return res['choices'][0]['message']['content']
         else:
-            print("Groq Full Response:", res) # for logs
+            print("Groq Full Response:", res)
             return f"Sorry Sir, Groq didn't respond. Error: {res.get('error', {}).get('message', 'Unknown')}"
     except Exception as e:
         print("Groq Exception:", e)
@@ -116,11 +115,11 @@ def webhook():
         text = msg["text"]["body"].strip()
         text_lower = text.lower()
         
-        # 1. COMMANDS - CHECK THESE FIRST
+        # 1. COMMANDS
         if text_lower in [".status", "status"]:
             lagos_time = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
-            send_text(from_number, f"""*ARIA SYSTEM STATUS v7.4*
-Powered by: Groq gpt-oss-120b
+            send_text(from_number, f"""*ARIA SYSTEM STATUS v7.5*
+Powered by: Groq groq/compound
 
 aria - Boot Jarvis
 status - Show Commands
@@ -180,7 +179,7 @@ Just chat with me for anything else Sir.""")
                 explanation = ai_explain(topic)
                 send_text(from_number, explanation)
 
-        # 2. DEFAULT: NORMAL CHATBOT - THIS IS THE MAIN FUNCTION NOW
+        # 2. DEFAULT: NORMAL CHATBOT
         else:
             reply = ai_chat(text)
             send_text(from_number, reply)
