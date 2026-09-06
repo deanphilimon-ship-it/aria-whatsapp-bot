@@ -12,7 +12,7 @@ app = Flask(__name__)
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 PINTEREST_TOKEN = os.getenv("PINTEREST_TOKEN")
-GROQ_KEY = os.getenv("GROQ_KEY") # Get from console.groq.com
+GROQ_KEY = os.getenv("GROQ_KEY")
 
 # === SEND FUNCTIONS ===
 def send_text(to, text):
@@ -44,54 +44,57 @@ def groq_call(prompt, system="You are ARIA, a helpful assistant. The user calls 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
-        "model": "gpt-oss-120b", # CHANGED TO THIS MODEL
+        "model": "gpt-oss-120b",
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
-        "max_tokens": 1024
+        "max_tokens": 800 # Reduced to avoid timeout
     }
-    res = requests.post(url, headers=headers, json=data).json()
-    return res['choices'][0]['message']['content']
+    try:
+        res = requests.post(url, headers=headers, json=data, timeout=25).json()
+        return res['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Groq Error: {e}"
 
 def ai_chat(prompt):
     return groq_call(prompt)
 
 def ai_explain(topic):
-    fields = ["Physics", "History", "Biology", "Economics", "Psychology", "Philosophy", "Computer Science"]
-    explanation = f"*Explanation for: {topic}*\n\n"
-    
-    for field in fields:
-        prompt = f"Explain '{topic}' in 2 clear sentences from the perspective of {field}"
-        ans = groq_call(prompt, system="You are an expert educator. Be concise.")
-        explanation += f"*{field}:* {ans}\n\n"
-    
-    explanation += "Reply with `explain <field>` to go deeper into 1 field. Ex: `explain Physics`"
-    return explanation
+    # PATCH: Do 1 call that asks for all 7 fields at once. Faster
+    send_text = "" # placeholder
+    prompt = f"Explain '{topic}' in 2 sentences each from the perspective of: Physics, History, Biology, Economics, Psychology, Philosophy, Computer Science. Format with **Field**: explanation"
+    result = groq_call(prompt, system="You are an expert educator. Be concise and clear.")
+    result += "\n\nReply with `explain <field>` to go deeper into 1 field. Ex: `explain Physics`"
+    return result
 
 def ai_image(prompt):
-    # Groq gpt-oss-120b doesn't do image gen. Using free Pollinations.ai
     safe_prompt = requests.utils.quote(prompt)
     return f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=1024&model=flux"
 
-# === MEDIA FUNCTIONS ===
+# === MEDIA FUNCTIONS - PATCHED ===
 def get_pinterest_image(query):
-    url = f"https://api.pinterest.com/v5/search/pins?query={query}&limit=1"
+    # PATCH: Add aesthetic and try 3 results
+    query = query + " aesthetic"
+    url = f"https://api.pinterest.com/v5/search/pins?query={query}&limit=3"
     headers = {"Authorization": f"Bearer {PINTEREST_TOKEN}"}
-    res = requests.get(url, headers=headers).json()
-    if res.get("items"):
-        pin = res["items"][0]
-        return pin["media"]["images"]["736x"]["url"], pin["link"]
+    try:
+        res = requests.get(url, headers=headers, timeout=10).json()
+        if res.get("items"):
+            pin = res["items"][0]
+            return pin["media"]["images"]["736x"]["url"], pin["link"]
+    except: pass
     return None, None
 
 def download_mp3(query):
+    # PATCH: Stronger anti-bot args
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': 'downloads/%(title)s.%(ext)s',
         'noplaylist': True,
         'quiet': True,
-        'extractor_args': {'youtube': {'player_client': ['android']}},
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
     }
     os.makedirs("downloads", exist_ok=True)
@@ -113,7 +116,7 @@ def webhook():
         # 1. JARVIS COMMANDS
         if text.lower() in [".status", "status"]:
             lagos_time = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
-            send_text(from_number, f"""*ARIA SYSTEM STATUS v7.2*
+            send_text(from_number, f"""*ARIA SYSTEM STATUS v7.3*
 Powered by: Groq gpt-oss-120b
 
 aria - Boot Jarvis
@@ -146,7 +149,7 @@ explain <topic> - 7 field explanation""")
             send_text(from_number, f"Searching Pinterest for: {query}...")
             img_url, pin_url = get_pinterest_image(query)
             if img_url: send_image_url(from_number, img_url, f"Pinterest: {query}\n{pin_url}")
-            else: send_text(from_number, "No pins found. Try different keywords Sir.")
+            else: send_text(from_number, "No pins found. Try: batman art, goth aesthetic, dark wallpaper Sir.")
         
         elif text.lower().startswith(".play"):
             query = text[5:].strip()
@@ -155,7 +158,7 @@ explain <topic> - 7 field explanation""")
                 filepath, title = download_mp3(query)
                 send_audio(from_number, filepath)
             except Exception as e:
-                send_text(from_number, f"Download failed: {e}")
+                send_text(from_number, f"Download failed: {str(e)[:200]}")
 
         # 3. AI IMAGE COMMANDS
         elif text.lower().startswith("imagine") or text.lower().startswith("create"):
@@ -164,15 +167,15 @@ explain <topic> - 7 field explanation""")
             img_url = ai_image(prompt)
             send_image_url(from_number, img_url, f"AI Image: {prompt}")
         
-        # 4. AI EXPLAIN COMMAND
+        # 4. AI EXPLAIN COMMAND - PATCHED
         elif text.lower().startswith("explain"):
             parts = text.split(" ", 1)
             if len(parts) < 2:
                 send_text(from_number, "Usage: explain <topic>\nI will explain from 7 fields of study.")
             else:
                 topic = parts[1]
-                send_text(from_number, "Analyzing from 7 fields... 1 moment Sir")
-                explanation = ai_explain(topic)
+                send_text(from_number, f"Analyzing '{topic}' from 7 fields... 1 moment Sir")
+                explanation = ai_explain(topic) # Now 1 API call instead of 7
                 send_text(from_number, explanation)
 
         # 5. DEFAULT AI CHAT - WORKS WITHOUT COMMAND
@@ -181,7 +184,7 @@ explain <topic> - 7 field explanation""")
             send_text(from_number, reply)
             
     except Exception as e:
-        print(e)
+        print("Webhook Error:", e)
     return "OK", 200
 
 if __name__ == "__main__":
