@@ -6,7 +6,7 @@ import pytz
 import time
 
 app = Flask(__name__)
-VERSION = "v10.6 FINAL"
+VERSION = "v10.7 BULLETPROOF"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -17,27 +17,27 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
 CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "llava-v1.5-7b-4096-preview" # FIXED VISION MODEL
+VISION_MODEL = "llama-3.2-11b-vision-preview" # WORKING VISION
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    # FORCE SPLIT AT 3500 TO BE SAFE UNDER 4096 LIMIT
-    chunks = [text[i:i+3500] for i in range(0, len(text), 3500)] 
+    # SPLIT AT 900 CHARS TO BE 100% SAFE
+    chunks = [text[i:i+900] for i in range(0, len(text), 900)] 
     for i, chunk in enumerate(chunks):
         if len(chunks) > 1: chunk = f"Part {i+1}/{len(chunks)}\n\n{chunk}"
         requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": chunk}})
-        time.sleep(0.5) # Prevent rate limit
+        time.sleep(1.2) # 1.2s delay stops WhatsApp cutoff
 
 def send_image_url(to, image_url, caption=""):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
-def groq_call(prompt, system="You are ARIA. Be detailed. Max 600 words.", model=CHAT_MODEL):
+def groq_call(prompt, system="You are ARIA. Be detailed. Max 800 words.", model=CHAT_MODEL):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:1500]}], "temperature": 0.5, "max_tokens": 800} # BIGGER
+    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:2000]}], "temperature": 0.5, "max_tokens": 1200} # MAX DEPTH
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -48,11 +48,11 @@ def groq_vision(image_url, prompt):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {"model": VISION_MODEL,"messages": [{"role": "user","content": [{"type": "text", "text": prompt},{"type": "image_url", "image_url": {"url": image_url}}]}
-        ],"max_tokens": 300}
+        ],"max_tokens": 400}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=40).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
-        return f"Vision error: {res.get('error', res)}"
+        return f"Vision error: {res.get('error', {}).get('message', res)}"
     except Exception as e: return f"Vision connection error: {e}"
 
 def ai_explain(topic, field_num, from_number):
@@ -64,7 +64,7 @@ def ai_explain(topic, field_num, from_number):
         result = f"〔 *{topic.upper()} - 6 FIELDS* 〕\n\n"
         for i, f in enumerate(fields, 1):
             result += f"{i}. *{f}*\n"
-        result += f"\nReply: `explain {topic} 3` to go deeper into Pharmacology"
+        result += f"\nReply: `explain {topic} 3` for Pharmacology deep dive"
         return result
     else:
         try: idx = int(field_num) - 1
@@ -74,8 +74,8 @@ def ai_explain(topic, field_num, from_number):
             return "Ask `explain psychology` first to see fields"
             
         field = last_explain_fields[from_number][idx]
-        system = "You are a professor. Give 8 detailed bullet points. 3 lines each. No limit."
-        prompt = f"Deep dive into '{topic}' from {field} perspective. Be comprehensive."
+        system = "You are a professor. Give 10 detailed bullet points. Explain like teaching a class."
+        prompt = f"Deep dive into '{topic}' from {field} perspective. Be comprehensive with examples."
         return groq_call(prompt, system=system)
 
 def get_unsplash_image(query):
@@ -94,7 +94,7 @@ def get_youtube_link(query):
     return f"◆ *{query.title()}*\n\nTap to play: {youtube_url}"
 
 def solve_image_math(image_url):
-    prompt = "This is a math/calculation problem. Solve it step by step. Show final answer clearly."
+    prompt = "Solve this math problem step by step. Show formula, working, and final answer."
     return groq_vision(image_url, prompt)
 
 def get_runtime():
@@ -108,7 +108,7 @@ def get_menu():
 ◆ *Owner*: Sir
 ◆ *Runtime*: {get_runtime()}
 ◆ *YT Mode*: Link Only
-◆ *Vision*: Llava 7B
+◆ *Vision*: Llama 3.2 11B
 ◆ *Time*: {lt}
 
 『 *AI* 』
@@ -135,7 +135,6 @@ def webhook():
         
         if msg.get("type") == "image":
             image_id = msg["image"]["id"]
-            caption = msg.get("caption", "").lower()
             media_info = requests.get(f"https://graph.facebook.com/v20.0/{image_id}", headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).json()
             image_url = media_info.get("url")
             user_waiting_image[from_number] = {"url": image_url}
@@ -153,7 +152,7 @@ def webhook():
                     result = solve_image_math(img_data["url"])
                 else:
                     send_text(from_number, "Analyzing image...")
-                    prompt = "Describe image and verify if facts are true. Be detailed." if tl == ".verify" else "Describe this image in detail. What do you see?"
+                    prompt = "Describe image and fact check it. Be detailed." if tl == ".verify" else "Describe this image in detail. Identify objects, colors, style."
                     result = groq_vision(img_data["url"], prompt)
                 send_text(from_number, f"〔 *RESULT* 〕\n{result}")
             else:
