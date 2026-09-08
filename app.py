@@ -6,7 +6,7 @@ import pytz
 import time
 
 app = Flask(__name__)
-VERSION = "v10.7 BULLETPROOF"
+VERSION = "v10.8 POLLINATIONS"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -17,7 +17,6 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
 CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "llama-3.2-11b-vision-preview" # WORKING VISION
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
@@ -34,10 +33,10 @@ def send_image_url(to, image_url, caption=""):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
-def groq_call(prompt, system="You are ARIA. Be detailed. Max 800 words.", model=CHAT_MODEL):
+def groq_call(prompt, system="You are ARIA. Advanced Responsive Intelligent Assistant. Be detailed. Max 800 words.", model=CHAT_MODEL):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:2000]}], "temperature": 0.5, "max_tokens": 1200} # MAX DEPTH
+    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:2000]}], "temperature": 0.5, "max_tokens": 1200}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -45,15 +44,17 @@ def groq_call(prompt, system="You are ARIA. Be detailed. Max 800 words.", model=
     except: return "Connection error."
 
 def groq_vision(image_url, prompt):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": VISION_MODEL,"messages": [{"role": "user","content": [{"type": "text", "text": prompt},{"type": "image_url", "image_url": {"url": image_url}}]}
-        ],"max_tokens": 400}
+    # POLLINATIONS VISION - FREE, NO KEY NEEDED
+    url = "https://text.pollinations.ai/"
+    full_prompt = f"{prompt}\n\nImage URL: {image_url}"
     try:
-        res = requests.post(url, headers=headers, json=data, timeout=40).json()
-        if 'choices' in res: return res['choices'][0]['message']['content']
-        return f"Vision error: {res.get('error', {}).get('message', res)}"
-    except Exception as e: return f"Vision connection error: {e}"
+        res = requests.post(url, json={"messages": [{"role": "user", "content": full_prompt}]}, timeout=45).json()
+        if isinstance(res, str): return res
+        if isinstance(res, list) and len(res) > 0: return res[0].get("content", "No response")
+        if isinstance(res, dict) and 'choices' in res: return res['choices'][0]['message']['content']
+        return str(res)
+    except Exception as e: 
+        return f"Vision error: {e}"
 
 def ai_explain(topic, field_num, from_number):
     fields = ["Biology", "Chemistry", "Pharmacology", "Clinical", "Pathophysiology", "Exam Tips"]
@@ -94,7 +95,7 @@ def get_youtube_link(query):
     return f"◆ *{query.title()}*\n\nTap to play: {youtube_url}"
 
 def solve_image_math(image_url):
-    prompt = "Solve this math problem step by step. Show formula, working, and final answer."
+    prompt = "Solve this math problem step by step. Show formula, working, and final answer clearly."
     return groq_vision(image_url, prompt)
 
 def get_runtime():
@@ -108,7 +109,7 @@ def get_menu():
 ◆ *Owner*: Sir
 ◆ *Runtime*: {get_runtime()}
 ◆ *YT Mode*: Link Only
-◆ *Vision*: Llama 3.2 11B
+◆ *Vision*: Pollinations Free
 ◆ *Time*: {lt}
 
 『 *AI* 』
@@ -152,7 +153,7 @@ def webhook():
                     result = solve_image_math(img_data["url"])
                 else:
                     send_text(from_number, "Analyzing image...")
-                    prompt = "Describe image and fact check it. Be detailed." if tl == ".verify" else "Describe this image in detail. Identify objects, colors, style."
+                    prompt = "Describe image and fact check it. Be detailed." if tl == ".verify" else "Describe this image in detail. Identify objects, colors, text, style. Be specific."
                     result = groq_vision(img_data["url"], prompt)
                 send_text(from_number, f"〔 *RESULT* 〕\n{result}")
             else:
