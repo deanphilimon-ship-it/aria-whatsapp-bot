@@ -6,7 +6,7 @@ import pytz
 import time
 
 app = Flask(__name__)
-VERSION = "v10.8 POLLINATIONS"
+VERSION = "v10.9 ANONYMOUS VISION"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -44,15 +44,14 @@ def groq_call(prompt, system="You are ARIA. Advanced Responsive Intelligent Assi
     except: return "Connection error."
 
 def groq_vision(image_url, prompt):
-    # POLLINATIONS VISION - FREE, NO KEY NEEDED
-    url = "https://text.pollinations.ai/"
-    full_prompt = f"{prompt}\n\nImage URL: {image_url}"
+    # POLLINATIONS ANONYMOUS VISION - NO KEY, NO BUDGET, GET REQUEST
+    full_query = f"{prompt}. Image URL: {image_url}"
+    url = f"https://text.pollinations.ai/{requests.utils.quote(full_query)}"
     try:
-        res = requests.post(url, json={"messages": [{"role": "user", "content": full_prompt}]}, timeout=45).json()
-        if isinstance(res, str): return res
-        if isinstance(res, list) and len(res) > 0: return res[0].get("content", "No response")
-        if isinstance(res, dict) and 'choices' in res: return res['choices'][0]['message']['content']
-        return str(res)
+        res = requests.get(url, timeout=60).text
+        if "error" in res.lower() and "rate" in res.lower():
+            return "Pollinations is rate limited. Try again in 30s Sir"
+        return res
     except Exception as e: 
         return f"Vision error: {e}"
 
@@ -109,7 +108,7 @@ def get_menu():
 ◆ *Owner*: Sir
 ◆ *Runtime*: {get_runtime()}
 ◆ *YT Mode*: Link Only
-◆ *Vision*: Pollinations Free
+◆ *Vision*: Pollinations Anonymous
 ◆ *Time*: {lt}
 
 『 *AI* 』
