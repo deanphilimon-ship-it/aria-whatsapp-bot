@@ -6,6 +6,7 @@ import pytz
 import time
 
 app = Flask(__name__)
+VERSION = "v10.4 RAPIDAPI" # DEBUG VERSION
 last_explain_topic = {}
 user_waiting_image = {}
 start_time = time.time()
@@ -14,14 +15,15 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY") # NEW
+RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 CHAT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    chunks = [text[i:i+3000] for i in range(0, len(text), 3000)]
+    # FORCE SPLIT TO AVOID WHATSAPP CUTOFF
+    chunks = [text[i:i+1500] for i in range(0, len(text), 1500)] 
     for i, chunk in enumerate(chunks):
         if len(chunks) > 1: chunk = f"[{i+1}/{len(chunks)}]\n{chunk}"
         requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": chunk}})
@@ -36,10 +38,10 @@ def send_audio_url(to, audio_url):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "audio", "audio": {"link": audio_url}})
 
-def groq_call(prompt, system="You are ARIA. Be extremely concise. Max 150 words. No tables.", model=CHAT_MODEL):
+def groq_call(prompt, system="You are ARIA. Be extremely concise. Max 120 words. No tables.", model=CHAT_MODEL):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:800]}], "temperature": 0.5, "max_tokens": 200}
+    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:600]}], "temperature": 0.5, "max_tokens": 120} # REDUCED TOKENS
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -50,7 +52,7 @@ def groq_vision(image_url, prompt):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {"model": VISION_MODEL,"messages": [{"role": "user","content": [{"type": "text", "text": prompt},{"type": "image_url", "image_url": {"url": image_url}}]}
-        ],"max_tokens": 250}
+        ],"max_tokens": 150}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=40).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -60,10 +62,10 @@ def groq_vision(image_url, prompt):
 def ai_explain(topic, field, from_number):
     last_explain_topic[from_number] = topic
     if field == "all":
-        system = "You are a professor. MAX 5 BULLETS. 1 line each. NO TABLES."
-        prompt = f"Explain '{topic}' in 5 fields: Biology, Chemistry, Pharmacology, Clinical, Exam tips. 1 short sentence each."
+        system = "You are a professor. MAX 4 WEEKS. 2 BULLETS PER WEEK. NO TABLES. BE BRIEF." # ULTRA SHORT
+        prompt = f"Make a study plan for '{topic}'. 4 weeks only. 2 bullets each."
         result = groq_call(prompt, system=system)
-        result += "\n\nReply `explain Pharmacology` for details."
+        result += "\n\nReply `explain Pharmacology` for details on 1 topic."
     else:
         system = "You are an expert. 3 bullets max. 1 line each."
         prompt = f"Explain '{topic}' from {field}. 3 short bullet points."
@@ -81,34 +83,25 @@ def get_unsplash_image(query):
     except: pass
     return None, None
 
-# RAPIDAPI YT DOWNLOAD - WORKS ON RENDER
+# WORKING RAPIDAPI - youtube-mp3
 def download_mp3_rapid(query):
     if not RAPIDAPI_KEY:
         return None, "Bug: Add RAPIDAPI_KEY to Render"
     
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": "youtube-mp36.p.rapidapi.com"
+        "X-RapidAPI-Host": "youtube-mp3.p.rapidapi.com" # WORKING HOST
     }
     youtube_url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
     try:
-        # 1. Search
-        search_url = "https://youtube-mp36.p.rapidapi.com/search/"
-        search_res = requests.get(search_url, headers=headers, params={"q": query}, timeout=10).json()
-        if not search_res.get('items'):
-            return None, f"No results. Watch: {youtube_url}"
+        # This API does search + download in 1 call using query as id
+        dl_url = "https://youtube-mp3.p.rapidapi.com/dl/"
+        dl_res = requests.get(dl_url, headers=headers, params={"id": query}, timeout=20).json()
         
-        video_id = search_res['items'][0]['id']
-        title = search_res['items'][0]['title']
-        
-        # 2. Download
-        dl_url = "https://youtube-mp36.p.rapidapi.com/dl"
-        dl_res = requests.get(dl_url, headers=headers, params={"id": video_id}, timeout=20).json()
-        
-        if dl_res.get("link"):
-            return dl_res["link"], title
+        if dl_res.get("status") == "ok" and dl_res.get("link"):
+            return dl_res["link"], dl_res["title"]
         else:
-            return None, f"Download failed. Watch: {youtube_url}"
+            return None, f"No results. Watch: {youtube_url}"
             
     except Exception as e:
         print(e)
@@ -121,10 +114,10 @@ def get_runtime():
 
 def get_menu():
     lt = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
-    return f"""─────〔 *ARIA v10.3* 〕─────
+    return f"""─────〔 *ARIA {VERSION}* 〕─────
 ◆ *Owner*: Sir
 ◆ *Runtime*: {get_runtime()}
-◆ *YT Mode*: RapidAPI MP3
+◆ *YT Mode*: youtube-mp3 API
 ◆ *Vision*: Llama 4 Scout
 ◆ *Time*: {lt}
 
@@ -205,6 +198,10 @@ def webhook():
     except Exception as e:
         print("Error:", e)
     return "OK", 200
+
+@app.route("/")
+def home():
+    return f"ARIA {VERSION} Running"
 
 if __name__ == "__main__":
     app.run(port=5000)
