@@ -8,7 +8,7 @@ import time
 import base64
 
 app = Flask(__name__)
-VERSION = "v12.1 MEMORY + GEMINI VISION"
+VERSION = "v12.2"
 start_time = time.time()
 
 # MEMORY STORAGE
@@ -21,9 +21,9 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY") # ADD THIS
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "google/gemini-2.0-flash-exp:free" # FREE VISION
+VISION_MODEL = "google/gemini-2.0-flash-lite:free" # FIXED MODEL
 MEMORY_FILE = "aria_memory.json"
 
 def load_memory():
@@ -58,13 +58,15 @@ def download_whatsapp_image(image_url):
     return base64.b64encode(res.content).decode('utf-8')
 
 def openrouter_vision(image_url, prompt):
-    # GEMINI 2.0 FLASH VIA OPENROUTER - FREE + ACCURATE
+    # FIXED: Gemini 2.0 Flash Lite + Required Headers
     base64_image = download_whatsapp_image(image_url)
     
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://aria-bot.com", # Required
+        "X-Title": "ARIA Bot"
     }
     data = {
         "model": VISION_MODEL,
@@ -81,7 +83,7 @@ def openrouter_vision(image_url, prompt):
         res = requests.post(url, headers=headers, json=data, timeout=40).json()
         if 'choices' in res: 
             return res['choices'][0]['message']['content']
-        return f"Vision error: {res}"
+        return f"Vision error: {res.get('error', res)}"
     except Exception as e:
         return f"Vision error: {e}"
 
@@ -111,9 +113,15 @@ def learn_fact(from_number, text):
         user_profile[from_number]["name"] = name
         save_memory()
         return f"Got it! I'll remember your name is *{name}* 😊"
+    if "i like" in tl:
+        like = text.split("i like")[-1].strip()
+        if from_number not in user_profile: user_profile[from_number] = {}
+        user_profile[from_number]["likes"] = like
+        save_memory()
+        return f"Noted! You like *{like}*"
     return None
 
-def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Be helpful and presentable. Max 350 words."):
+def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Be helpful, presentable, and refer to past conversation when relevant. Use bold headers. Max 350 words."):
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -130,18 +138,24 @@ def get_menu():
     return f"""─────〔 *ARIA {VERSION}* 〕─────
 👤 *Owner*: Sir
 ⏱️ *Runtime*: {get_runtime()}
-🧠 *Memory*: ON
-👁️ *Vision*: Gemini 2.0 Flash Free
+🧠 *Memory*: ON - 15 messages
+👁️ *Vision*: Gemini 2.0 Flash Lite Free
 🕒 *Time*: {lt}
 
 『 *MEMORY* 』
 ├─ remember my name is <name>
+├─ remember i like <thing>
 └─ forget me
 
 『 *AI* 』
+├─ explain <topic>
 ├─ ○.describe *send image*
 ├─ ○.verify *send image*
-└─ ○.solve *send image*"""
+└─ ○.solve *send image*
+
+『 *MEDIA* 』
+├─ ○.pint <keyword>
+└─ ○.play <song name>"""
 
 def get_runtime():
     seconds = int(time.time() - start_time)
@@ -178,14 +192,16 @@ def webhook():
             conversation_memory[from_number] = []
             user_profile[from_number] = {}
             save_memory()
-            send_text(from_number, "🧠 *Memory cleared Sir*.")
+            send_text(from_number, "🧠 *Memory cleared Sir*. Starting fresh.")
             return "OK", 200
             
         if tl in [".describe", ".verify", ".solve"]:
             if user_waiting_image.get(from_number):
                 img_data = user_waiting_image.pop(from_number)
-                send_text(from_number, "👁️ *Analyzing with Gemini...*")
-                prompt = "Describe this image in detail" if tl == ".describe" else "Fact check this image" if tl == ".verify" else "Solve this math problem step by step"
+                send_text(from_number, "👁️ *Analyzing with Gemini Lite...*")
+                if tl == ".describe": prompt = "Describe this image in detail"
+                elif tl == ".verify": prompt = "Fact check this image. Is it real or AI generated? Any misinformation?"
+                else: prompt = "Solve this math problem step by step"
                 result = openrouter_vision(img_data["url"], prompt)
                 add_to_memory(from_number, "assistant", result)
                 send_text(from_number, f"〔 *RESULT* 〕\n\n{result}")
