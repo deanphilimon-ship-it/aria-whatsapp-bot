@@ -2,24 +2,44 @@ from flask import Flask, request
 import requests
 import os
 import base64
+import json
 from datetime import datetime
 import pytz
 import time
 
 app = Flask(__name__)
-VERSION = "v11.3"
+VERSION = "v11.4 PRESENTABLE + MEMORY"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
 start_time = time.time()
 
+conversation_memory = {} # MEMORY BACK
+user_profile = {}
+MAX_HISTORY = 15
+MEMORY_FILE = "aria_memory.json"
+
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-UNSPLASH_KEY = os.getenv("UNSPLASH_KEY") # UNSPLASH IS BACK
+UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY") # NEEDED FOR VISION
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 CHAT_MODEL = "llama-3.1-70b-versatile" 
-VISION_MODEL = "google/gemma-2-27b-it" # FREE VISION ON OPENROUTER
+VISION_MODEL = "google/gemma-2-27b-it"
+
+def load_memory():
+    global conversation_memory, user_profile
+    if os.path.exists(MEMORY_FILE):
+        with open(MEMORY_FILE, 'r') as f:
+            data = json.load(f)
+            conversation_memory = data.get("convo", {})
+            user_profile = data.get("profile", {})
+
+def save_memory():
+    with open(MEMORY_FILE, 'w') as f:
+        json.dump({"convo": conversation_memory, "profile": user_profile}, f)
+
+load_memory() # LOAD ON START
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
@@ -38,10 +58,40 @@ def send_image_url(to, image_url, caption=""):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
-def groq_call(prompt, system="You are ARIA. Advanced Responsive Intelligent Assistant. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words. Use bullet points.", model=CHAT_MODEL):
+def build_memory_context(from_number):
+    context = ""
+    if from_number in user_profile:
+        name = user_profile[from_number].get("name", "Sir")
+        context += f"You are talking to {name}. "
+    if from_number in conversation_memory:
+        context += "Recent conversation:\n"
+        for msg in conversation_memory[from_number][-10:]:
+            context += f"{msg['role']}: {msg['content'][:200]}\n"
+    return context
+
+def add_to_memory(from_number, role, content):
+    if from_number not in conversation_memory:
+        conversation_memory[from_number] = []
+    conversation_memory[from_number].append({"role": role, "content": content})
+    conversation_memory[from_number] = conversation_memory[from_number][-MAX_HISTORY:]
+    save_memory()
+
+def learn_fact(from_number, text):
+    tl = text.lower()
+    if "remember" in tl and "my name is" in tl:
+        name = text.split("my name is")[-1].strip()
+        if from_number not in user_profile: user_profile[from_number] = {}
+        user_profile[from_number]["name"] = name
+        save_memory()
+        return f"Got it! I'll remember your name is *{name}* 😊"
+    return None
+
+def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words."):
+    memory_context = build_memory_context(from_number)
+    full_prompt = f"{memory_context}\n\nUser: {prompt}"
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt[:1500]}], "temperature": 0.4, "max_tokens": 550}
+    data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -64,7 +114,7 @@ def openrouter_vision(image_url, prompt):
         "X-Title": "ARIA Bot"
     }
     data = {
-        "model": VISION_MODEL, # Gemma 2 27B has free vision
+        "model": VISION_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -103,7 +153,7 @@ def ai_explain(topic, field_num, from_number):
         field = last_explain_fields[from_number][idx]
         system = "You are a professor. Reply like a helpful friend. Use bold labels, emojis, clear sections. 10 bullet points max. Be complete but concise."
         prompt = f"Deep dive into '{topic}' from {field} perspective. Use examples."
-        return groq_call(prompt, system=system)
+        return groq_call(prompt, from_number, system=system)
 
 def get_unsplash_image(query):
     if not UNSPLASH_KEY: return None, "MISSING_KEY"
@@ -133,6 +183,7 @@ def get_menu():
     lt = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
     return f"""─────〔 *ARIA {VERSION}* 〕─────
 👤 *Owner*: Sir
+🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
 🎵 *YT Mode*: Link Only
 👁️ *Vision*: Gemma 2 27B Free
@@ -146,12 +197,13 @@ def get_menu():
 ├─ ○.verify *send image*
 └─ ○.solve *send image*
 
+『 *MEMORY* 』
+├─ remember my name is <name>
+└─ forget me
+
 『 *MEDIA* 』
 ├─ ○.pint <keyword>
-└─ ○.play <song name>
-
-『 *TOOLS* 』
-└─ ○.solve *for math images*"""
+└─ ○.play <song name>"""
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -171,7 +223,21 @@ def webhook():
         
         text = msg["text"]["body"].strip()
         tl = text.lower()
+        add_to_memory(from_number, "user", text) # SAVE TO MEMORY
         
+        learned = learn_fact(from_number, text)
+        if learned:
+            add_to_memory(from_number, "assistant", learned)
+            send_text(from_number, learned)
+            return "OK", 200
+        
+        if tl == "forget me":
+            conversation_memory[from_number] = []
+            user_profile[from_number] = {}
+            save_memory()
+            send_text(from_number, "🧠 *Memory cleared Sir*.")
+            return "OK", 200
+            
         if tl in [".describe", ".verify", ".solve"]:
             if user_waiting_image.get(from_number):
                 img_data = user_waiting_image.pop(from_number)
@@ -184,6 +250,7 @@ def webhook():
                 else:
                     send_text(from_number, "👁️ *Analyzing image...*")
                     result = openrouter_vision(img_data["url"], "Describe this image in detail. Identify objects, colors, text, style. Use bullet points.")
+                add_to_memory(from_number, "assistant", result) # SAVE RESULT
                 send_text(from_number, f"〔 *RESULT* 〕\n\n{result}")
             else:
                 send_text(from_number, "⚠️ *Send image first Sir*")
@@ -207,11 +274,18 @@ def webhook():
             send_image_url(from_number, f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1024&height=1024", f"AI: {prompt}")
         elif tl.startswith("explain"):
             parts = text.split(" ", 2)
-            if len(parts) == 1: send_text(from_number, "⚠️ Usage: `explain <topic>`")
-            elif len(parts) == 2: send_text(from_number, ai_explain(parts[1], "all", from_number))
-            else: send_text(from_number, ai_explain(parts[1], parts[2], from_number))
+            if len(parts) == 1: 
+                result = "⚠️ Usage: `explain <topic>`"
+            elif len(parts) == 2: 
+                result = ai_explain(parts[1], "all", from_number)
+            else: 
+                result = ai_explain(parts[1], parts[2], from_number)
+            add_to_memory(from_number, "assistant", result)
+            send_text(from_number, result)
         else:
-            send_text(from_number, groq_call(text))
+            result = groq_call(text, from_number)
+            add_to_memory(from_number, "assistant", result) # SAVE RESPONSE
+            send_text(from_number, result)
     except Exception as e:
         print("Error:", e)
     return "OK", 200
