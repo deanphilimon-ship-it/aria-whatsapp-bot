@@ -8,10 +8,9 @@ import time
 import base64
 
 app = Flask(__name__)
-VERSION = "v12.4 MEMORY + QWEN VISION"
+VERSION = "v12.8"
 start_time = time.time()
 
-# MEMORY STORAGE
 conversation_memory = {}
 user_profile = {}
 user_waiting_image = {}
@@ -19,11 +18,9 @@ MAX_HISTORY = 15
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "qwen/qwen2.5-vl-72b-instruct:free" # FIXED: STABLE FREE VISION
+CHAT_MODEL = "llama-3.3-70b-versatile" 
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct" # NEW OFFICIAL GROQ VISION
 MEMORY_FILE = "aria_memory.json"
 
 def load_memory():
@@ -57,32 +54,28 @@ def download_whatsapp_image(image_url):
     res = requests.get(image_url, headers=headers)
     return base64.b64encode(res.content).decode('utf-8')
 
-def openrouter_vision(image_url, prompt):
+def groq_vision(image_url, prompt):
     base64_image = download_whatsapp_image(image_url)
     
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://aria-bot.com",
-        "X-Title": "ARIA Bot"
-    }
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
     data = {
         "model": VISION_MODEL,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": f"{prompt}. Be concise, max 150 words. Use bullet points and bold headers."},
+                {"type": "text", "text": f"{prompt}. Be concise, max 120 words. Use bullet points with bold headers."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
             ]
         }],
-        "max_tokens": 400
+        "max_tokens": 400,
+        "temperature": 0.3
     }
     try:
         res = requests.post(url, headers=headers, json=data, timeout=45).json()
         if 'choices' in res: 
             return res['choices'][0]['message']['content']
-        return f"Vision error: {res.get('error', res)}"
+        return f"Vision error: {res}"
     except Exception as e:
         return f"Vision error: {e}"
 
@@ -112,15 +105,9 @@ def learn_fact(from_number, text):
         user_profile[from_number]["name"] = name
         save_memory()
         return f"Got it! I'll remember your name is *{name}* 😊"
-    if "i like" in tl:
-        like = text.split("i like")[-1].strip()
-        if from_number not in user_profile: user_profile[from_number] = {}
-        user_profile[from_number]["likes"] = like
-        save_memory()
-        return f"Noted! You like *{like}*"
     return None
 
-def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Be helpful, presentable, use bold headers. Max 350 words."):
+def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Be helpful and presentable. Max 350 words."):
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -135,27 +122,14 @@ def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Int
 def get_menu():
     lt = datetime.now(pytz.timezone('Africa/Lagos')).strftime("%I:%M %p")
     return f"""─────〔 *ARIA {VERSION}* 〕─────
-👤 *Owner*: Sir
-⏱️ *Runtime*: {get_runtime()}
-🧠 *Memory*: ON - 15 messages
-👁️ *Vision*: Qwen2.5-VL 72B Free
-🕒 *Time*: {lt}
-
-『 *MEMORY* 』
+🧠 *Memory*: ON
+👁️ *Vision*: Llama 4 Scout 17B - FREE
+『 *COMMANDS* 』
 ├─ remember my name is <name>
-├─ remember i like <thing>
-└─ forget me
-
-『 *AI* 』
-├─ explain <topic>
+├─ forget me
 ├─ ○.describe *send image*
 ├─ ○.verify *send image*
 └─ ○.solve *send image*"""
-
-def get_runtime():
-    seconds = int(time.time() - start_time)
-    h, m, s = seconds//3600, (seconds%3600)//60, seconds%60
-    return f"{h}h {m}m {s}s"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -187,17 +161,17 @@ def webhook():
             conversation_memory[from_number] = []
             user_profile[from_number] = {}
             save_memory()
-            send_text(from_number, "🧠 *Memory cleared Sir*. Starting fresh.")
+            send_text(from_number, "🧠 *Memory cleared Sir*.")
             return "OK", 200
             
         if tl in [".describe", ".verify", ".solve"]:
             if user_waiting_image.get(from_number):
                 img_data = user_waiting_image.pop(from_number)
-                send_text(from_number, "👁️ *Analyzing with Qwen...*")
+                send_text(from_number, "👁️ *Analyzing with Llama 4 Scout...*")
                 if tl == ".describe": prompt = "Describe this image in detail"
-                elif tl == ".verify": prompt = "Fact check this image. Is it real or AI generated?"
+                elif tl == ".verify": prompt = "Fact check this image. Is it real or AI generated? List signs."
                 else: prompt = "Solve this math problem step by step"
-                result = openrouter_vision(img_data["url"], prompt)
+                result = groq_vision(img_data["url"], prompt)
                 add_to_memory(from_number, "assistant", result)
                 send_text(from_number, f"〔 *RESULT* 〕\n\n{result}")
             else:
