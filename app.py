@@ -8,13 +8,13 @@ import pytz
 import time
 
 app = Flask(__name__)
-VERSION = "v11.4 PRESENTABLE + MEMORY"
+VERSION = "v11.7 DUAL AI"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
 start_time = time.time()
 
-conversation_memory = {} # MEMORY BACK
+conversation_memory = {}
 user_profile = {}
 MAX_HISTORY = 15
 MEMORY_FILE = "aria_memory.json"
@@ -23,9 +23,17 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_KEY = os.getenv("GROQ_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
-CHAT_MODEL = "llama-3.1-70b-versatile" 
-VISION_MODEL = "google/gemma-2-27b-it"
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY") # KEPT: For fallback
+
+# DEFAULTS - GROQ FREE
+CHAT_MODEL = "llama-3.3-70b-versatile" 
+VISION_MODEL = "llama-3.2-11b-vision-preview"
+AI_PROVIDER = "GROQ" # CHANGED: Track which provider we're using
+
+# UNCOMMENT THESE 2 LINES TO SWITCH TO OPENROUTER GPT-OSS-120B
+# CHAT_MODEL = "openai/gpt-oss-120b"
+# VISION_MODEL = "google/gemini-2.0-flash-exp:free" # Free vision on OR
+# AI_PROVIDER = "OPENROUTER"
 
 def load_memory():
     global conversation_memory, user_profile
@@ -39,7 +47,7 @@ def save_memory():
     with open(MEMORY_FILE, 'w') as f:
         json.dump({"convo": conversation_memory, "profile": user_profile}, f)
 
-load_memory() # LOAD ON START
+load_memory()
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
@@ -86,12 +94,19 @@ def learn_fact(from_number, text):
         return f"Got it! I'll remember your name is *{name}* 😊"
     return None
 
-def groq_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words."):
+def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words."):
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
+    
+    if AI_PROVIDER == "GROQ": # GROQ CALL
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+        data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
+    else: # OPENROUTER CALL
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://aria-bot.com", "X-Title": "ARIA Bot"}
+        data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
+    
     try:
         res = requests.post(url, headers=headers, json=data, timeout=30).json()
         if 'choices' in res: return res['choices'][0]['message']['content']
@@ -103,16 +118,17 @@ def download_whatsapp_image(image_url):
     res = requests.get(image_url, headers=headers)
     return base64.b64encode(res.content).decode('utf-8')
 
-def openrouter_vision(image_url, prompt):
+def vision_call(image_url, prompt):
     base64_image = download_whatsapp_image(image_url)
     short_prompt = f"{prompt}. Be concise. Use bullet points. Max 150 words."
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://aria-bot.com",
-        "X-Title": "ARIA Bot"
-    }
+    
+    if AI_PROVIDER == "GROQ": # GROQ VISION
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    else: # OPENROUTER VISION
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://aria-bot.com", "X-Title": "ARIA Bot"}
+    
     data = {
         "model": VISION_MODEL,
         "messages": [{
@@ -153,7 +169,7 @@ def ai_explain(topic, field_num, from_number):
         field = last_explain_fields[from_number][idx]
         system = "You are a professor. Reply like a helpful friend. Use bold labels, emojis, clear sections. 10 bullet points max. Be complete but concise."
         prompt = f"Deep dive into '{topic}' from {field} perspective. Use examples."
-        return groq_call(prompt, from_number, system=system)
+        return ai_call(prompt, from_number, system=system)
 
 def get_unsplash_image(query):
     if not UNSPLASH_KEY: return None, "MISSING_KEY"
@@ -172,7 +188,7 @@ def get_youtube_link(query):
 
 def solve_image_math(image_url):
     prompt = "Solve this math problem step by step. Show formula, working, and final answer. Be concise."
-    return openrouter_vision(image_url, prompt)
+    return vision_call(image_url, prompt)
 
 def get_runtime():
     seconds = int(time.time() - start_time)
@@ -186,7 +202,9 @@ def get_menu():
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
 🎵 *YT Mode*: Link Only
-👁️ *Vision*: Gemma 2 27B Free
+👁️ *Vision*: {VISION_MODEL}
+🤖 *AI*: {CHAT_MODEL}
+⚡ *Provider*: {AI_PROVIDER}
 🎨 *Style*: Presentable + Concise
 🕒 *Time*: {lt}
 
@@ -223,7 +241,7 @@ def webhook():
         
         text = msg["text"]["body"].strip()
         tl = text.lower()
-        add_to_memory(from_number, "user", text) # SAVE TO MEMORY
+        add_to_memory(from_number, "user", text)
         
         learned = learn_fact(from_number, text)
         if learned:
@@ -246,11 +264,11 @@ def webhook():
                     result = solve_image_math(img_data["url"])
                 elif tl == ".verify":
                     send_text(from_number, "👁️ *Verifying image...*")
-                    result = openrouter_vision(img_data["url"], "Fact check this image. Is it real or AI? Give 3 signs.")
+                    result = vision_call(img_data["url"], "Fact check this image. Is it real or AI? Give 3 signs.")
                 else:
                     send_text(from_number, "👁️ *Analyzing image...*")
-                    result = openrouter_vision(img_data["url"], "Describe this image in detail. Identify objects, colors, text, style. Use bullet points.")
-                add_to_memory(from_number, "assistant", result) # SAVE RESULT
+                    result = vision_call(img_data["url"], "Describe this image in detail. Identify objects, colors, text, style. Use bullet points.")
+                add_to_memory(from_number, "assistant", result)
                 send_text(from_number, f"〔 *RESULT* 〕\n\n{result}")
             else:
                 send_text(from_number, "⚠️ *Send image first Sir*")
@@ -283,8 +301,8 @@ def webhook():
             add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
         else:
-            result = groq_call(text, from_number)
-            add_to_memory(from_number, "assistant", result) # SAVE RESPONSE
+            result = ai_call(text, from_number)
+            add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
     except Exception as e:
         print("Error:", e)
