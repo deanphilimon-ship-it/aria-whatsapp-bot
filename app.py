@@ -9,7 +9,7 @@ import time
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.1 STREAMING REASONING"
+VERSION = "v12.2"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -27,9 +27,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-CHAT_MODEL = "openai/gpt-oss-120b" # Smartest for chat
-FAST_MODEL = "qwen/qwen3.8-27b" # For explain/long replies 
-VISION_MODEL = "qwen/qwen3.6-27b" # For.describe.solve
+CHAT_MODEL = "openai/gpt-oss-120b" 
+FAST_MODEL = "qwen/qwen3.8-27b"
+VISION_MODEL = "qwen/qwen3.6-27b"
 
 def load_memory():
     global conversation_memory, user_profile
@@ -64,7 +64,6 @@ def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intel
     
     full_response = ""
     try:
-        # CHANGED: Added stream=True like your code
         stream = client.chat.completions.create(
             model=model,
             messages=[
@@ -72,10 +71,10 @@ def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intel
                 {"role": "user", "content": full_prompt[:4000]}
             ],
             temperature=0.6,
-            max_completion_tokens=1024,
+            max_tokens=1024, # FIXED: was max_completion_tokens
             top_p=0.95,
-            stream=True, # CHANGED
-            reasoning_format="parsed" # Shows reasoning tokens
+            stream=True
+            # REMOVED: reasoning_format - causes error on old SDK
         )
         for chunk in stream:
             if chunk.choices[0].delta.content:
@@ -100,8 +99,8 @@ def vision_call(image_url, prompt):
                 ]
             }],
             temperature=0.3,
-            max_completion_tokens=400,
-            stream=True # CHANGED
+            max_tokens=400, # FIXED
+            stream=True
         )
         for chunk in stream:
             if chunk.choices[0].delta.content:
@@ -199,7 +198,7 @@ def get_menu():
 👁️ *Vision*: Qwen3.6 27B
 🤖 *Chat*: GPT-OSS 120B
 ⚡ *Fast*: Qwen3.8 27B
-🔥 *Mode*: Streaming + Reasoning
+🔥 *Mode*: Streaming
 🕒 *Time*: {lt}
 
 『 *AI* 』
