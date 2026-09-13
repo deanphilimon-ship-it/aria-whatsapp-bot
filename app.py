@@ -6,9 +6,10 @@ import json
 from datetime import datetime
 import pytz
 import time
+from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v11.7 DUAL AI"
+VERSION = "v12.1 STREAMING REASONING"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -22,18 +23,13 @@ MEMORY_FILE = "aria_memory.json"
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
-GROQ_KEY = os.getenv("GROQ_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_KEY") # KEPT: For fallback
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# DEFAULTS - GROQ FREE
-CHAT_MODEL = "llama-3.3-70b-versatile" 
-VISION_MODEL = "llama-3.2-11b-vision-preview"
-AI_PROVIDER = "GROQ" # CHANGED: Track which provider we're using
+client = Groq(api_key=GROQ_API_KEY)
 
-# UNCOMMENT THESE 2 LINES TO SWITCH TO OPENROUTER GPT-OSS-120B
-# CHAT_MODEL = "openai/gpt-oss-120b"
-# VISION_MODEL = "google/gemini-2.0-flash-exp:free" # Free vision on OR
-# AI_PROVIDER = "OPENROUTER"
+CHAT_MODEL = "openai/gpt-oss-120b" # Smartest for chat
+FAST_MODEL = "qwen/qwen3.8-27b" # For explain/long replies 
+VISION_MODEL = "qwen/qwen3.6-27b" # For.describe.solve
 
 def load_memory():
     global conversation_memory, user_profile
@@ -61,10 +57,63 @@ def send_text(to, text):
         requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": chunk}})
         time.sleep(1.5)
 
-def send_image_url(to, image_url, caption=""):
-    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
+def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. Think step by step internally. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words."):
+    memory_context = build_memory_context(from_number)
+    full_prompt = f"{memory_context}\n\nUser: {prompt}"
+    model = FAST_MODEL if len(full_prompt) > 1500 else CHAT_MODEL
+    
+    full_response = ""
+    try:
+        # CHANGED: Added stream=True like your code
+        stream = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": full_prompt[:4000]}
+            ],
+            temperature=0.6,
+            max_completion_tokens=1024,
+            top_p=0.95,
+            stream=True, # CHANGED
+            reasoning_format="parsed" # Shows reasoning tokens
+        )
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                full_response += chunk.choices[0].delta.content
+        return full_response
+    except Exception as e: 
+        return f"⚠️ *AI Error:* {e}"
+
+def vision_call(image_url, prompt):
+    base64_image = download_whatsapp_image(image_url)
+    short_prompt = f"{prompt}. Think step by step. Be concise. Use bullet points. Max 150 words."
+    
+    full_response = ""
+    try:
+        stream = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": short_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]
+            }],
+            temperature=0.3,
+            max_completion_tokens=400,
+            stream=True # CHANGED
+        )
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                full_response += chunk.choices[0].delta.content
+        return full_response
+    except Exception as e: 
+        return f"⚠️ *Vision error:* {e}"
+
+def download_whatsapp_image(image_url):
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    res = requests.get(image_url, headers=headers)
+    return base64.b64encode(res.content).decode('utf-8')
 
 def build_memory_context(from_number):
     context = ""
@@ -94,80 +143,21 @@ def learn_fact(from_number, text):
         return f"Got it! I'll remember your name is *{name}* 😊"
     return None
 
-def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. You have memory. Reply like a helpful friend. Use bold labels, emojis, clear sections. Be complete but concise. Max 350 words."):
-    memory_context = build_memory_context(from_number)
-    full_prompt = f"{memory_context}\n\nUser: {prompt}"
-    
-    if AI_PROVIDER == "GROQ": # GROQ CALL
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-        data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
-    else: # OPENROUTER CALL
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://aria-bot.com", "X-Title": "ARIA Bot"}
-        data = {"model": CHAT_MODEL, "messages": [{"role": "system", "content": system}, {"role": "user", "content": full_prompt[:2500]}], "temperature": 0.4, "max_tokens": 550}
-    
-    try:
-        res = requests.post(url, headers=headers, json=data, timeout=30).json()
-        if 'choices' in res: return res['choices'][0]['message']['content']
-        return f"⚠️ *AI Error:* {res}"
-    except: return "⚠️ *Connection error Sir*"
-
-def download_whatsapp_image(image_url):
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
-    res = requests.get(image_url, headers=headers)
-    return base64.b64encode(res.content).decode('utf-8')
-
-def vision_call(image_url, prompt):
-    base64_image = download_whatsapp_image(image_url)
-    short_prompt = f"{prompt}. Be concise. Use bullet points. Max 150 words."
-    
-    if AI_PROVIDER == "GROQ": # GROQ VISION
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
-    else: # OPENROUTER VISION
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json", "HTTP-Referer": "https://aria-bot.com", "X-Title": "ARIA Bot"}
-    
-    data = {
-        "model": VISION_MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": short_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-            ]
-        }],
-        "max_tokens": 400
-    }
-    try:
-        res = requests.post(url, headers=headers, json=data, timeout=60).json()
-        if 'choices' in res:
-            return res['choices'][0]['message']['content']
-        return f"⚠️ *Vision error:* {res}"
-    except Exception as e: 
-        return f"⚠️ *Vision error:* {e}"
-
 def ai_explain(topic, field_num, from_number):
     fields = ["Biology", "Chemistry", "Pharmacology", "Clinical", "Pathophysiology", "Exam Tips"]
-    
     if field_num == "all":
         last_explain_topic[from_number] = topic
         last_explain_fields[from_number] = fields
         result = f"📚 *{topic.title()} - 6 Fields*\n\n"
-        for i, f in enumerate(fields, 1):
-            result += f"{i}. *{f}*\n"
+        for i, f in enumerate(fields, 1): result += f"{i}. *{f}*\n"
         result += f"\n💡 Reply: `explain {topic} 3` for Pharmacology"
         return result
     else:
         try: idx = int(field_num) - 1
         except: return "⚠️ Usage: `explain psychology 2`"
-        
-        if from_number not in last_explain_fields: 
-            return "⚠️ Ask `explain psychology` first to see fields"
-            
+        if from_number not in last_explain_fields: return "⚠️ Ask `explain psychology` first to see fields"
         field = last_explain_fields[from_number][idx]
-        system = "You are a professor. Reply like a helpful friend. Use bold labels, emojis, clear sections. 10 bullet points max. Be complete but concise."
+        system = "You are a professor. Think step by step. Use bold labels, emojis. 10 bullet points max."
         prompt = f"Deep dive into '{topic}' from {field} perspective. Use examples."
         return ai_call(prompt, from_number, system=system)
 
@@ -182,12 +172,17 @@ def get_unsplash_image(query):
     except: pass
     return None, None
 
+def send_image_url(to, image_url, caption=""):
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
+
 def get_youtube_link(query):
     youtube_url = f"https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
     return f"🎵 *{query.title()}*\n\n▶️ Tap to play: {youtube_url}"
 
 def solve_image_math(image_url):
-    prompt = "Solve this math problem step by step. Show formula, working, and final answer. Be concise."
+    prompt = "Solve this math problem step by step. Show formula, working, and final answer."
     return vision_call(image_url, prompt)
 
 def get_runtime():
@@ -201,11 +196,10 @@ def get_menu():
 👤 *Owner*: Sir
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
-🎵 *YT Mode*: Link Only
-👁️ *Vision*: {VISION_MODEL}
-🤖 *AI*: {CHAT_MODEL}
-⚡ *Provider*: {AI_PROVIDER}
-🎨 *Style*: Presentable + Concise
+👁️ *Vision*: Qwen3.6 27B
+🤖 *Chat*: GPT-OSS 120B
+⚡ *Fast*: Qwen3.8 27B
+🔥 *Mode*: Streaming + Reasoning
 🕒 *Time*: {lt}
 
 『 *AI* 』
@@ -230,7 +224,6 @@ def webhook():
     try:
         msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
         from_number = msg["from"]
-        
         if msg.get("type") == "image":
             image_id = msg["image"]["id"]
             media_info = requests.get(f"https://graph.facebook.com/v20.0/{image_id}", headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).json()
@@ -238,24 +231,20 @@ def webhook():
             user_waiting_image[from_number] = {"url": image_url}
             send_text(from_number, "📸 *Image saved Sir*\n\nSend `.describe` `.verify` or `.solve`")
             return "OK", 200
-        
         text = msg["text"]["body"].strip()
         tl = text.lower()
         add_to_memory(from_number, "user", text)
-        
         learned = learn_fact(from_number, text)
         if learned:
             add_to_memory(from_number, "assistant", learned)
             send_text(from_number, learned)
             return "OK", 200
-        
         if tl == "forget me":
             conversation_memory[from_number] = []
             user_profile[from_number] = {}
             save_memory()
             send_text(from_number, "🧠 *Memory cleared Sir*.")
             return "OK", 200
-            
         if tl in [".describe", ".verify", ".solve"]:
             if user_waiting_image.get(from_number):
                 img_data = user_waiting_image.pop(from_number)
@@ -267,13 +256,12 @@ def webhook():
                     result = vision_call(img_data["url"], "Fact check this image. Is it real or AI? Give 3 signs.")
                 else:
                     send_text(from_number, "👁️ *Analyzing image...*")
-                    result = vision_call(img_data["url"], "Describe this image in detail. Identify objects, colors, text, style. Use bullet points.")
+                    result = vision_call(img_data["url"], "Describe this image in detail. Identify objects, colors, text, style.")
                 add_to_memory(from_number, "assistant", result)
                 send_text(from_number, f"〔 *RESULT* 〕\n\n{result}")
             else:
                 send_text(from_number, "⚠️ *Send image first Sir*")
             return "OK", 200
-            
         if tl in [".status", ".menu"]:
             send_text(from_number, get_menu())
         elif tl.startswith(".pint"):
@@ -281,7 +269,7 @@ def webhook():
             send_text(from_number, f"🔍 *Searching Unsplash for:* {query}...")
             img_url, page_url = get_unsplash_image(query)
             if img_url: send_image_url(from_number, img_url, f"📸 Unsplash: {query}")
-            else: send_text(from_number, "⚠️ *No images found Sir. Add UNSPLASH_KEY to Render.*")
+            else: send_text(from_number, "⚠️ *No images found Sir.*")
         elif tl.startswith(".play"):
             query = text[5:].strip()
             result = get_youtube_link(query)
@@ -292,12 +280,9 @@ def webhook():
             send_image_url(from_number, f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1024&height=1024", f"AI: {prompt}")
         elif tl.startswith("explain"):
             parts = text.split(" ", 2)
-            if len(parts) == 1: 
-                result = "⚠️ Usage: `explain <topic>`"
-            elif len(parts) == 2: 
-                result = ai_explain(parts[1], "all", from_number)
-            else: 
-                result = ai_explain(parts[1], parts[2], from_number)
+            if len(parts) == 1: result = "⚠️ Usage: `explain <topic>`"
+            elif len(parts) == 2: result = ai_explain(parts[1], "all", from_number)
+            else: result = ai_explain(parts[1], parts[2], from_number)
             add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
         else:
