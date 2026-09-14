@@ -7,10 +7,11 @@ import re
 from datetime import datetime
 import pytz
 import time
+import hashlib
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.4"
+VERSION = "v12.5 SECURE"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -28,9 +29,17 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
 
-CHAT_MODEL = "openai/gpt-oss-120b" 
+CHAT_MODEL = "openai/gpt-oss-120b"
 FAST_MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = "qwen/qwen3.6-27b"
+
+# ====== SECURITY SETTINGS ======
+ALLOWED_USERS = ["2348026177804"] # <-- PUT YOUR NUMBER HERE. Country code, no + or spaces. Example: 2348012345678
+PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W") # Resets every Monday
+MAX_TRIES = 3
+auth_tries = {} # {number: tries}
+authenticated_users = set() # numbers that passed
+BANNED_USERS = set()
 
 def load_memory():
     global conversation_memory, user_profile
@@ -46,6 +55,33 @@ def save_memory():
 
 load_memory()
 
+def check_auth(from_number, text):
+    # 1. Always allow owner
+    if from_number in ALLOWED_USERS:
+        authenticated_users.add(from_number)
+        return True, ""
+
+    # 2. Check ban
+    if from_number in BANNED_USERS:
+        return False, "⛔ *You are banned from using ARIA.*"
+
+    # 3. Check if already authenticated
+    if from_number in authenticated_users:
+        return True, ""
+
+    # 4. Check password
+    if text.strip().upper() == PASSWORD:
+        authenticated_users.add(from_number)
+        auth_tries[from_number] = 0
+        return True, "✅ *Access Granted Sir*\n\nWelcome to ARIA." # NO PASSWORD SHOWN
+
+    # 5. Wrong password
+    auth_tries[from_number] = auth_tries.get(from_number, 0) + 1
+    if auth_tries[from_number] >= MAX_TRIES:
+        BANNED_USERS.add(from_number)
+        return False, "⛔ *Locked*. Too many wrong attempts. You are banned."
+    return False, f"🔒 *Private Bot*\n\nSend password to unlock.\nAttempts left: {MAX_TRIES - auth_tries[from_number]}"
+
 def clean_ui(text):
     text = re.sub(r'\|.*\|', '', text)
     text = re.sub(r'---+', '', text)
@@ -60,7 +96,7 @@ def send_text(to, text):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     chunks = [text[i:i+650] for i in range(0, len(text), 650)]
     for i, chunk in enumerate(chunks):
-        if len(chunks) > 1: 
+        if len(chunks) > 1:
             header = f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n📄 *Part {i+1}/{len(chunks)}*\n└──────────────────────────────┘\n\n"
         else:
             header = f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n└──────────────────────────────┘\n\n"
@@ -72,7 +108,7 @@ def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intel
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
     model = FAST_MODEL if len(full_prompt) > 1500 else CHAT_MODEL
-    
+
     full_response = ""
     try:
         stream = client.chat.completions.create(
@@ -90,13 +126,12 @@ def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intel
             if chunk.choices[0].delta.content:
                 full_response += chunk.choices[0].delta.content
         return full_response
-    except Exception as e: 
+    except Exception as e:
         return f"⚠️ *AI Error:* {e}"
 
 def vision_call(image_url, prompt):
     base64_image = download_whatsapp_image(image_url)
     short_prompt = f"{prompt}. Think step by step. Be concise. Use bullet points. Max 150 words."
-    
     full_response = ""
     try:
         stream = client.chat.completions.create(
@@ -116,7 +151,7 @@ def vision_call(image_url, prompt):
             if chunk.choices[0].delta.content:
                 full_response += chunk.choices[0].delta.content
         return full_response
-    except Exception as e: 
+    except Exception as e:
         return f"⚠️ *Vision error:* {e}"
 
 def download_whatsapp_image(image_url):
@@ -158,7 +193,7 @@ def ai_explain(topic, field_num, from_number):
         last_explain_topic[from_number] = topic
         last_explain_fields[from_number] = fields
         result = f"〔 *{topic.title()} - 6 FIELDS* 〕\n\n"
-        for i, f in enumerate(fields, 1): 
+        for i, f in enumerate(fields, 1):
             result += f"{i}. {f}\n"
         result += f"\n💡 *Tip*: Reply `explain {topic} 3` for Pharmacology"
         return result
@@ -206,41 +241,65 @@ def get_menu():
 👤 *Owner*: Sir
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
+🔒 *Security*: ON
 🤖 *Brain*: GPT-OSS 120B
 👁️ *Vision*: Qwen3.6 27B
 ⚡ *Speed*: Qwen3.8 27B
 🕒 *Time*: {lt}
 
 〔 *AI COMMANDS* 〕
-• `explain <topic>`
-• `explain <topic> <1-6>`
+- `explain <topic>`
+- `explain <topic> <1-6>`
 
 〔 *VISION* 〕
-• Send image → `.describe`
-• Send image → `.verify` 
-• Send image → `.solve`
+- Send image → `.describe`
+- Send image → `.verify`
+- Send image → `.solve`
 
-〔 *MEMORY* 〕
-• `remember my name is <name>`
-• `forget me`
+〔 *ADMIN* 〕
+- `.ban <number>`
+- `.unban <number>`
 
 〔 *MEDIA* 〕
-• `.pint <keyword>`
-• `.play <song name>`
-• `imagine <prompt>`"""
+- `.pint <keyword>`
+- `.play <song name>`
+- `imagine <prompt>`"""
 
-# ====== THIS WAS MISSING ======
+# ====== WEBHOOK ======
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     global last_explain_topic, user_waiting_image
-    # Meta verification
     if request.method == "GET":
         return request.args.get("hub.challenge")
-    
+
     data = request.get_json()
     try:
         msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
         from_number = msg["from"]
+
+        # SECURITY CHECK
+        text = msg.get("text", {}).get("body", "").strip()
+        is_auth, auth_msg = check_auth(from_number, text)
+        if not is_auth:
+            send_text(from_number, auth_msg)
+            return "OK", 200
+        if auth_msg:
+            send_text(from_number, auth_msg)
+
+        # ADMIN COMMANDS
+        if text.lower().startswith(".ban "):
+            if from_number in ALLOWED_USERS:
+                target = text.split(" ")[1]
+                BANNED_USERS.add(target)
+                send_text(from_number, f"⛔ Banned: {target}")
+            return "OK", 200
+        if text.lower().startswith(".unban "):
+            if from_number in ALLOWED_USERS:
+                target = text.split(" ")[1]
+                BANNED_USERS.discard(target)
+                send_text(from_number, f"✅ Unbanned: {target}")
+            return "OK", 200
+
         if msg.get("type") == "image":
             image_id = msg["image"]["id"]
             media_info = requests.get(f"https://graph.facebook.com/v20.0/{image_id}", headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}).json()
@@ -248,7 +307,7 @@ def webhook():
             user_waiting_image[from_number] = {"url": image_url}
             send_text(from_number, "📸 *Image saved Sir*\n\nSend `.describe` `.verify` or `.solve`")
             return "OK", 200
-        text = msg["text"]["body"].strip()
+
         tl = text.lower()
         add_to_memory(from_number, "user", text)
         learned = learn_fact(from_number, text)
@@ -256,12 +315,14 @@ def webhook():
             add_to_memory(from_number, "assistant", learned)
             send_text(from_number, learned)
             return "OK", 200
+
         if tl == "forget me":
             conversation_memory[from_number] = []
             user_profile[from_number] = {}
             save_memory()
             send_text(from_number, "🧠 *Memory cleared Sir*.")
             return "OK", 200
+
         if tl in [".describe", ".verify", ".solve"]:
             if user_waiting_image.get(from_number):
                 img_data = user_waiting_image.pop(from_number)
@@ -279,6 +340,7 @@ def webhook():
             else:
                 send_text(from_number, "⚠️ *Send image first Sir*")
             return "OK", 200
+
         if tl in [".status", ".menu"]:
             send_text(from_number, get_menu())
         elif tl.startswith(".pint"):
@@ -306,6 +368,7 @@ def webhook():
             result = ai_call(text, from_number)
             add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
+
     except Exception as e:
         print("Error:", e)
     return "OK", 200
@@ -315,4 +378,4 @@ def home():
     return f"ARIA {VERSION} Running"
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000) # host 0.0.0.0 for Render
+    app.run(host="0.0.0.0", port=5000)
