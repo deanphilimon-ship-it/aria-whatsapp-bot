@@ -12,7 +12,7 @@ from collections import defaultdict
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.9.1"
+VERSION = "v12.9.2"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -37,24 +37,24 @@ FAST_MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = "qwen/qwen3.6-27b"
 
 # ====== SECURITY SETTINGS ======
-OWNER_NUMBER = "2348026177804" # <-- PUT YOUR NUMBER HERE
-ALLOWED_USERS = ["2348XXXXXXXX", "2349XXXXXXX"] # <-- PUT YOUR USERS HERE
-PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W") # Resets every Monday
-MAX_TRIES = 3
-auth_tries = {} # {number: tries}
-authenticated_users = set() # numbers that passed
+OWNER_NUMBER = "2348026177804"
+ALLOWED_USERS = ["2347069719997", "2349XXXXXXX"]
+PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W")
+MAX_TRIES = 4
+auth_tries = {}
+authenticated_users = set()
 BANNED_USERS = set()
 
 # ====== API KEYS ======
-COMICVINE_KEY = "bac15d29ffe11ced90b001b3827b2d20df130cfa" # YOUR KEY
+COMICVINE_KEY = "bac15d29ffe11ced90b001b3827b2d20df130cfa"
 
 # ====== RATE LIMIT ======
-api_requests = defaultdict(list) # {number: [timestamps]}
+api_requests = defaultdict(list)
 LIMITS = {
-    "pint4": 20, # ComicVine: 20/hr
-    "pint1": 50, # Unsplash: 50/hr
-    "pint2": 50, # Pexels: 50/hr
-    "pint5": 50 # Pixabay: 50/hr
+    "pint4": 20,
+    "pint1": 50,
+    "pint2": 50,
+    "pint5": 50
 }
 
 def load_memory():
@@ -75,7 +75,7 @@ load_memory()
 def check_rate_limit(number, api_name):
     now = time.time()
     key = f"{number}_{api_name}"
-    api_requests[key] = [t for t in api_requests[key] if now - t < 3600] # keep last 1 hour
+    api_requests[key] = [t for t in api_requests[key] if now - t < 3600]
     if len(api_requests[key]) >= LIMITS.get(api_name, 100):
         return False
     api_requests[key].append(now)
@@ -127,10 +127,10 @@ def send_image_url(to, image_url, caption=""):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
-# ==========.PINT COMMANDS WITH RATE LIMIT ==========
+# ==========.PINT COMMANDS ==========
 def pint1_unsplash(sender, query):
     if not check_rate_limit(sender, "pint1"):
-        send_text(sender, "⛔ *Rate Limit*\n\n20 Unsplash searches left this hour. Try again later.")
+        send_text(sender, "⛔ *Rate Limit*\n\n50 Unsplash searches left this hour.")
         return
     send_text(sender, f"📌 Pint1 Unsplash: *{query}*...")
     url = f"https://api.unsplash.com/photos/random?query={query}&client_id={UNSPLASH_KEY}&orientation=portrait"
@@ -143,7 +143,7 @@ def pint1_unsplash(sender, query):
 
 def pint2_pexels(sender, query):
     if not check_rate_limit(sender, "pint2"):
-        send_text(sender, "⛔ *Rate Limit*\n\n20 Pexels searches left this hour. Try again later.")
+        send_text(sender, "⛔ *Rate Limit*\n\n50 Pexels searches left this hour.")
         return
     send_text(sender, f"📌 Pint2 Pexels: *{query}*...")
     headers = {"Authorization": PEXELS_KEY}
@@ -184,7 +184,7 @@ def pint4_comics(sender, query):
     headers = {"User-Agent": "ARIA-Bot/1.0"}
     try:
         res = requests.get(url, params=params, headers=headers, timeout=10).json()
-        if res.get("status_code") == 1: # ComicVine OK
+        if res.get("status_code") == 1:
             if res["results"]:
                 result = res["results"][0]
                 name = result.get("name") or result.get("volume", {}).get("name", query)
@@ -204,7 +204,7 @@ def pint4_comics(sender, query):
 
 def pint5_pixabay(sender, query):
     if not check_rate_limit(sender, "pint5"):
-        send_text(sender, "⛔ *Rate Limit*\n\n20 Pixabay searches left this hour. Try again later.")
+        send_text(sender, "⛔ *Rate Limit*\n\n50 Pixabay searches left this hour.")
         return
     send_text(sender, f"🎨 Pint5 Pixabay: *{query}*...")
     url = f"https://pixabay.com/api/?key={PIXABAY_KEY}&q={query}&image_type=vector&orientation=horizontal&per_page=1"
@@ -217,7 +217,7 @@ def pint5_pixabay(sender, query):
         else: send_text(sender, f"No vectors found for: {query}")
     except: send_text(sender, f"Pint5 Error")
 
-# ========== YOUR EXISTING AI/VISION FUNCTIONS ==========
+# ========== AI/VISION FUNCTIONS ==========
 def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. Reply with clean WhatsApp UI. Use emojis, bold *text*, and bullet points. NO markdown tables, NO ###. Use '〔 *TITLE* 〕' for sections. Use '•' for bullets. Be presentable like Meta AI. Max 300 words."):
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
@@ -284,7 +284,7 @@ def ai_explain(topic, field_num, from_number):
         return result
     else:
         try: idx = int(field_num) - 1
-        except: return "⚠️ *Usage*: `explain psychology 2`"
+        except: return "*Usage:* `explain psychology 2`"
         if from_number not in last_explain_fields: return "⚠️ Ask `explain psychology` first to see fields"
         field = last_explain_fields[from_number][idx]
         system = "You are a professor. Use clean UI. Start with '〔 *DEEP DIVE* 〕'. Use emojis and bullets. No tables. Max 10 points."
@@ -352,7 +352,6 @@ def webhook():
         if not is_auth: send_text(from_number, auth_msg); return "OK", 200
         if auth_msg: send_text(from_number, auth_msg)
 
-        # ADMIN COMMANDS - OWNER ONLY
         if text.lower().startswith(".ban "):
             if from_number == OWNER_NUMBER:
                 target = text.split(" ")[1]; BANNED_USERS.add(target); save_memory(); send_text(from_number, f"⛔ Banned: {target}")
@@ -388,7 +387,6 @@ def webhook():
             else: send_text(from_number, "⚠️ *Send image first Sir*")
             return "OK", 200
 
-        # NEW PINT COMMANDS
         if tl.startswith(".pint1 "): pint1_unsplash(from_number, text[7:]); return "OK", 200
         if tl.startswith(".pint2 "): pint2_pexels(from_number, text[7:]); return "OK", 200
         if tl.startswith(".pint3 "): pint3_anime(from_number, text[7:]); return "OK", 200
@@ -401,13 +399,14 @@ def webhook():
         elif tl.startswith("explain"):
             parts = text.split(" ", 2)
             if len(parts) == 1: 
-                result = "Usage: `explain <topic>`"
+                result = "*Usage:* `explain <topic>`"
             elif len(parts) == 2: 
                 result = ai_explain(parts[1], "all", from_number)
             else: 
                 result = ai_explain(parts[1], parts[2], from_number)
             add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
+        else: result = ai_call(text, from_number); add_to_memory(from_number, "assistant", result); send_text(from_number, result)
 
     except Exception as e: print("Error:", e)
     return "OK", 200
