@@ -11,7 +11,7 @@ import hashlib
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.5 SECURE"
+VERSION = "v12.6"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -34,30 +34,32 @@ FAST_MODEL = "qwen/qwen3.8-27b"
 VISION_MODEL = "qwen/qwen3.6-27b"
 
 # ====== SECURITY SETTINGS ======
-ALLOWED_USERS = ["2348026177804"] # <-- PUT YOUR NUMBER HERE. Country code, no + or spaces. Example: 2348012345678
+OWNER_NUMBER = "2348026177804" # <-- PUT YOUR NUMBER HERE. THIS IS THE ONLY ADMIN
+ALLOWED_USERS = ["2348XXXXXXXX", "2349XXXXXXX"] # <-- PUT YOUR NUMBER + OTHER USERS HERE. They skip password but NO admin
 PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W") # Resets every Monday
-MAX_TRIES = 3
+MAX_TRIES = 4
 auth_tries = {} # {number: tries}
 authenticated_users = set() # numbers that passed
 BANNED_USERS = set()
 
 def load_memory():
-    global conversation_memory, user_profile
+    global conversation_memory, user_profile, BANNED_USERS
     if os.path.exists(MEMORY_FILE):
         with open(MEMORY_FILE, 'r') as f:
             data = json.load(f)
             conversation_memory = data.get("convo", {})
             user_profile = data.get("profile", {})
+            BANNED_USERS = set(data.get("banned", [])) # Load banned on restart
 
 def save_memory():
     with open(MEMORY_FILE, 'w') as f:
-        json.dump({"convo": conversation_memory, "profile": user_profile}, f)
+        json.dump({"convo": conversation_memory, "profile": user_profile, "banned": list(BANNED_USERS)}, f)
 
 load_memory()
 
 def check_auth(from_number, text):
-    # 1. Always allow owner
-    if from_number in ALLOWED_USERS:
+    # 1. Always allow owner + allowed users
+    if from_number == OWNER_NUMBER or from_number in ALLOWED_USERS:
         authenticated_users.add(from_number)
         return True, ""
 
@@ -79,6 +81,7 @@ def check_auth(from_number, text):
     auth_tries[from_number] = auth_tries.get(from_number, 0) + 1
     if auth_tries[from_number] >= MAX_TRIES:
         BANNED_USERS.add(from_number)
+        save_memory()
         return False, "⛔ *Locked*. Too many wrong attempts. You are banned."
     return False, f"🔒 *Private Bot*\n\nSend password to unlock.\nAttempts left: {MAX_TRIES - auth_tries[from_number]}"
 
@@ -241,7 +244,7 @@ def get_menu():
 👤 *Owner*: Sir
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
-🔒 *Security*: ON
+🔒 *Security*: ADMIN LOCK
 🤖 *Brain*: GPT-OSS 120B
 👁️ *Vision*: Qwen3.6 27B
 ⚡ *Speed*: Qwen3.8 27B
@@ -256,7 +259,7 @@ def get_menu():
 - Send image → `.verify`
 - Send image → `.solve`
 
-〔 *ADMIN* 〕
+〔 *OWNER ONLY* 〕
 - `.ban <number>`
 - `.unban <number>`
 
@@ -286,18 +289,25 @@ def webhook():
         if auth_msg:
             send_text(from_number, auth_msg)
 
-        # ADMIN COMMANDS
+        # ADMIN COMMANDS - OWNER ONLY
         if text.lower().startswith(".ban "):
-            if from_number in ALLOWED_USERS:
+            if from_number == OWNER_NUMBER: # <-- LOCKED TO OWNER ONLY
                 target = text.split(" ")[1]
                 BANNED_USERS.add(target)
+                save_memory()
                 send_text(from_number, f"⛔ Banned: {target}")
+            else:
+                send_text(from_number, "⛔ *Owner only command*")
             return "OK", 200
+
         if text.lower().startswith(".unban "):
-            if from_number in ALLOWED_USERS:
+            if from_number == OWNER_NUMBER: # <-- LOCKED TO OWNER ONLY
                 target = text.split(" ")[1]
                 BANNED_USERS.discard(target)
+                save_memory()
                 send_text(from_number, f"✅ Unbanned: {target}")
+            else:
+                send_text(from_number, "⛔ *Owner only command*")
             return "OK", 200
 
         if msg.get("type") == "image":
