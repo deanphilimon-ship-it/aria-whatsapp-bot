@@ -12,7 +12,7 @@ from collections import defaultdict
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.9.2"
+VERSION = "v12.9.3"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -38,7 +38,7 @@ VISION_MODEL = "qwen/qwen3.6-27b"
 
 # ====== SECURITY SETTINGS ======
 OWNER_NUMBER = "2348026177804"
-ALLOWED_USERS = ["2347069719997", "2349XXXXXXX"]
+ALLOWED_USERS = ["2348XXXXXXXX", "2349XXXXXXX"]
 PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W")
 MAX_TRIES = 4
 auth_tries = {}
@@ -48,7 +48,7 @@ BANNED_USERS = set()
 # ====== API KEYS ======
 COMICVINE_KEY = "bac15d29ffe11ced90b001b3827b2d20df130cfa"
 
-# ====== RATE LIMIT ======
+# ====== RATE LIMIT - HIDDEN FROM HUD ======
 api_requests = defaultdict(list)
 LIMITS = {
     "pint4": 20,
@@ -127,10 +127,44 @@ def send_image_url(to, image_url, caption=""):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
+# ========== ADMIN: USERS PANEL ==========
+def get_users_list():
+    owner_text = f"👑 *OWNER*\n• {OWNER_NUMBER}\n\n"
+    
+    allowed_text = "🟢 *ALLOWED USERS - Skip Password*\n"
+    for num in ALLOWED_USERS:
+        if num!= OWNER_NUMBER:
+            name = user_profile.get(num, {}).get("name", "Unknown")
+            allowed_text += f"• {num} - *{name}*\n"
+    if allowed_text == "🟢 *ALLOWED USERS - Skip Password*\n":
+        allowed_text += "• None\n"
+    
+    auth_text = "\n🔓 *AUTHENTICATED USERS - Used Password*\n"
+    temp_list = [n for n in authenticated_users if n!= OWNER_NUMBER and n not in ALLOWED_USERS]
+    if temp_list:
+        for num in temp_list:
+            name = user_profile.get(num, {}).get("name", "Unknown")
+            tries = auth_tries.get(num, 0)
+            auth_text += f"• {num} - *{name}* | Tries: {tries}\n"
+    else:
+        auth_text += "• None yet\n"
+        
+    banned_text = "\n⛔ *BANNED USERS*\n"
+    if BANNED_USERS:
+        for num in BANNED_USERS:
+            banned_text += f"• {num}\n"
+    else:
+        banned_text += "• None\n"
+        
+    total = len(set(ALLOWED_USERS + list(authenticated_users)))
+    header = f"〔 *ARIA USERS PANEL* 〕\n*Total Active:* {total}\n\n"
+    
+    return header + owner_text + allowed_text + auth_text + banned_text
+
 # ==========.PINT COMMANDS ==========
 def pint1_unsplash(sender, query):
     if not check_rate_limit(sender, "pint1"):
-        send_text(sender, "⛔ *Rate Limit*\n\n50 Unsplash searches left this hour.")
+        send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
     send_text(sender, f"📌 Pint1 Unsplash: *{query}*...")
     url = f"https://api.unsplash.com/photos/random?query={query}&client_id={UNSPLASH_KEY}&orientation=portrait"
@@ -143,7 +177,7 @@ def pint1_unsplash(sender, query):
 
 def pint2_pexels(sender, query):
     if not check_rate_limit(sender, "pint2"):
-        send_text(sender, "⛔ *Rate Limit*\n\n50 Pexels searches left this hour.")
+        send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
     send_text(sender, f"📌 Pint2 Pexels: *{query}*...")
     headers = {"Authorization": PEXELS_KEY}
@@ -176,7 +210,7 @@ def pint3_anime(sender, query):
 
 def pint4_comics(sender, query):
     if not check_rate_limit(sender, "pint4"):
-        send_text(sender, "⛔ *Rate Limit*\n\nYou hit 20 Comic searches this hour Sir.\nComicVine API resets in 60 mins.")
+        send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
     send_text(sender, f"📚 Pint4 Comics: *{query}*...")
     url = f"https://comicvine.gamespot.com/api/search/"
@@ -204,7 +238,7 @@ def pint4_comics(sender, query):
 
 def pint5_pixabay(sender, query):
     if not check_rate_limit(sender, "pint5"):
-        send_text(sender, "⛔ *Rate Limit*\n\n50 Pixabay searches left this hour.")
+        send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
     send_text(sender, f"🎨 Pint5 Pixabay: *{query}*...")
     url = f"https://pixabay.com/api/?key={PIXABAY_KEY}&q={query}&image_type=vector&orientation=horizontal&per_page=1"
@@ -309,7 +343,7 @@ def get_menu():
 👤 *Owner*: Sir
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
-🔒 *Security*: ADMIN LOCK + RATELIMIT
+🔒 *Security*: ADMIN LOCK
 🤖 *Brain*: GPT-OSS 120B
 👁️ *Vision*: Qwen3.6 27B
 ⚡ *Speed*: Qwen3.8 27B
@@ -325,15 +359,16 @@ def get_menu():
 - Send image → `.solve`
 
 〔 *OWNER ONLY* 〕
+- `.users` = View all bot users
 - `.ban <number>`
 - `.unban <number>`
 
-〔 *MEDIA - 5 PINTS* 〕
-- `.pint1 <keyword>` = Unsplash [50/hr]
-- `.pint2 <keyword>` = Pexels [50/hr]
-- `.pint3 <keyword>` = Anime/Manga [nsfw owner]
-- `.pint4 <keyword>` = DC/Marvel [20/hr]
-- `.pint5 <keyword>` = Icons/Vectors [50/hr]
+〔 *MEDIA* 〕
+- `.pint1 <keyword>` = Unsplash Photos
+- `.pint2 <keyword>` = Pexels Aesthetic
+- `.pint3 <keyword>` = Anime/Manga
+- `.pint4 <keyword>` = DC/Marvel Comics
+- `.pint5 <keyword>` = Icons/Vectors
 - `imagine <prompt>` = AI Gen
 - `.play <song name>`"""
 
@@ -352,6 +387,7 @@ def webhook():
         if not is_auth: send_text(from_number, auth_msg); return "OK", 200
         if auth_msg: send_text(from_number, auth_msg)
 
+        # ADMIN COMMANDS - OWNER ONLY
         if text.lower().startswith(".ban "):
             if from_number == OWNER_NUMBER:
                 target = text.split(" ")[1]; BANNED_USERS.add(target); save_memory(); send_text(from_number, f"⛔ Banned: {target}")
@@ -361,6 +397,13 @@ def webhook():
             if from_number == OWNER_NUMBER:
                 target = text.split(" ")[1]; BANNED_USERS.discard(target); save_memory(); send_text(from_number, f"✅ Unbanned: {target}")
             else: send_text(from_number, "⛔ *Owner only command*")
+            return "OK", 200
+        if tl == ".users":
+            if from_number == OWNER_NUMBER:
+                users_list = get_users_list()
+                send_text(from_number, users_list)
+            else: 
+                send_text(from_number, "⛔ *Owner only command*")
             return "OK", 200
 
         if msg.get("type") == "image":
