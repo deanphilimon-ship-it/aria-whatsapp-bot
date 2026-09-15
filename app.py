@@ -12,7 +12,7 @@ from collections import defaultdict
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.9.3"
+VERSION = "v12.9.4"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -364,7 +364,7 @@ def get_menu():
 - `.unban <number>`
 
 〔 *MEDIA* 〕
-- `.pint1 <keyword>` 
+- `.pint1 <keyword>`
 - `.pint2 <keyword>`
 - `.pint3 <keyword>`
 - `.pint4 <keyword>`
@@ -438,4 +438,30 @@ def webhook():
 
         if tl == ".status" or tl == ".menu": send_text(from_number, get_menu())
         elif tl.startswith(".play"): query = text[5:].strip(); result = get_youtube_link(query); send_text(from_number, result)
-        elif tl.startswith("imagine") or tl.startswith("create"): prompt = text.split(" ", 1)[1]; send_text(from_number, f"🎨 *Generating image for:* {prompt}..."); send_image_url(from_number, f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1024&height=1024", f"AI
+        elif tl.startswith("imagine") or tl.startswith("create"): 
+            parts = text.split(" ", 1)
+            if len(parts) < 2 or not parts[1].strip():
+                send_text(from_number, "⚠️ *Usage:* `imagine <prompt>`\n\nExample: `imagine cyberpunk city at night`")
+            else:
+                prompt = parts[1]
+                send_text(from_number, f"🎨 *Generating image for:* {prompt}...")
+                send_image_url(from_number, f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1024&height=1024", f"AI: {prompt}")
+        elif tl.startswith("explain"):
+            parts = text.split(" ", 2)
+            if len(parts) == 1: 
+                result = "*Usage:* `explain <topic>`"
+            elif len(parts) == 2: 
+                result = ai_explain(parts[1], "all", from_number)
+            else: 
+                result = ai_explain(parts[1], parts[2], from_number)
+            add_to_memory(from_number, "assistant", result)
+            send_text(from_number, result)
+        else: result = ai_call(text, from_number); add_to_memory(from_number, "assistant", result); send_text(from_number, result)
+
+    except Exception as e: print("Error:", e)
+    return "OK", 200
+
+@app.route("/")
+def home(): return f"ARIA {VERSION} Running"
+
+if __name__ == "__main__": app.run(host="0.0.0.0", port=5000)
