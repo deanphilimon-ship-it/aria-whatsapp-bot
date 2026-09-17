@@ -12,7 +12,7 @@ from collections import defaultdict
 from groq import Groq
 
 app = Flask(__name__)
-VERSION = "v12.9.4"
+VERSION = "v12.9.8"
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
@@ -27,16 +27,15 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-PEXELS_KEY = os.getenv("PEXELS_KEY")
+PEXELS_KEY = os.getenv("PEXELS_KEY") # Not used anymore
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
 
 CHAT_MODEL = "openai/gpt-oss-120b"
-FAST_MODEL = "qwen/qwen3.8-27b"
-VISION_MODEL = "qwen/qwen3.6-27b"
+FAST_MODEL = "qwen/qwen3-32b"
+VISION_MODEL = "meta-llama/llama-4-maverick-17b-128e-instruct"
 
-# ====== SECURITY SETTINGS ======
 OWNER_NUMBER = "2348026177804"
 ALLOWED_USERS = ["2348XXXXXXXX", "2349XXXXXXX"]
 PASSWORD = "ARIA" + datetime.now(pytz.timezone('Africa/Lagos')).strftime("%Y%W")
@@ -45,17 +44,10 @@ auth_tries = {}
 authenticated_users = set()
 BANNED_USERS = set()
 
-# ====== API KEYS ======
 COMICVINE_KEY = "bac15d29ffe11ced90b001b3827b2d20df130cfa"
 
-# ====== RATE LIMIT - HIDDEN FROM HUD ======
 api_requests = defaultdict(list)
-LIMITS = {
-    "pint4": 20,
-    "pint1": 50,
-    "pint2": 50,
-    "pint5": 50
-}
+LIMITS = {"pint4": 20, "pint1": 50, "pint2": 100, "pint5": 50}
 
 def load_memory():
     global conversation_memory, user_profile, BANNED_USERS
@@ -127,10 +119,8 @@ def send_image_url(to, image_url, caption=""):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     requests.post(url, headers=headers, json={"messaging_product": "whatsapp", "to": to, "type": "image", "image": {"link": image_url, "caption": caption}})
 
-# ========== ADMIN: USERS PANEL ==========
 def get_users_list():
     owner_text = f"👑 *OWNER*\n• {OWNER_NUMBER}\n\n"
-    
     allowed_text = "🟢 *ALLOWED USERS - Skip Password*\n"
     for num in ALLOWED_USERS:
         if num!= OWNER_NUMBER:
@@ -138,36 +128,31 @@ def get_users_list():
             allowed_text += f"• {num} - *{name}*\n"
     if allowed_text == "🟢 *ALLOWED USERS - Skip Password*\n":
         allowed_text += "• None\n"
-    
-    auth_text = "\n🔓 *AUTHENTICATED USERS - Used Password*\n"
+    auth_text = "\n🔓 *AUTHENTICATED USERS*\n"
     temp_list = [n for n in authenticated_users if n!= OWNER_NUMBER and n not in ALLOWED_USERS]
     if temp_list:
         for num in temp_list:
             name = user_profile.get(num, {}).get("name", "Unknown")
-            tries = auth_tries.get(num, 0)
-            auth_text += f"• {num} - *{name}* | Tries: {tries}\n"
+            auth_text += f"• {num} - *{name}*\n"
     else:
         auth_text += "• None yet\n"
-        
     banned_text = "\n⛔ *BANNED USERS*\n"
     if BANNED_USERS:
         for num in BANNED_USERS:
             banned_text += f"• {num}\n"
     else:
         banned_text += "• None\n"
-        
     total = len(set(ALLOWED_USERS + list(authenticated_users)))
     header = f"〔 *ARIA USERS PANEL* 〕\n*Total Active:* {total}\n\n"
-    
     return header + owner_text + allowed_text + auth_text + banned_text
 
-# ==========.PINT COMMANDS ==========
+# PINT1 UNSPLASH
 def pint1_unsplash(sender, query):
     if not check_rate_limit(sender, "pint1"):
         send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
     send_text(sender, f"📌 Pint1 Unsplash: *{query}*...")
-    url = f"https://api.unsplash.com/photos/random?query={query}&client_id={UNSPLASH_KEY}&orientation=portrait"
+    url = f"https://api.unsplash.com/photos/random?query={requests.utils.quote(query)}&client_id={UNSPLASH_KEY}&orientation=portrait"
     try:
         res = requests.get(url, timeout=10).json()
         img_url = res["urls"]["regular"]
@@ -175,38 +160,61 @@ def pint1_unsplash(sender, query):
         send_image_url(sender, img_url, caption=f"Pint1: {query}\nPhoto by {photographer} on Unsplash")
     except: send_text(sender, f"No results on Unsplash for: {query}")
 
+# NEW PINT2 WALLHAVEN - NO KEY - FANTASY + AESTHETIC
 def pint2_pexels(sender, query):
     if not check_rate_limit(sender, "pint2"):
         send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
-    send_text(sender, f"📌 Pint2 Pexels: *{query}*...")
-    headers = {"Authorization": PEXELS_KEY}
-    url = f"https://api.pexels.com/v1/search?query={query}&per_page=1&orientation=portrait"
+    send_text(sender, f"📌 Pint2 Wallhaven: *{query}*...")
+
+    # Wallhaven - Best for fantasy wallpaper
+    url = f"https://wallhaven.cc/api/v1/search?q={requests.utils.quote(query)}&sorting=random&atleast=1920x1080&ratios=16x9,9x16"
+    try:
+        res = requests.get(url, timeout=15).json()
+        if res.get("data") and len(res["data"]) > 0:
+            photo = res["data"][0]
+            photo_url = photo["path"]
+            resolution = photo.get("resolution", "4K")
+            send_image_url(sender, photo_url, caption=f"🎨 Pint2: {query}\n{resolution} | Wallhaven | Aesthetic Wallpaper")
+        else:
+            raise Exception("No wallpapers")
+    except Exception as e:
+        print(f"Wallhaven error: {e}")
+        # FALLBACK TO WIKIMEDIA + UNSPLASH
+        try:
+            url2 = f"https://api.unsplash.com/photos/random?query={requests.utils.quote(query)}&client_id={UNSPLASH_KEY}&orientation=portrait"
+            res2 = requests.get(url2, timeout=10).json()
+            img_url = res2["urls"]["regular"]
+            send_image_url(sender, img_url, caption=f"Pint2 Fallback: {query}\nFrom Unsplash")
+        except:
+            # LAST FALLBACK - FLUX AI GENERATE
+            ai_prompt = f"{query}, fantasy art, aesthetic wallpaper, ultra detailed, 4k"
+            encoded = requests.utils.quote(ai_prompt)
+            flux_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&width=1024&height=1536&enhance=true&nologo=true"
+            send_image_url(sender, flux_url, caption=f"Pint2 AI: {query}\nGenerated with FLUX - Fantasy Aesthetic")
+
+# PINT3 DANBOORU - NO KEY
+def pint3_anime(sender, query):
+    send_text(sender, f"🎌 Pint3 Danbooru: *{query}*...")
+    q = query.lower().replace(" ", "_")
+    nsfw_tags = ["naked", "nude", "boobs", "pussy", "sex", "nsfw"]
+    if any(tag in q for tag in nsfw_tags) and sender!= OWNER_NUMBER:
+        send_text(sender, "⛔ *SFW Only*\n\nOwner can use NSFW tags. Try: Goku, Naruto, Luffy")
+        return
+    url = f"https://danbooru.donmai.us/posts.json?tags={q}&limit=1&random=true"
+    headers = {"User-Agent": "ARIA-Bot/1.0"}
     try:
         res = requests.get(url, headers=headers, timeout=10).json()
-        photo_url = res["photos"][0]["src"]["large2x"]
-        photographer = res["photos"][0]["photographer"]
-        send_image_url(sender, photo_url, caption=f"Pint2: {query}\nPhoto by {photographer} on Pexels")
-    except: send_text(sender, f"No results on Pexels for: {query}")
-
-def pint3_anime(sender, query):
-    send_text(sender, f"🎌 Pint3 Anime: *{query}*...")
-    query = query.lower()
-    nsfw = False
-    if "nsfw" in query:
-        if sender!= OWNER_NUMBER:
-            send_text(sender, "NSFW is Owner only")
-            return
-        nsfw = True
-        query = query.replace("nsfw", "").strip()
-    if "manhwa" in query or "manga" in query: tag = "shinobu"
-    elif "neko" in query: tag = "neko"
-    else: tag = "waifu"
-    url = f"https://api.waifu.pics/nsfw/{tag}" if nsfw else f"https://api.waifu.pics/sfw/{tag}"
-    try:
-        res = requests.get(url, timeout=10).json()
-        send_image_url(sender, res["url"], caption=f"Pint3: {query}\nAnime by waifu.pics")
-    except: send_text(sender, f"Pint3 Error. Try: waifu, neko, manga")
+        if res and len(res) > 0:
+            post = res[0]
+            file_url = post.get("large_file_url") or post.get("file_url")
+            img_url = "https://danbooru.donmai.us" + file_url if file_url.startswith("/") else file_url
+            tags = post["tag_string"].split()[:5]
+            send_image_url(sender, img_url, caption=f"Pint3: {query}\nTags: {', '.join(tags)}\nSource: Danbooru")
+        else:
+            send_text(sender, f"No results for: *{query}*\n\nTry: Goku, Naruto, Luffy, Mikasa, Rem")
+    except Exception as e:
+        send_text(sender, f"Pint3 Error: {str(e)[:80]}\nTry different character")
 
 def pint4_comics(sender, query):
     if not check_rate_limit(sender, "pint4"):
@@ -231,27 +239,36 @@ def pint4_comics(sender, query):
             else: send_text(sender, f"No comics found for: *{query}*. Try 'Batman', 'Spider-Man'")
         else:
             send_text(sender, f"⚠️ ComicVine Error: {res.get('error', 'Unknown')}")
-    except requests.Timeout: 
-        send_text(sender, f"⚠️ ComicVine is slow. Try again in 10s")
-    except Exception as e: 
-        send_text(sender, f"Pint4 Error: {str(e)[:100]}")
+    except: send_text(sender, f"⚠️ ComicVine is slow. Try again in 10s")
 
-def pint5_pixabay(sender, query):
+def pint5_education(sender, query):
     if not check_rate_limit(sender, "pint5"):
         send_text(sender, "⛔ *Rate Limit*\n\nToo many searches. Try again later.")
         return
-    send_text(sender, f"🎨 Pint5 Pixabay: *{query}*...")
-    url = f"https://pixabay.com/api/?key={PIXABAY_KEY}&q={query}&image_type=vector&orientation=horizontal&per_page=1"
+    send_text(sender, f"🧪 Pint5 Education: *{query}*... Searching diagrams")
+    edu_query = f"{query} diagram laboratory apparatus scientific chart"
+    url = f"https://api.unsplash.com/photos/random?query={requests.utils.quote(edu_query)}&client_id={UNSPLASH_KEY}&orientation=landscape"
     try:
         res = requests.get(url, timeout=10).json()
-        if res["hits"]:
-            photo_url = res["hits"][0]["largeImageURL"]
-            user = res["hits"][0]["user"]
-            send_image_url(sender, photo_url, caption=f"Pint5: {query}\nVector/Icon by {user} on Pixabay")
-        else: send_text(sender, f"No vectors found for: {query}")
-    except: send_text(sender, f"Pint5 Error")
+        img_url = res["urls"]["regular"]
+        photographer = res["user"]["name"]
+        send_image_url(sender, img_url, caption=f"🧪 Pint5: {query}\nEducational Diagram + Apparatus\nPhoto by {photographer} on Unsplash")
+    except:
+        ai_prompt = f"detailed educational diagram of {query}, labeled apparatus, scientific illustration, clean white background"
+        send_text(sender, f"Using AI to generate diagram for: {query}")
+        send_image_url(sender, f"https://image.pollinations.ai/prompt/{requests.utils.quote(ai_prompt)}?model=flux&width=1024&height=768&enhance=true&nologo=true", f"Pint5 AI: {query}\nEducational Diagram")
 
-# ========== AI/VISION FUNCTIONS ==========
+# NEW FLUX IMAGINE - BETTER QUALITY
+def imagine_generate(sender, prompt):
+    send_text(sender, f"🎨 *FLUX AI Generating:* {prompt}...")
+    encoded = requests.utils.quote(prompt + ", ultra detailed, 8k, cinematic lighting, sharp focus, fantasy art")
+    flux_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&width=1024&height=1024&enhance=true&nologo=true&seed={hash(prompt) % 10000}"
+    try:
+        send_image_url(sender, flux_url, caption=f"FLUX: {prompt}\nModel: FLUX.1-dev | Enhanced")
+    except:
+        turbo_url = f"https://image.pollinations.ai/prompt/{encoded}?model=turbo&width=1024&height=1024&nologo=true"
+        send_image_url(sender, turbo_url, caption=f"AI: {prompt}\nModel: Turbo Fallback")
+
 def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intelligent Assistant. Reply with clean WhatsApp UI. Use emojis, bold *text*, and bullet points. NO markdown tables, NO ###. Use '〔 *TITLE* 〕' for sections. Use '•' for bullets. Be presentable like Meta AI. Max 300 words."):
     memory_context = build_memory_context(from_number)
     full_prompt = f"{memory_context}\n\nUser: {prompt}"
@@ -264,16 +281,32 @@ def ai_call(prompt, from_number, system="You are ARIA. Advanced Responsive Intel
         return full_response
     except Exception as e: return f"⚠️ *AI Error:* {e}"
 
+# VISION WITH 4-MODEL FALLBACK
 def vision_call(image_url, prompt):
     base64_image = download_whatsapp_image(image_url)
     short_prompt = f"{prompt}. Think step by step. Be concise. Use bullet points. Max 150 words."
-    full_response = ""
-    try:
-        stream = client.chat.completions.create(model=VISION_MODEL, messages=[{"role": "user","content": [{"type": "text", "text": short_prompt},{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]}], temperature=0.3, max_tokens=400, stream=True)
-        for chunk in stream:
-            if chunk.choices[0].delta.content: full_response += chunk.choices[0].delta.content
-        return full_response
-    except Exception as e: return f"⚠️ *Vision error:* {e}"
+    models_to_try = [
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "meta-llama/llama-3.2-90b-vision-preview",
+        "meta-llama/llama-3.2-11b-vision-preview"
+    ]
+    for model_name in models_to_try:
+        try:
+            full_response = ""
+            stream = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user","content": [{"type": "text", "text": short_prompt},{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]}],
+                temperature=0.3, max_tokens=500, stream=True)
+            for chunk in stream:
+                if chunk.choices[0].delta.content: full_response += chunk.choices[0].delta.content
+            if full_response:
+                print(f"Vision success: {model_name}")
+                return full_response
+        except Exception as e:
+            print(f"Vision failed {model_name}: {e}")
+            continue
+    return f"⚠️ *All Vision models failed.* Try again in 30s."
 
 def download_whatsapp_image(image_url):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
@@ -344,9 +377,9 @@ def get_menu():
 🧠 *Memory*: ON
 ⏱️ *Runtime*: {get_runtime()}
 🔒 *Security*: ADMIN LOCK
-🤖 *Brain*: GPT-OSS 120B
-👁️ *Vision*: Qwen3.6 27B
-⚡ *Speed*: Qwen3.8 27B
+🤖 *Brain*: GPT-OSS 120B + Qwen3-32b
+👁️ *Vision*: Llama-4 Maverick Fallback (4 models)
+🎨 *Imagine*: FLUX.1-dev Enhanced
 🕒 *Time*: {lt}
 
 〔 *AI COMMANDS* 〕
@@ -363,16 +396,15 @@ def get_menu():
 - `.ban <number>`
 - `.unban <number>`
 
-〔 *MEDIA* 〕
+〔 *MEDIA - ALL FIXED* 〕
 - `.pint1 <keyword>`
 - `.pint2 <keyword>`
-- `.pint3 <keyword>`
+- `.pint3 <character>` 
 - `.pint4 <keyword>`
-- `.pint5 <keyword>`
-- `imagine <prompt>`
+- `.pint5 <subject>`
+- `imagine <prompt>` 
 - `.play <song name>`"""
 
-# ====== WEBHOOK ======
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     global last_explain_topic, user_waiting_image
@@ -382,13 +414,12 @@ def webhook():
         msg = data["entry"][0]["changes"][0]["value"]["messages"][0]
         from_number = msg["from"]
         text = msg.get("text", {}).get("body", "").strip()
-        tl = text.lower() # <-- FIX: DEFINED BEFORE USE
-        
+        tl = text.lower()
+
         is_auth, auth_msg = check_auth(from_number, text)
         if not is_auth: send_text(from_number, auth_msg); return "OK", 200
         if auth_msg: send_text(from_number, auth_msg)
 
-        # ADMIN COMMANDS - OWNER ONLY
         if text.lower().startswith(".ban "):
             if from_number == OWNER_NUMBER:
                 target = text.split(" ")[1]; BANNED_USERS.add(target); save_memory(); send_text(from_number, f"⛔ Banned: {target}")
@@ -403,7 +434,7 @@ def webhook():
             if from_number == OWNER_NUMBER:
                 users_list = get_users_list()
                 send_text(from_number, users_list)
-            else: 
+            else:
                 send_text(from_number, "⛔ *Owner only command*")
             return "OK", 200
 
@@ -434,25 +465,23 @@ def webhook():
         if tl.startswith(".pint2 "): pint2_pexels(from_number, text[7:]); return "OK", 200
         if tl.startswith(".pint3 "): pint3_anime(from_number, text[7:]); return "OK", 200
         if tl.startswith(".pint4 "): pint4_comics(from_number, text[7:]); return "OK", 200
-        if tl.startswith(".pint5 "): pint5_pixabay(from_number, text[7:]); return "OK", 200
+        if tl.startswith(".pint5 "): pint5_education(from_number, text[7:]); return "OK", 200
 
         if tl == ".status" or tl == ".menu": send_text(from_number, get_menu())
         elif tl.startswith(".play"): query = text[5:].strip(); result = get_youtube_link(query); send_text(from_number, result)
-        elif tl.startswith("imagine") or tl.startswith("create"): 
+        elif tl.startswith("imagine") or tl.startswith("create"):
             parts = text.split(" ", 1)
             if len(parts) < 2 or not parts[1].strip():
                 send_text(from_number, "⚠️ *Usage:* `imagine <prompt>`\n\nExample: `imagine cyberpunk city at night`")
             else:
-                prompt = parts[1]
-                send_text(from_number, f"🎨 *Generating image for:* {prompt}...")
-                send_image_url(from_number, f"https://image.pollinations.ai/prompt/{requests.utils.quote(prompt)}?width=1024&height=1024", f"AI: {prompt}")
+                imagine_generate(from_number, parts[1])
         elif tl.startswith("explain"):
             parts = text.split(" ", 2)
-            if len(parts) == 1: 
+            if len(parts) == 1:
                 result = "*Usage:* `explain <topic>`"
-            elif len(parts) == 2: 
+            elif len(parts) == 2:
                 result = ai_explain(parts[1], "all", from_number)
-            else: 
+            else:
                 result = ai_explain(parts[1], parts[2], from_number)
             add_to_memory(from_number, "assistant", result)
             send_text(from_number, result)
