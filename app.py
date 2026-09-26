@@ -19,7 +19,7 @@ from groq import Groq
 
 app = Flask(__name__)
 
-VERSION = "v13.0.1"
+VERSION = "v14.0.0"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -34,6 +34,7 @@ GRAPH_API_VERSION = os.getenv(
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
+IMAGE_WAIT_TIMEOUT = 30 * 60
 
 conversation_memory = {}
 user_profile = {}
@@ -50,6 +51,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
@@ -60,7 +62,8 @@ COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 # ============================================================
 
 CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "qwen/qwen3.8-27b"
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 # ============================================================
 # GROQ CLIENT
@@ -1527,21 +1530,173 @@ def add_to_memory(
     save_memory()
 
 # ============================================================
-# AI CALL
+# AI PROVIDER LAYER
 # ============================================================
+
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+)
+
+
+def _extract_groq_text(completion):
+
+    if not completion or not getattr(completion, "choices", None):
+        return ""
+
+    message = getattr(
+        completion.choices[0],
+        "message",
+        None
+    )
+
+    if not message:
+        return ""
+
+    content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if content is None:
+        return ""
+
+    return str(content).strip()
+
+
+def _extract_gemini_text(data):
+
+    candidates = data.get("candidates") or []
+
+    if not candidates:
+        return ""
+
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+
+    texts = []
+
+    for part in parts:
+        text = part.get("text")
+        if text:
+            texts.append(str(text))
+
+    return "\n".join(texts).strip()
+
+
+def gemini_call(
+    prompt,
+    system=DEFAULT_SYSTEM_PROMPT,
+    image_data=None,
+    mime_type=None,
+    timeout=45
+):
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+
+    parts = []
+
+    if image_data:
+        if not mime_type or not mime_type.startswith("image/"):
+            raise ValueError("Gemini vision requires an image MIME type")
+
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": image_data
+                }
+            }
+        )
+
+    parts.append(
+        {
+            "text": prompt
+        }
+    )
+
+    payload = {
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": system
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 1024
+        }
+    }
+
+    response = requests.post(
+        f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Gemini HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    data = response.json()
+    text = _extract_gemini_text(data)
+
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+
+    return text
+
+
+def groq_chat_call(
+    prompt,
+    system=DEFAULT_SYSTEM_PROMPT
+):
+
+    if not client:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
+    completion = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.6,
+        max_tokens=1024,
+        top_p=0.95,
+        stream=False
+    )
+
+    text = _extract_groq_text(completion)
+
+    if not text:
+        raise ValueError("Groq returned an empty response")
+
+    return text
+
 
 def ai_call(
     prompt,
     from_number,
     system=DEFAULT_SYSTEM_PROMPT
 ):
-
-    if not client:
-
-        return (
-            "AI is not configured.\n\n"
-            "GROQ_API_KEY is missing."
-        )
 
     memory_context = build_memory_context(
         from_number
@@ -1553,75 +1708,70 @@ def ai_call(
     )
 
     user_content = full_prompt[:12000]
+    errors = []
 
-    try:
-
-        completion = (
-            client.chat.completions.create(
-                model=CHAT_MODEL,
-
-                messages=[
-                    {
-                        "role":
-                        "system",
-
-                        "content":
-                        system
-                    },
-
-                    {
-                        "role":
-                        "user",
-
-                        "content":
-                        user_content
-                    }
-                ],
-
-                temperature=0.6,
-
-                # PATCH:
-                # Compatible with the SDK currently
-                # installed on your Render service.
-                max_tokens=1024,
-
-                top_p=0.95,
-
-                stream=False,
-
-                reasoning_effort="medium",
-
-                include_reasoning=False
-            )
-        )
-
-        response = (
-            completion
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            return (
-                "I received an empty response from the AI."
+    # Primary: Groq.
+    if client:
+        try:
+            response = groq_chat_call(
+                user_content,
+                system=system
             )
 
-        return response.strip()
+            print(
+                f"[AI SUCCESS] provider=groq model={CHAT_MODEL}"
+            )
 
-    except Exception as e:
+            return response
 
-        print(
-            "[AI ERROR]",
-            repr(e)
-        )
+        except Exception as e:
+            errors.append(
+                f"Groq: {repr(e)}"
+            )
+            print(
+                "[AI GROQ ERROR]",
+                repr(e)
+            )
 
+    # Fallback: Gemini. Optional and only used if configured.
+    if GEMINI_API_KEY:
+        try:
+            response = gemini_call(
+                user_content,
+                system=system
+            )
+
+            print(
+                f"[AI SUCCESS] provider=gemini model={GEMINI_MODEL}"
+            )
+
+            return response
+
+        except Exception as e:
+            errors.append(
+                f"Gemini: {repr(e)}"
+            )
+            print(
+                "[AI GEMINI ERROR]",
+                repr(e)
+            )
+
+    if not client and not GEMINI_API_KEY:
         return (
-            "AI request failed.\n\n"
-            "Check the Render logs for "
-            "[AI ERROR] to see the exact cause."
+            "AI is not configured.\n\n"
+            "Add GROQ_API_KEY or GEMINI_API_KEY to Render."
         )
+
+    print(
+        "[AI ERROR SUMMARY]",
+        " | ".join(errors)
+    )
+
+    return (
+        "AI request failed.\n\n"
+        "Both configured AI providers failed. "
+        "Use `.health` to see their status."
+    )
 
 # ============================================================
 # WHATSAPP IMAGE DOWNLOAD
@@ -1633,7 +1783,6 @@ def download_whatsapp_image(
 ):
 
     if not image_url:
-
         raise ValueError(
             "WhatsApp returned no image URL."
         )
@@ -1652,7 +1801,6 @@ def download_whatsapp_image(
     response.raise_for_status()
 
     if not response.content:
-
         raise ValueError(
             "Downloaded image is empty."
         )
@@ -1672,10 +1820,7 @@ def download_whatsapp_image(
         .lower()
     )
 
-    if not detected_mime.startswith(
-        "image/"
-    ):
-
+    if not detected_mime.startswith("image/"):
         raise ValueError(
             "Downloaded media is not an image: "
             f"{detected_mime}"
@@ -1687,27 +1832,71 @@ def download_whatsapp_image(
     )
 
     if image_size_mb > 20:
-
         raise ValueError(
-            f"Image is too large "
-            f"({image_size_mb:.1f} MB). "
+            f"Image is too large ({image_size_mb:.1f} MB). "
             "Maximum supported size is 20 MB."
         )
 
     encoded = base64.b64encode(
         response.content
-    ).decode(
-        "utf-8"
+    ).decode("utf-8")
+
+    return encoded, detected_mime
+
+
+def groq_vision_call(
+    base64_image,
+    detected_mime,
+    prompt
+):
+
+    if not client:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
+    vision_prompt = (
+        f"{prompt}\n\n"
+        "Be accurate and concise. "
+        "If something cannot be determined from the image, "
+        "say that clearly instead of guessing."
     )
 
-    return (
-        encoded,
-        detected_mime
+    completion = client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": vision_prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                f"data:{detected_mime};"
+                                f"base64,{base64_image}"
+                            )
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0.3,
+        max_tokens=1024,
+        top_p=0.9,
+        stream=False
     )
 
-# ============================================================
-# VISION CALL
-# ============================================================
+    text = _extract_groq_text(completion)
+
+    if not text:
+        raise ValueError(
+            "Groq vision returned an empty response"
+        )
+
+    return text
+
 
 def vision_call(
     image_url,
@@ -1715,15 +1904,7 @@ def vision_call(
     mime_type=None
 ):
 
-    if not client:
-
-        return (
-            "Vision is not configured.\n\n"
-            "GROQ_API_KEY is missing."
-        )
-
     try:
-
         (
             base64_image,
             detected_mime
@@ -1731,95 +1912,176 @@ def vision_call(
             image_url,
             mime_type
         )
-
-        vision_prompt = (
-            f"{prompt}\n\n"
-            "Be accurate and concise. "
-            "If something cannot be determined "
-            "from the image, say that clearly "
-            "instead of guessing."
-        )
-
-        completion = (
-            client.chat.completions.create(
-                model=VISION_MODEL,
-
-                messages=[
-                    {
-                        "role":
-                        "user",
-
-                        "content": [
-                            {
-                                "type":
-                                "text",
-
-                                "text":
-                                vision_prompt
-                            },
-
-                            {
-                                "type":
-                                "image_url",
-
-                                "image_url": {
-                                    "url":
-                                    (
-                                        f"data:{detected_mime};"
-                                        f"base64,{base64_image}"
-                                    )
-                                }
-                            }
-                        ]
-                    }
-                ],
-
-                temperature=0.3,
-
-                # PATCH:
-                # Changed from max_completion_tokens.
-                max_tokens=1024,
-
-                top_p=0.9,
-
-                stream=False,
-
-                reasoning_effort="none"
-            )
-        )
-
-        response = (
-            completion
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            raise ValueError(
-                "Vision model returned an empty response."
-            )
-
-        print(
-            f"[VISION SUCCESS] "
-            f"{VISION_MODEL}"
-        )
-
-        return response.strip()
-
     except Exception as e:
-
         print(
-            "[VISION ERROR]",
+            "[VISION DOWNLOAD ERROR]",
             repr(e)
+        )
+        return (
+            "I couldn't retrieve that image from WhatsApp.\n\n"
+            f"Reason: {str(e)[:500]}"
+        )
+
+    errors = []
+
+    # Primary vision provider: Groq Qwen 3.8 27B.
+    if client:
+        try:
+            result = groq_vision_call(
+                base64_image,
+                detected_mime,
+                prompt
+            )
+
+            print(
+                f"[VISION SUCCESS] provider=groq model={VISION_MODEL}"
+            )
+
+            return result.strip()
+
+        except Exception as e:
+            errors.append(
+                f"Groq Vision: {repr(e)}"
+            )
+            print(
+                "[VISION GROQ ERROR]",
+                repr(e)
+            )
+
+    # Fallback vision provider: Gemini.
+    if GEMINI_API_KEY:
+        try:
+            result = gemini_call(
+                prompt + "\n\n"
+                "Be accurate and concise. "
+                "If something cannot be determined from the image, "
+                "say that clearly instead of guessing.",
+                system=DEFAULT_SYSTEM_PROMPT,
+                image_data=base64_image,
+                mime_type=detected_mime
+            )
+
+            print(
+                f"[VISION SUCCESS] provider=gemini model={GEMINI_MODEL}"
+            )
+
+            return result.strip()
+
+        except Exception as e:
+            errors.append(
+                f"Gemini Vision: {repr(e)}"
+            )
+            print(
+                "[VISION GEMINI ERROR]",
+                repr(e)
+            )
+
+    if not client and not GEMINI_API_KEY:
+        return (
+            "Vision is not configured.\n\n"
+            "Add GROQ_API_KEY or GEMINI_API_KEY to Render."
+        )
+
+    print(
+        "[VISION ERROR SUMMARY]",
+        " | ".join(errors)
+    )
+
+    return (
+        "I couldn't process that image.\n\n"
+        "Both configured vision providers failed. "
+        "Use `.health` to see their configuration/status."
+    )
+
+# ============================================================
+# PROVIDER HEALTH
+# ============================================================
+
+def check_groq_chat_health():
+
+    if not client:
+        return "NOT CONFIGURED"
+
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Reply only with OK."
+                }
+            ],
+            max_tokens=8,
+            stream=False
         )
 
         return (
-            "I couldn't process that image.\n\n"
-            "Check the Render logs for "
-            "[VISION ERROR] to see the exact cause."
+            "ONLINE"
+            if _extract_groq_text(completion)
+            else "EMPTY RESPONSE"
         )
+
+    except Exception as e:
+        print(
+            "[HEALTH GROQ ERROR]",
+            repr(e)
+        )
+        return "FAILED"
+
+
+def check_gemini_health():
+
+    if not GEMINI_API_KEY:
+        return "NOT CONFIGURED"
+
+    try:
+        result = gemini_call(
+            "Reply only with OK.",
+            system="You are a health check."
+        )
+
+        return "ONLINE" if result else "EMPTY RESPONSE"
+
+    except Exception as e:
+        print(
+            "[HEALTH GEMINI ERROR]",
+            repr(e)
+        )
+        return "FAILED"
+
+
+def check_groq_models():
+
+    if not client:
+        return "NOT CONFIGURED"
+
+    try:
+        models = client.models.list()
+        ids = {
+            getattr(model, "id", "")
+            for model in models.data
+        }
+
+        chat_ok = CHAT_MODEL in ids
+        vision_ok = VISION_MODEL in ids
+
+        if chat_ok and vision_ok:
+            return "AVAILABLE"
+
+        missing = []
+        if not chat_ok:
+            missing.append("chat")
+        if not vision_ok:
+            missing.append("vision")
+
+        return "MISSING " + ", ".join(missing)
+
+    except Exception as e:
+        print(
+            "[HEALTH MODEL LIST ERROR]",
+            repr(e)
+        )
+        return "UNKNOWN"
 
 # ============================================================
 # SOLVE IMAGE
@@ -2066,61 +2328,36 @@ def get_runtime():
     )
 
 # ============================================================
-# MENU
-# NOTE:
-# .status and .menu are intentionally still together
-# in this version. We will separate them AFTER the API
-# patch is confirmed working.
+# MENU / STATUS
 # ============================================================
 
 def get_menu():
 
-    local_time = datetime.now(
-        pytz.timezone(
-            "Africa/Lagos"
-        )
-    ).strftime(
-        "%I:%M %p"
-    )
-
     return f"""
 〔 *ARIA {VERSION}* 〕
 
-*Memory:* ON
-*Runtime:* {get_runtime()}
-*Security:* ADMIN LOCK
+*AI assistant + WhatsApp automation*
 
-*Brain:* GPT-OSS 120B
-*Vision:* Qwen 3.8 27B
-*Imagine:* FLUX
-
-*Time:* {local_time}
-
-〔 *AI COMMANDS* 〕
-
+〔 *AI* 〕
 • `explain <topic>`
 • `explain <topic> <1-6>`
 
 〔 *VISION* 〕
-
 • Send image → `.describe`
 • Send image → `.verify`
 • Send image → `.solve`
 
 〔 *SYSTEM* 〕
-
-• `.health`
-• `.status`
-• `.menu`
+• `.health` — live dependency checks
+• `.status` — current configuration
+• `.menu` — this command list
 
 〔 *OWNER* 〕
-
 • `.users`
 • `.ban <number>`
 • `.unban <number>`
 
 〔 *MEDIA* 〕
-
 • `.pint1 <keyword>`
 • `.pint2 <keyword>`
 • `.pint3 <character>`
@@ -2128,6 +2365,55 @@ def get_menu():
 • `.pint5 <subject>`
 • `imagine <prompt>`
 • `.play <song name>`
+"""
+
+
+def get_status():
+
+    local_time = datetime.now(
+        pytz.timezone("Africa/Lagos")
+    ).strftime("%I:%M %p")
+
+    whatsapp = (
+        "CONFIGURED"
+        if WHATSAPP_TOKEN and PHONE_NUMBER_ID
+        else "NOT CONFIGURED"
+    )
+
+    groq = (
+        "CONFIGURED"
+        if client
+        else "NOT CONFIGURED"
+    )
+
+    gemini = (
+        "CONFIGURED"
+        if GEMINI_API_KEY
+        else "NOT CONFIGURED"
+    )
+
+    pending_images = len(user_waiting_image)
+
+    return f"""
+〔 *ARIA STATUS* 〕
+
+*Version:* {VERSION}
+*Runtime:* {get_runtime()}
+*Lagos Time:* {local_time}
+*Graph API:* {GRAPH_API_VERSION}
+
+〔 *PROVIDERS* 〕
+*Groq:* {groq}
+*Groq Chat:* {CHAT_MODEL}
+*Groq Vision:* {VISION_MODEL}
+*Gemini:* {gemini}
+*Gemini Model:* {GEMINI_MODEL}
+
+〔 *SYSTEMS* 〕
+*WhatsApp:* {whatsapp}
+*Memory:* OK
+*Pending Images:* {pending_images}
+*Image Fallback:* {"ENABLED" if GEMINI_API_KEY else "DISABLED"}
 """
 
 # ============================================================
@@ -2204,36 +2490,34 @@ def webhook():
                 200
             )
 
-        changes = entries[0].get(
-            "changes",
-            []
-        )
+        # Meta can send multiple entries/changes in one webhook.
+        # Find the first actual inbound message and ignore delivery/status events.
+        msg = None
 
-        if not changes:
+        for entry in entries:
+
+            for change in entry.get("changes", []):
+
+                value = change.get("value") or {}
+
+                for candidate in value.get("messages", []):
+
+                    if candidate.get("from"):
+                        msg = candidate
+                        break
+
+                if msg:
+                    break
+
+            if msg:
+                break
+
+        if not msg:
 
             return (
                 "OK",
                 200
             )
-
-        value = changes[0].get(
-            "value",
-            {}
-        )
-
-        messages = value.get(
-            "messages",
-            []
-        )
-
-        if not messages:
-
-            return (
-                "OK",
-                200
-            )
-
-        msg = messages[0]
 
         from_number = msg.get(
             "from"
@@ -2504,11 +2788,9 @@ def webhook():
                 user_waiting_image[
                     from_number
                 ] = {
-                    "url":
-                    image_url,
-
-                    "mime_type":
-                    media_mime_type
+                    "url": image_url,
+                    "mime_type": media_mime_type,
+                    "saved_at": time.time()
                 }
 
                 send_text(
@@ -2603,109 +2885,59 @@ def webhook():
 
         if tl == ".health":
 
-            groq_status = "NOT CONFIGURED"
+            groq_chat_status = check_groq_chat_health()
+            gemini_status = check_gemini_health()
+            groq_models_status = check_groq_models()
 
-            if client:
-
-                try:
-
-                    health_test = (
-                        client.chat.completions.create(
-                            model=CHAT_MODEL,
-
-                            messages=[
-                                {
-                                    "role":
-                                    "user",
-
-                                    "content":
-                                    "Reply only with: OK"
-                                }
-                            ],
-
-                            # PATCH:
-                            # Changed from
-                            # max_completion_tokens.
-                            max_tokens=10,
-
-                            stream=False,
-
-                            reasoning_effort="low",
-
-                            include_reasoning=False
-                        )
-                    )
-
-                    if (
-                        health_test.choices
-                        and health_test.choices[0].message
-                    ):
-
-                        groq_status = "ONLINE"
-
-                    else:
-
-                        groq_status = "EMPTY RESPONSE"
-
-                except Exception as e:
-
-                    groq_status = "FAILED"
-
-                    print(
-                        "[HEALTH GROQ ERROR]",
-                        repr(e)
-                    )
+            whatsapp_status = (
+                "CONFIGURED"
+                if WHATSAPP_TOKEN and PHONE_NUMBER_ID
+                else "NOT CONFIGURED"
+            )
 
             memory_status = (
                 "OK"
                 if conversation_memory is not None
+                and user_profile is not None
+                and BANNED_USERS is not None
                 else "ERROR"
             )
 
-            whatsapp_status = (
-                "CONFIGURED"
-                if (
-                    WHATSAPP_TOKEN
-                    and PHONE_NUMBER_ID
-                )
-                else
-                "NOT CONFIGURED"
+            groq_vision_status = (
+                "READY"
+                if client and groq_models_status in {
+                    "AVAILABLE",
+                    "UNKNOWN"
+                }
+                else "NOT CONFIGURED"
+                if not client
+                else "CHECK FAILED"
             )
 
-            vision_status = (
-                "CONFIGURED"
-                if client
-                else
-                "NOT CONFIGURED"
+            gemini_vision_status = (
+                "READY"
+                if GEMINI_API_KEY
+                else "NOT CONFIGURED"
             )
 
             health = (
                 f"〔 *ARIA HEALTH* 〕\n\n"
-
                 f"*Version:* {VERSION}\n"
-
                 f"*Runtime:* {get_runtime()}\n"
-
-                f"*Graph API:* "
-                f"{GRAPH_API_VERSION}\n"
-
-                f"*WhatsApp:* "
-                f"{whatsapp_status}\n"
-
-                f"*Chat Model:* "
-                f"{CHAT_MODEL}\n"
-
-                f"*Groq Chat:* "
-                f"{groq_status}\n"
-
-                f"*Vision Model:* "
-                f"{VISION_MODEL}\n"
-
-                f"*Vision:* "
-                f"{vision_status}\n"
-
-                f"*Memory:* "
-                f"{memory_status}\n"
+                f"*Graph API:* {GRAPH_API_VERSION}\n\n"
+                f"〔 *CORE* 〕\n"
+                f"*WhatsApp:* {whatsapp_status}\n"
+                f"*Memory:* {memory_status}\n\n"
+                f"〔 *GROQ* 〕\n"
+                f"*Chat:* {groq_chat_status}\n"
+                f"*Models:* {groq_models_status}\n"
+                f"*Vision:* {groq_vision_status}\n"
+                f"*Chat Model:* {CHAT_MODEL}\n"
+                f"*Vision Model:* {VISION_MODEL}\n\n"
+                f"〔 *GEMINI FALLBACK* 〕\n"
+                f"*API:* {gemini_status}\n"
+                f"*Vision:* {gemini_vision_status}\n"
+                f"*Model:* {GEMINI_MODEL}\n"
             )
 
             send_text(
@@ -2734,11 +2966,22 @@ def webhook():
                 )
             )
 
+            if saved_image:
+
+                saved_at = saved_image.get("saved_at", 0)
+
+                if saved_at and time.time() - saved_at > IMAGE_WAIT_TIMEOUT:
+                    user_waiting_image.pop(
+                        from_number,
+                        None
+                    )
+                    saved_image = None
+
             if not saved_image:
 
                 send_text(
                     from_number,
-                    "Send an image first."
+                    "No recent image is waiting. Send an image first."
                 )
 
                 return (
@@ -2923,14 +3166,23 @@ If text is unreadable, say so.
         # STATUS / MENU
         # ====================================================
 
-        if tl in [
-            ".status",
-            ".menu"
-        ]:
+        if tl == ".menu":
 
             send_text(
                 from_number,
                 get_menu()
+            )
+
+            return (
+                "OK",
+                200
+            )
+
+        if tl == ".status":
+
+            send_text(
+                from_number,
+                get_status()
             )
 
             return (
@@ -3121,7 +3373,9 @@ def home():
     return (
         f"ARIA {VERSION} Running | "
         f"Graph API {GRAPH_API_VERSION} | "
-        f"Vision {VISION_MODEL}"
+        f"Chat {CHAT_MODEL} | "
+        f"Vision {VISION_MODEL} | "
+        f"Gemini {GEMINI_MODEL}"
     )
 
 # ============================================================
@@ -3141,6 +3395,9 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
+
+
 
 
 
