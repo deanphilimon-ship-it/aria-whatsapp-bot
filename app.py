@@ -4,6 +4,7 @@ import os
 import base64
 import json
 import re
+import hashlib
 from datetime import datetime
 import pytz
 import time
@@ -13,18 +14,32 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# Patched Version
+# VERSION 13.0.1
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "v13.0.0"
+VERSION = "v13.0.1"
+start_time = time.time()
+
+
+# ============================================================
+# META GRAPH API
+# ============================================================
+
+GRAPH_API_VERSION = os.getenv(
+    "GRAPH_API_VERSION",
+    "v26.0"
+)
+
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
-
-start_time = time.time()
 
 conversation_memory = {}
 user_profile = {}
@@ -39,15 +54,12 @@ MEMORY_FILE = "aria_memory.json"
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-
-UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
-PIXABAY_KEY = os.getenv("PIXABAY_KEY")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ComicVine key should be stored in Render Environment Variables.
-# If you have not created COMICVINE_KEY there yet, the bot will
-# still run, but Pint4 will report that the key is missing.
+UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
+PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 
 
@@ -55,10 +67,8 @@ COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 # GROQ MODELS
 # ============================================================
 
-# Main text/reasoning model
 CHAT_MODEL = "openai/gpt-oss-120b"
 
-# Current Groq multimodal vision model
 VISION_MODEL = "qwen/qwen3.8-27b"
 
 
@@ -66,7 +76,11 @@ VISION_MODEL = "qwen/qwen3.8-27b"
 # GROQ CLIENT
 # ============================================================
 
-client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+client = (
+    Groq(api_key=GROQ_API_KEY)
+    if GROQ_API_KEY
+    else None
+)
 
 
 # ============================================================
@@ -90,7 +104,9 @@ PASSWORD = (
 MAX_TRIES = 4
 
 auth_tries = {}
+
 authenticated_users = set()
+
 BANNED_USERS = set()
 
 
@@ -113,6 +129,7 @@ LIMITS = {
 # ============================================================
 
 def load_memory():
+
     global conversation_memory
     global user_profile
     global BANNED_USERS
@@ -121,20 +138,50 @@ def load_memory():
         return
 
     try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+
+        with open(
+            MEMORY_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
 
-        conversation_memory = data.get("convo", {})
-        user_profile = data.get("profile", {})
-        BANNED_USERS = set(data.get("banned", []))
+        conversation_memory = data.get(
+            "convo",
+            {}
+        )
+
+        user_profile = data.get(
+            "profile",
+            {}
+        )
+
+        BANNED_USERS = set(
+            data.get(
+                "banned",
+                []
+            )
+        )
 
     except Exception as e:
-        print(f"[MEMORY LOAD ERROR] {repr(e)}")
+
+        print(
+            "[MEMORY LOAD ERROR]",
+            repr(e)
+        )
 
 
 def save_memory():
+
     try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+
+        with open(
+            MEMORY_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
             json.dump(
                 {
                     "convo": conversation_memory,
@@ -147,7 +194,11 @@ def save_memory():
             )
 
     except Exception as e:
-        print(f"[MEMORY SAVE ERROR] {repr(e)}")
+
+        print(
+            "[MEMORY SAVE ERROR]",
+            repr(e)
+        )
 
 
 load_memory()
@@ -157,8 +208,13 @@ load_memory()
 # RATE LIMITER
 # ============================================================
 
-def check_rate_limit(number, api_name):
+def check_rate_limit(
+    number,
+    api_name
+):
+
     now = time.time()
+
     key = f"{number}_{api_name}"
 
     api_requests[key] = [
@@ -167,10 +223,17 @@ def check_rate_limit(number, api_name):
         if now - t < 3600
     ]
 
-    if len(api_requests[key]) >= LIMITS.get(api_name, 100):
+    if len(
+        api_requests[key]
+    ) >= LIMITS.get(
+        api_name,
+        100
+    ):
+
         return False
 
     api_requests[key].append(now)
+
     return True
 
 
@@ -178,34 +241,66 @@ def check_rate_limit(number, api_name):
 # AUTHENTICATION
 # ============================================================
 
-def check_auth(from_number, text):
+def check_auth(
+    from_number,
+    text
+):
 
-    if from_number == OWNER_NUMBER or from_number in ALLOWED_USERS:
-        authenticated_users.add(from_number)
+    if (
+        from_number == OWNER_NUMBER
+        or from_number in ALLOWED_USERS
+    ):
+
+        authenticated_users.add(
+            from_number
+        )
+
         return True, ""
 
     if from_number in BANNED_USERS:
-        return False, "You are banned from using ARIA."
+
+        return (
+            False,
+            "You are banned from using ARIA."
+        )
 
     if from_number in authenticated_users:
+
         return True, ""
 
-    if text.strip().upper() == PASSWORD:
-        authenticated_users.add(from_number)
+    if (
+        text.strip().upper()
+        == PASSWORD.upper()
+    ):
+
+        authenticated_users.add(
+            from_number
+        )
+
         auth_tries[from_number] = 0
 
         return (
             True,
-            "Access Granted.\n\nWelcome to ARIA."
+            "Access Granted.\n\n"
+            "Welcome to ARIA."
         )
 
     auth_tries[from_number] = (
-        auth_tries.get(from_number, 0) + 1
+        auth_tries.get(
+            from_number,
+            0
+        ) + 1
     )
 
-    if auth_tries[from_number] >= MAX_TRIES:
+    if (
+        auth_tries[from_number]
+        >= MAX_TRIES
+    ):
 
-        BANNED_USERS.add(from_number)
+        BANNED_USERS.add(
+            from_number
+        )
+
         save_memory()
 
         return (
@@ -213,7 +308,10 @@ def check_auth(from_number, text):
             "Locked. Too many incorrect attempts."
         )
 
-    remaining = MAX_TRIES - auth_tries[from_number]
+    remaining = (
+        MAX_TRIES
+        - auth_tries[from_number]
+    )
 
     return (
         False,
@@ -224,7 +322,67 @@ def check_auth(from_number, text):
 
 
 # ============================================================
-# WHATSAPP TEXT CLEANUP
+# USER LIST
+# ============================================================
+
+def get_users_list():
+
+    users = set()
+
+    users.update(
+        authenticated_users
+    )
+
+    users.update(
+        conversation_memory.keys()
+    )
+
+    users.update(
+        user_profile.keys()
+    )
+
+    users.update(
+        ALLOWED_USERS
+    )
+
+    users.discard(
+        OWNER_NUMBER
+    )
+
+    if not users:
+
+        return (
+            "〔 *ARIA USERS* 〕\n\n"
+            "No users recorded."
+        )
+
+    lines = [
+        "〔 *ARIA USERS* 〕",
+        "",
+        f"*Authenticated:* "
+        f"{len(authenticated_users)}",
+        f"*Recorded:* {len(users)}",
+        f"*Banned:* {len(BANNED_USERS)}",
+        ""
+    ]
+
+    for number in sorted(users):
+
+        status = (
+            "BANNED"
+            if number in BANNED_USERS
+            else "ACTIVE"
+        )
+
+        lines.append(
+            f"• {number} — {status}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# WHATSAPP FORMATTING
 # ============================================================
 
 def clean_ui(text):
@@ -234,33 +392,46 @@ def clean_ui(text):
 
     text = str(text)
 
-    # Remove accidental pipe tables
-    text = re.sub(r"\|.*\|", "", text)
+    lines = text.splitlines()
 
-    # Remove horizontal markdown rules
-    text = re.sub(r"---+", "", text)
+    cleaned_lines = []
 
-    # Convert markdown headings into ARIA sections
+    for line in lines:
+
+        stripped = line.strip()
+
+        if (
+            stripped.startswith("|")
+            and stripped.endswith("|")
+        ):
+
+            continue
+
+        if re.match(
+            r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?$",
+            stripped
+        ):
+
+            continue
+
+        cleaned_lines.append(line)
+
+    text = "\n".join(
+        cleaned_lines
+    )
+
     text = re.sub(
-        r"###\s*",
-        "〔 *",
-        text
+        r"^#{1,6}\s*(.+)$",
+        r"〔 *\1* 〕",
+        text,
+        flags=re.MULTILINE
     )
 
     text = text.replace(
-        "###",
-        "〕"
+        "**",
+        "*"
     )
 
-    # WhatsApp already supports *bold*
-    # Convert markdown **bold** to WhatsApp *bold*
-    text = re.sub(
-        r"\*\*",
-        "*",
-        text
-    )
-
-    # Prevent excessive whitespace
     text = re.sub(
         r"\n{4,}",
         "\n\n",
@@ -271,31 +442,77 @@ def clean_ui(text):
 
 
 # ============================================================
+# GRAPH API URL
+# ============================================================
+
+def graph_url(
+    endpoint
+):
+
+    return (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{endpoint}"
+    )
+
+
+# ============================================================
 # SEND WHATSAPP TEXT
 # ============================================================
 
-def send_text(to, text):
+def send_text(
+    to,
+    text
+):
 
     text = clean_ui(text)
 
     if not text:
-        text = "I couldn't generate a response."
 
-    url = (
-        f"https://graph.facebook.com/v20.0/"
+        text = (
+            "I couldn't generate a response."
+        )
+
+    if not WHATSAPP_TOKEN:
+
+        print(
+            "[WHATSAPP ERROR] "
+            "WHATSAPP_TOKEN is missing."
+        )
+
+        return False
+
+    if not PHONE_NUMBER_ID:
+
+        print(
+            "[WHATSAPP ERROR] "
+            "PHONE_NUMBER_ID is missing."
+        )
+
+        return False
+
+    url = graph_url(
         f"{PHONE_NUMBER_ID}/messages"
     )
 
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization":
+        f"Bearer {WHATSAPP_TOKEN}",
+
+        "Content-Type":
+        "application/json"
     }
 
-    # WhatsApp has message size limitations.
     chunks = [
         text[i:i + 650]
-        for i in range(0, len(text), 650)
+        for i in range(
+            0,
+            len(text),
+            650
+        )
     ]
+
+    success = True
 
     for i, chunk in enumerate(chunks):
 
@@ -314,14 +531,19 @@ def send_text(to, text):
                 f"└──────────────────────────────┘\n\n"
             )
 
-        body = header + chunk
-
         payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
+            "messaging_product":
+            "whatsapp",
+
+            "to":
+            to,
+
+            "type":
+            "text",
+
             "text": {
-                "body": body
+                "body":
+                header + chunk
             }
         }
 
@@ -335,51 +557,94 @@ def send_text(to, text):
             )
 
             if not response.ok:
+
+                success = False
+
                 print(
                     "[WHATSAPP SEND ERROR]",
                     response.status_code,
-                    response.text[:1000]
+                    response.text[:2000]
                 )
 
         except Exception as e:
 
+            success = False
+
             print(
-                f"[WHATSAPP SEND EXCEPTION] {repr(e)}"
+                "[WHATSAPP SEND EXCEPTION]",
+                repr(e)
             )
 
-        time.sleep(0.8)
+        time.sleep(0.5)
+
+    return success
 
 
 # ============================================================
-# SEND IMAGE TO WHATSAPP
+# SEND IMAGE
 # ============================================================
 
-def send_image_url(to, image_url, caption=""):
+def send_image_url(
+    to,
+    image_url,
+    caption=""
+):
 
     if not image_url:
+
         send_text(
             to,
             "I couldn't find an image to send."
         )
+
         return False
 
-    url = (
-        f"https://graph.facebook.com/v20.0/"
+    if not WHATSAPP_TOKEN:
+
+        print(
+            "[WHATSAPP IMAGE ERROR] "
+            "WHATSAPP_TOKEN missing."
+        )
+
+        return False
+
+    if not PHONE_NUMBER_ID:
+
+        print(
+            "[WHATSAPP IMAGE ERROR] "
+            "PHONE_NUMBER_ID missing."
+        )
+
+        return False
+
+    url = graph_url(
         f"{PHONE_NUMBER_ID}/messages"
     )
 
     headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization":
+        f"Bearer {WHATSAPP_TOKEN}",
+
+        "Content-Type":
+        "application/json"
     }
 
     payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "image",
+        "messaging_product":
+        "whatsapp",
+
+        "to":
+        to,
+
+        "type":
+        "image",
+
         "image": {
-            "link": image_url,
-            "caption": caption[:1024]
+            "link":
+            image_url,
+
+            "caption":
+            caption[:1024]
         }
     }
 
@@ -397,7 +662,7 @@ def send_image_url(to, image_url, caption=""):
             print(
                 "[WHATSAPP IMAGE ERROR]",
                 response.status_code,
-                response.text[:1000]
+                response.text[:2000]
             )
 
             send_text(
@@ -412,7 +677,8 @@ def send_image_url(to, image_url, caption=""):
     except Exception as e:
 
         print(
-            f"[WHATSAPP IMAGE EXCEPTION] {repr(e)}"
+            "[WHATSAPP IMAGE EXCEPTION]",
+            repr(e)
         )
 
         send_text(
@@ -424,108 +690,13 @@ def send_image_url(to, image_url, caption=""):
 
 
 # ============================================================
-# USER PANEL
-# ============================================================
-
-def get_users_list():
-
-    owner_text = (
-        f"OWNER\n"
-        f"• {OWNER_NUMBER}\n\n"
-    )
-
-    allowed_text = (
-        "ALLOWED USERS - Skip Password\n"
-    )
-
-    for num in ALLOWED_USERS:
-
-        if num != OWNER_NUMBER:
-
-            name = (
-                user_profile
-                .get(num, {})
-                .get("name", "Unknown")
-            )
-
-            allowed_text += (
-                f"• {num} - *{name}*\n"
-            )
-
-    if allowed_text == (
-        "ALLOWED USERS - Skip Password\n"
-    ):
-
-        allowed_text += "• None\n"
-
-    auth_text = (
-        "\nAUTHENTICATED USERS\n"
-    )
-
-    temp_list = [
-        n
-        for n in authenticated_users
-        if n != OWNER_NUMBER
-        and n not in ALLOWED_USERS
-    ]
-
-    if temp_list:
-
-        for num in temp_list:
-
-            name = (
-                user_profile
-                .get(num, {})
-                .get("name", "Unknown")
-            )
-
-            auth_text += (
-                f"• {num} - *{name}*\n"
-            )
-
-    else:
-
-        auth_text += "• None yet\n"
-
-    banned_text = (
-        "\nBANNED USERS\n"
-    )
-
-    if BANNED_USERS:
-
-        for num in BANNED_USERS:
-            banned_text += f"• {num}\n"
-
-    else:
-
-        banned_text += "• None\n"
-
-    total = len(
-        set(
-            ALLOWED_USERS
-            + list(authenticated_users)
-        )
-    )
-
-    header = (
-        f"〔 *ARIA USERS PANEL* 〕\n"
-        f"*Total Active:* {total}\n\n"
-    )
-
-    return (
-        header
-        + owner_text
-        + allowed_text
-        + auth_text
-        + banned_text
-    )
-
-
-# ============================================================
 # PINT1 - UNSPLASH
 # ============================================================
 
-def pint1_unsplash(sender, query):
+def pint1_unsplash(
+    sender,
+    query
+):
 
     if not UNSPLASH_KEY:
 
@@ -536,11 +707,15 @@ def pint1_unsplash(sender, query):
 
         return
 
-    if not check_rate_limit(sender, "pint1"):
+    if not check_rate_limit(
+        sender,
+        "pint1"
+    ):
 
         send_text(
             sender,
-            "Too many Unsplash searches. Try again later."
+            "Too many Unsplash searches. "
+            "Try again later."
         )
 
         return
@@ -569,6 +744,7 @@ def pint1_unsplash(sender, query):
         res = response.json()
 
         img_url = res["urls"]["regular"]
+
         photographer = res["user"]["name"]
 
         send_image_url(
@@ -583,7 +759,8 @@ def pint1_unsplash(sender, query):
     except Exception as e:
 
         print(
-            f"[UNSPLASH ERROR] {repr(e)}"
+            "[UNSPLASH ERROR]",
+            repr(e)
         )
 
         send_text(
@@ -596,13 +773,20 @@ def pint1_unsplash(sender, query):
 # PINT2 - WALLHAVEN
 # ============================================================
 
-def pint2_pexels(sender, query):
+def pint2_pexels(
+    sender,
+    query
+):
 
-    if not check_rate_limit(sender, "pint2"):
+    if not check_rate_limit(
+        sender,
+        "pint2"
+    ):
 
         send_text(
             sender,
-            "Too many wallpaper searches. Try again later."
+            "Too many wallpaper searches. "
+            "Try again later."
         )
 
         return
@@ -635,7 +819,9 @@ def pint2_pexels(sender, query):
 
             photo = res["data"][0]
 
-            photo_url = photo.get("path")
+            photo_url = photo.get(
+                "path"
+            )
 
             resolution = photo.get(
                 "resolution",
@@ -655,15 +841,16 @@ def pint2_pexels(sender, query):
 
                 return
 
-        raise Exception("No wallpapers found")
+        raise Exception(
+            "No wallpapers found"
+        )
 
     except Exception as e:
 
         print(
-            f"[WALLHAVEN ERROR] {repr(e)}"
+            "[WALLHAVEN ERROR]",
+            repr(e)
         )
-
-    # Unsplash fallback
 
     if UNSPLASH_KEY:
 
@@ -701,10 +888,9 @@ def pint2_pexels(sender, query):
         except Exception as e:
 
             print(
-                f"[UNSPLASH FALLBACK ERROR] {repr(e)}"
+                "[UNSPLASH FALLBACK ERROR]",
+                repr(e)
             )
-
-    # Final AI image fallback
 
     ai_prompt = (
         f"{query}, fantasy art, "
@@ -740,9 +926,15 @@ def pint2_pexels(sender, query):
 # PINT3 - DANBOORU
 # ============================================================
 
-def pint3_anime(sender, query):
+def pint3_anime(
+    sender,
+    query
+):
 
-    q = query.lower().replace(" ", "_")
+    q = query.lower().replace(
+        " ",
+        "_"
+    )
 
     nsfw_tags = [
         "naked",
@@ -754,7 +946,10 @@ def pint3_anime(sender, query):
     ]
 
     if (
-        any(tag in q for tag in nsfw_tags)
+        any(
+            tag in q
+            for tag in nsfw_tags
+        )
         and sender != OWNER_NUMBER
     ):
 
@@ -778,7 +973,8 @@ def pint3_anime(sender, query):
     )
 
     headers = {
-        "User-Agent": "ARIA-Bot/1.0"
+        "User-Agent":
+        "ARIA-Bot/1.0"
     }
 
     try:
@@ -806,8 +1002,12 @@ def pint3_anime(sender, query):
         post = res[0]
 
         file_url = (
-            post.get("large_file_url")
-            or post.get("file_url")
+            post.get(
+                "large_file_url"
+            )
+            or post.get(
+                "file_url"
+            )
         )
 
         if not file_url:
@@ -820,11 +1020,14 @@ def pint3_anime(sender, query):
             return
 
         if file_url.startswith("/"):
+
             img_url = (
                 "https://danbooru.donmai.us"
                 + file_url
             )
+
         else:
+
             img_url = file_url
 
         tags = post.get(
@@ -845,12 +1048,14 @@ def pint3_anime(sender, query):
     except Exception as e:
 
         print(
-            f"[DANBOORU ERROR] {repr(e)}"
+            "[DANBOORU ERROR]",
+            repr(e)
         )
 
         send_text(
             sender,
-            "Danbooru failed. Try a different character."
+            "Danbooru failed. "
+            "Try a different character."
         )
 
 
@@ -858,23 +1063,30 @@ def pint3_anime(sender, query):
 # PINT4 - COMICVINE
 # ============================================================
 
-def pint4_comics(sender, query):
+def pint4_comics(
+    sender,
+    query
+):
 
     if not COMICVINE_KEY:
 
         send_text(
             sender,
             "ComicVine is not configured. "
-            "Add COMICVINE_KEY to Render environment variables."
+            "Add COMICVINE_KEY to Render."
         )
 
         return
 
-    if not check_rate_limit(sender, "pint4"):
+    if not check_rate_limit(
+        sender,
+        "pint4"
+    ):
 
         send_text(
             sender,
-            "Too many comic searches. Try again later."
+            "Too many comic searches. "
+            "Try again later."
         )
 
         return
@@ -889,15 +1101,25 @@ def pint4_comics(sender, query):
     )
 
     params = {
-        "api_key": COMICVINE_KEY,
-        "format": "json",
-        "query": query,
-        "resources": "character,issue,volume",
-        "limit": 1
+        "api_key":
+        COMICVINE_KEY,
+
+        "format":
+        "json",
+
+        "query":
+        query,
+
+        "resources":
+        "character,issue,volume",
+
+        "limit":
+        1
     }
 
     headers = {
-        "User-Agent": "ARIA-Bot/1.0"
+        "User-Agent":
+        "ARIA-Bot/1.0"
     }
 
     try:
@@ -913,7 +1135,9 @@ def pint4_comics(sender, query):
 
         res = response.json()
 
-        if res.get("status_code") != 1:
+        if res.get(
+            "status_code"
+        ) != 1:
 
             send_text(
                 sender,
@@ -939,8 +1163,13 @@ def pint4_comics(sender, query):
         result = results[0]
 
         name = (
-            result.get("name")
-            or result.get("volume", {}).get(
+            result.get(
+                "name"
+            )
+            or result.get(
+                "volume",
+                {}
+            ).get(
                 "name",
                 query
             )
@@ -990,12 +1219,14 @@ def pint4_comics(sender, query):
     except Exception as e:
 
         print(
-            f"[COMICVINE ERROR] {repr(e)}"
+            "[COMICVINE ERROR]",
+            repr(e)
         )
 
         send_text(
             sender,
-            "ComicVine failed. Try again in a few seconds."
+            "ComicVine failed. "
+            "Try again in a few seconds."
         )
 
 
@@ -1003,13 +1234,20 @@ def pint4_comics(sender, query):
 # PINT5 - EDUCATION
 # ============================================================
 
-def pint5_education(sender, query):
+def pint5_education(
+    sender,
+    query
+):
 
-    if not check_rate_limit(sender, "pint5"):
+    if not check_rate_limit(
+        sender,
+        "pint5"
+    ):
 
         send_text(
             sender,
-            "Too many education searches. Try again later."
+            "Too many education searches. "
+            "Try again later."
         )
 
         return
@@ -1064,7 +1302,8 @@ def pint5_education(sender, query):
         except Exception as e:
 
             print(
-                f"[PINT5 UNSPLASH ERROR] {repr(e)}"
+                "[PINT5 UNSPLASH ERROR]",
+                repr(e)
             )
 
     ai_prompt = (
@@ -1096,7 +1335,10 @@ def pint5_education(sender, query):
     send_image_url(
         sender,
         image_url,
-        caption=f"Pint5 AI: {query}\nEducational Diagram"
+        caption=(
+            f"Pint5 AI: {query}\n"
+            "Educational Diagram"
+        )
     )
 
 
@@ -1104,7 +1346,10 @@ def pint5_education(sender, query):
 # IMAGE GENERATION
 # ============================================================
 
-def imagine_generate(sender, prompt):
+def imagine_generate(
+    sender,
+    prompt
+):
 
     send_text(
         sender,
@@ -1122,14 +1367,15 @@ def imagine_generate(sender, prompt):
         enhanced_prompt
     )
 
-    # Use a deterministic seed that is stable across
-    # the current process.
-    seed = int(
-        hashlib.sha256(
-            prompt.encode("utf-8")
-        ).hexdigest()[:8],
-        16
-    ) % 100000
+    seed = (
+        int(
+            hashlib.sha256(
+                prompt.encode("utf-8")
+            ).hexdigest()[:8],
+            16
+        )
+        % 100000
+    )
 
     flux_url = (
         "https://image.pollinations.ai/prompt/"
@@ -1173,7 +1419,7 @@ def imagine_generate(sender, prompt):
 
 
 # ============================================================
-# MAIN AI CALL
+# ARIA SYSTEM PROMPT
 # ============================================================
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -1194,20 +1440,19 @@ RESPONSE STYLE
 - Do not use ### headings.
 - Do not unnecessarily repeat the user's question.
 - Do not add filler.
-- For simple questions, give a simple answer.
-- For complex questions, explain the important reasoning clearly.
+- For simple questions, give simple answers.
+- For complex questions, explain important reasoning clearly.
 - Maximum normal response length: about 300 words unless the user asks for detail.
 
 ACCURACY
-- If you are uncertain, say so.
+- If uncertain, say so.
 - Never invent sources, facts, API results, files, events, or personal memories.
 - Distinguish facts from assumptions.
 - When the user asks for current information and no live tool/data is available, state that limitation instead of pretending the information is current.
 
 MEMORY
-- Use supplied conversation memory when it is relevant.
-- Do not claim to remember information that is not present in the supplied memory.
-- If the user asks you to forget something, follow the application's memory behavior.
+- Use supplied conversation memory when relevant.
+- Do not claim to remember information that is not present in supplied memory.
 
 PROBLEM SOLVING
 - Solve the actual problem instead of giving generic advice.
@@ -1216,265 +1461,34 @@ PROBLEM SOLVING
 
 WHATSAPP
 - Keep formatting clean and readable.
-- Use • for bullet points when appropriate.
+- Use • for bullets when appropriate.
 - Avoid excessive emojis.
 """
-
-
-def ai_call(
-    prompt,
-    from_number,
-    system=DEFAULT_SYSTEM_PROMPT
-):
-
-    if not client:
-
-        return (
-            "AI is not configured. "
-            "GROQ_API_KEY is missing."
-        )
-
-    memory_context = build_memory_context(
-        from_number
-    )
-
-    full_prompt = (
-        f"{memory_context}\n\n"
-        f"User: {prompt}"
-    )
-
-    # Keep enough room for the response while preventing
-    # enormous memory prompts from consuming the context.
-    user_content = full_prompt[:12000]
-
-    try:
-
-        completion = client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system
-                },
-                {
-                    "role": "user",
-                    "content": user_content
-                }
-            ],
-            temperature=0.6,
-            max_completion_tokens=1024,
-            top_p=0.95,
-            stream=False,
-            reasoning_effort="medium",
-            reasoning_format="hidden"
-        )
-
-        response = (
-            completion.choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            return (
-                "I received an empty response from the AI."
-            )
-
-        return response.strip()
-
-    except Exception as e:
-
-        print(
-            f"[AI ERROR] {repr(e)}"
-        )
-
-        return (
-            "AI request failed.\n\n"
-            "Try again in a few seconds."
-        )
-
-
-# ============================================================
-# WHATSAPP MEDIA DOWNLOAD
-# ============================================================
-
-def download_whatsapp_image(
-    image_url,
-    mime_type=None
-):
-
-    if not image_url:
-
-        raise ValueError(
-            "WhatsApp returned no image URL."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}"
-    }
-
-    response = requests.get(
-        image_url,
-        headers=headers,
-        timeout=30
-    )
-
-    response.raise_for_status()
-
-    if not response.content:
-
-        raise ValueError(
-            "Downloaded image is empty."
-        )
-
-    # Prefer MIME type supplied by WhatsApp.
-    # Fall back to HTTP response header.
-    detected_mime = (
-        mime_type
-        or response.headers.get(
-            "Content-Type",
-            "image/jpeg"
-        )
-    )
-
-    detected_mime = detected_mime.split(";")[0].strip()
-
-    if not detected_mime.startswith("image/"):
-
-        raise ValueError(
-            f"Downloaded media is not an image: {detected_mime}"
-        )
-
-    # Groq's current vision endpoint has a 20 MB image limit.
-    image_size_mb = (
-        len(response.content)
-        / (1024 * 1024)
-    )
-
-    if image_size_mb > 20:
-
-        raise ValueError(
-            f"Image is too large ({image_size_mb:.1f} MB). "
-            "Maximum supported size is 20 MB."
-        )
-
-    encoded = base64.b64encode(
-        response.content
-    ).decode("utf-8")
-
-    return encoded, detected_mime
-
-
-# ============================================================
-# VISION
-# ============================================================
-
-def vision_call(
-    image_url,
-    prompt,
-    mime_type=None
-):
-
-    if not client:
-
-        return (
-            "Vision is not configured. "
-            "GROQ_API_KEY is missing."
-        )
-
-    try:
-
-        base64_image, detected_mime = (
-            download_whatsapp_image(
-                image_url,
-                mime_type
-            )
-        )
-
-        vision_prompt = (
-            f"{prompt}\n\n"
-            "Be accurate and concise. "
-            "If something cannot be determined from the image, "
-            "say that clearly instead of guessing."
-        )
-
-        completion = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": vision_prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": (
-                                    f"data:{detected_mime};"
-                                    f"base64,{base64_image}"
-                                )
-                            }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.3,
-            max_completion_tokens=800,
-            top_p=0.9,
-            stream=False,
-            reasoning_effort="none"
-        )
-
-        response = (
-            completion.choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            raise ValueError(
-                "Vision model returned an empty response."
-            )
-
-        print(
-            f"[VISION SUCCESS] {VISION_MODEL}"
-        )
-
-        return response.strip()
-
-    except Exception as e:
-
-        print(
-            f"[VISION ERROR] {repr(e)}"
-        )
-
-        return (
-            "I couldn't process that image.\n\n"
-            "Try sending the image again."
-        )
 
 
 # ============================================================
 # MEMORY CONTEXT
 # ============================================================
 
-def build_memory_context(from_number):
+def build_memory_context(
+    from_number
+):
 
     context = ""
 
     if from_number in user_profile:
 
         name = (
-            user_profile[from_number]
-            .get("name", "Sir")
+            user_profile[
+                from_number
+            ].get(
+                "name",
+                "User"
+            )
         )
 
         context += (
-            f"You are talking to {name}. "
+            f"You are talking to {name}.\n"
         )
 
     if from_number in conversation_memory:
@@ -1499,11 +1513,15 @@ def build_memory_context(from_number):
 
             context += (
                 f"{role}: "
-                f"{content[:300]}\n"
+                f"{content[:500]}\n"
             )
 
     return context
 
+
+# ============================================================
+# MEMORY WRITE
+# ============================================================
 
 def add_to_memory(
     from_number,
@@ -1513,21 +1531,356 @@ def add_to_memory(
 
     if from_number not in conversation_memory:
 
-        conversation_memory[from_number] = []
+        conversation_memory[
+            from_number
+        ] = []
 
-    conversation_memory[from_number].append(
+    conversation_memory[
+        from_number
+    ].append(
         {
-            "role": role,
-            "content": content
+            "role":
+            role,
+
+            "content":
+            content
         }
     )
 
-    conversation_memory[from_number] = (
-        conversation_memory[from_number]
-        [-MAX_HISTORY:]
-    )
+    conversation_memory[
+        from_number
+    ] = conversation_memory[
+        from_number
+    ][-MAX_HISTORY:]
 
     save_memory()
+
+
+# ============================================================
+# AI CALL
+# ============================================================
+
+def ai_call(
+    prompt,
+    from_number,
+    system=DEFAULT_SYSTEM_PROMPT
+):
+
+    if not client:
+
+        return (
+            "AI is not configured.\n\n"
+            "GROQ_API_KEY is missing."
+        )
+
+    memory_context = build_memory_context(
+        from_number
+    )
+
+    full_prompt = (
+        f"{memory_context}\n\n"
+        f"User: {prompt}"
+    )
+
+    user_content = full_prompt[:12000]
+
+    try:
+
+        completion = (
+            client.chat.completions.create(
+                model=CHAT_MODEL,
+
+                messages=[
+                    {
+                        "role":
+                        "system",
+
+                        "content":
+                        system
+                    },
+
+                    {
+                        "role":
+                        "user",
+
+                        "content":
+                        user_content
+                    }
+                ],
+
+                temperature=0.6,
+
+                max_completion_tokens=1024,
+
+                top_p=0.95,
+
+                stream=False,
+
+                # GPT-OSS supports low/medium/high.
+                reasoning_effort="medium",
+
+                # Do NOT use reasoning_format with GPT-OSS.
+                include_reasoning=False
+            )
+        )
+
+        response = (
+            completion
+            .choices[0]
+            .message
+            .content
+        )
+
+        if not response:
+
+            return (
+                "I received an empty response from the AI."
+            )
+
+        return response.strip()
+
+    except Exception as e:
+
+        print(
+            "[AI ERROR]",
+            repr(e)
+        )
+
+        return (
+            "AI request failed.\n\n"
+            "Check the Render logs for "
+            "[AI ERROR] to see the exact cause."
+        )
+
+
+# ============================================================
+# WHATSAPP IMAGE DOWNLOAD
+# ============================================================
+
+def download_whatsapp_image(
+    image_url,
+    mime_type=None
+):
+
+    if not image_url:
+
+        raise ValueError(
+            "WhatsApp returned no image URL."
+        )
+
+    headers = {
+        "Authorization":
+        f"Bearer {WHATSAPP_TOKEN}"
+    }
+
+    response = requests.get(
+        image_url,
+        headers=headers,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    if not response.content:
+
+        raise ValueError(
+            "Downloaded image is empty."
+        )
+
+    detected_mime = (
+        mime_type
+        or response.headers.get(
+            "Content-Type",
+            "image/jpeg"
+        )
+    )
+
+    detected_mime = (
+        detected_mime
+        .split(";")[0]
+        .strip()
+        .lower()
+    )
+
+    if not detected_mime.startswith(
+        "image/"
+    ):
+
+        raise ValueError(
+            "Downloaded media is not an image: "
+            f"{detected_mime}"
+        )
+
+    image_size_mb = (
+        len(response.content)
+        / (1024 * 1024)
+    )
+
+    if image_size_mb > 20:
+
+        raise ValueError(
+            f"Image is too large "
+            f"({image_size_mb:.1f} MB). "
+            "Maximum supported size is 20 MB."
+        )
+
+    encoded = base64.b64encode(
+        response.content
+    ).decode(
+        "utf-8"
+    )
+
+    return (
+        encoded,
+        detected_mime
+    )
+
+
+# ============================================================
+# VISION CALL
+# ============================================================
+
+def vision_call(
+    image_url,
+    prompt,
+    mime_type=None
+):
+
+    if not client:
+
+        return (
+            "Vision is not configured.\n\n"
+            "GROQ_API_KEY is missing."
+        )
+
+    try:
+
+        (
+            base64_image,
+            detected_mime
+        ) = download_whatsapp_image(
+            image_url,
+            mime_type
+        )
+
+        vision_prompt = (
+            f"{prompt}\n\n"
+            "Be accurate and concise. "
+            "If something cannot be determined "
+            "from the image, say that clearly "
+            "instead of guessing."
+        )
+
+        completion = (
+            client.chat.completions.create(
+                model=VISION_MODEL,
+
+                messages=[
+                    {
+                        "role":
+                        "user",
+
+                        "content": [
+                            {
+                                "type":
+                                "text",
+
+                                "text":
+                                vision_prompt
+                            },
+
+                            {
+                                "type":
+                                "image_url",
+
+                                "image_url": {
+                                    "url":
+                                    (
+                                        f"data:{detected_mime};"
+                                        f"base64,{base64_image}"
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ],
+
+                temperature=0.3,
+
+                max_completion_tokens=1024,
+
+                top_p=0.9,
+
+                stream=False,
+
+                # Qwen 3.8 supports "none".
+                reasoning_effort="none"
+            )
+        )
+
+        response = (
+            completion
+            .choices[0]
+            .message
+            .content
+        )
+
+        if not response:
+
+            raise ValueError(
+                "Vision model returned an empty response."
+            )
+
+        print(
+            f"[VISION SUCCESS] "
+            f"{VISION_MODEL}"
+        )
+
+        return response.strip()
+
+    except Exception as e:
+
+        print(
+            "[VISION ERROR]",
+            repr(e)
+        )
+
+        return (
+            "I couldn't process that image.\n\n"
+            "Check the Render logs for "
+            "[VISION ERROR] to see the exact cause."
+        )
+
+
+# ============================================================
+# SOLVE IMAGE MATH
+# ============================================================
+
+def solve_image_math(
+    image_url,
+    mime_type=None
+):
+
+    return vision_call(
+        image_url,
+
+        """
+Solve the math problem shown in the image.
+
+Read the problem carefully.
+
+Show:
+• The information given
+• The relevant formula or method
+• The important calculation steps
+• The final answer clearly
+
+If the image is too unclear to read,
+say exactly what part is unclear.
+""",
+
+        mime_type
+    )
 
 
 # ============================================================
@@ -1555,27 +1908,36 @@ def learn_fact(
         if not match:
             return None
 
-        name = match.group(1).strip()
+        name = (
+            match.group(1)
+            .strip()
+        )
 
         if not name:
             return None
 
         if from_number not in user_profile:
-            user_profile[from_number] = {}
 
-        user_profile[from_number]["name"] = name
+            user_profile[
+                from_number
+            ] = {}
+
+        user_profile[
+            from_number
+        ]["name"] = name
 
         save_memory()
 
         return (
-            f"Got it. I'll remember your name is *{name}*."
+            f"Got it. I'll remember "
+            f"your name is *{name}*."
         )
 
     return None
 
 
 # ============================================================
-# EDUCATIONAL EXPLANATIONS
+# EDUCATION EXPLANATION
 # ============================================================
 
 def ai_explain(
@@ -1625,7 +1987,10 @@ def ai_explain(
 
     try:
 
-        idx = int(field_num) - 1
+        idx = (
+            int(field_num)
+            - 1
+        )
 
     except ValueError:
 
@@ -1633,15 +1998,23 @@ def ai_explain(
             "Usage: `explain psychology 2`"
         )
 
-    if from_number not in last_explain_fields:
+    if (
+        from_number
+        not in last_explain_fields
+    ):
 
         return (
             "Ask `explain psychology` first "
             "to see the fields."
         )
 
-    if idx < 0 or idx >= len(
-        last_explain_fields[from_number]
+    if (
+        idx < 0
+        or idx >= len(
+            last_explain_fields[
+                from_number
+            ]
+        )
     ):
 
         return (
@@ -1649,7 +2022,9 @@ def ai_explain(
         )
 
     field = (
-        last_explain_fields[from_number][idx]
+        last_explain_fields[
+            from_number
+        ][idx]
     )
 
     system = """
@@ -1666,7 +2041,7 @@ Requirements:
 - No ### headings.
 - Keep the explanation organized.
 - Highlight exam-relevant points.
-- If the topic has important exceptions, mention them.
+- Mention important exceptions.
 """
 
     prompt = (
@@ -1683,10 +2058,12 @@ Requirements:
 
 
 # ============================================================
-# YOUTUBE
+# YOUTUBE SEARCH
 # ============================================================
 
-def get_youtube_link(query):
+def get_youtube_link(
+    query
+):
 
     youtube_url = (
         "https://www.youtube.com/results?search_query="
@@ -1700,43 +2077,21 @@ def get_youtube_link(query):
 
 
 # ============================================================
-# IMAGE MATH
-# ============================================================
-
-def solve_image_math(
-    image_url,
-    mime_type=None
-):
-
-    return vision_call(
-        image_url,
-        """
-Solve the math problem shown in the image.
-
-Read the problem carefully.
-Show the important formula or method.
-Show the calculations.
-Give the final answer clearly.
-If the image is too unclear to read, say so.
-""",
-        mime_type
-    )
-
-
-# ============================================================
 # RUNTIME
 # ============================================================
 
 def get_runtime():
 
     seconds = int(
-        time.time() - start_time
+        time.time()
+        - start_time
     )
 
     h = seconds // 3600
 
     m = (
-        seconds % 3600
+        seconds
+        % 3600
     ) // 60
 
     s = seconds % 60
@@ -1753,8 +2108,12 @@ def get_runtime():
 def get_menu():
 
     local_time = datetime.now(
-        pytz.timezone("Africa/Lagos")
-    ).strftime("%I:%M %p")
+        pytz.timezone(
+            "Africa/Lagos"
+        )
+    ).strftime(
+        "%I:%M %p"
+    )
 
     return f"""
 〔 *ARIA {VERSION}* 〕
@@ -1780,6 +2139,12 @@ def get_menu():
 • Send image → `.verify`
 • Send image → `.solve`
 
+〔 *SYSTEM* 〕
+
+• `.health`
+• `.status`
+• `.menu`
+
 〔 *OWNER* 〕
 
 • `.users`
@@ -1804,16 +2169,19 @@ def get_menu():
 
 @app.route(
     "/webhook",
-    methods=["POST", "GET"]
+    methods=[
+        "GET",
+        "POST"
+    ]
 )
 def webhook():
 
     global last_explain_topic
     global user_waiting_image
 
-    # --------------------------------------------------------
-    # META VERIFICATION
-    # --------------------------------------------------------
+    # ========================================================
+    # META WEBHOOK VERIFICATION
+    # ========================================================
 
     if request.method == "GET":
 
@@ -1825,22 +2193,24 @@ def webhook():
             "hub.verify_token"
         )
 
-        expected_verify_token = os.getenv(
-            "VERIFY_TOKEN"
+        if VERIFY_TOKEN:
+
+            if verify_token != VERIFY_TOKEN:
+
+                return (
+                    "Forbidden",
+                    403
+                )
+
+        return (
+            challenge
+            or "OK",
+            200
         )
 
-        # If VERIFY_TOKEN is configured, validate it.
-        if expected_verify_token:
-
-            if verify_token != expected_verify_token:
-
-                return "Forbidden", 403
-
-        return challenge or "OK", 200
-
-    # --------------------------------------------------------
+    # ========================================================
     # PARSE WEBHOOK
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
 
@@ -1850,7 +2220,10 @@ def webhook():
 
         if not data:
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         entries = data.get(
             "entry",
@@ -1859,7 +2232,10 @@ def webhook():
 
         if not entries:
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         changes = entries[0].get(
             "changes",
@@ -1868,7 +2244,10 @@ def webhook():
 
         if not changes:
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         value = changes[0].get(
             "value",
@@ -1880,11 +2259,12 @@ def webhook():
             []
         )
 
-        # Status updates and other webhook events
-        # don't contain messages.
         if not messages:
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         msg = messages[0]
 
@@ -1894,19 +2274,28 @@ def webhook():
 
         if not from_number:
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         text = (
-            msg.get("text", {})
-            .get("body", "")
+            msg.get(
+                "text",
+                {}
+            )
+            .get(
+                "body",
+                ""
+            )
             .strip()
         )
 
         tl = text.lower()
 
-        # ----------------------------------------------------
-        # AUTHENTICATION
-        # ----------------------------------------------------
+        # ====================================================
+        # AUTH
+        # ====================================================
 
         is_auth, auth_msg = check_auth(
             from_number,
@@ -1920,7 +2309,10 @@ def webhook():
                 auth_msg
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         if auth_msg:
 
@@ -1929,11 +2321,13 @@ def webhook():
                 auth_msg
             )
 
-        # ----------------------------------------------------
-        # OWNER COMMANDS
-        # ----------------------------------------------------
+        # ====================================================
+        # OWNER: BAN
+        # ====================================================
 
-        if tl.startswith(".ban "):
+        if tl.startswith(
+            ".ban "
+        ):
 
             if from_number == OWNER_NUMBER:
 
@@ -1949,9 +2343,15 @@ def webhook():
                         "Usage: `.ban <number>`"
                     )
 
-                    return "OK", 200
+                    return (
+                        "OK",
+                        200
+                    )
 
-                target = parts[1].strip()
+                target = (
+                    parts[1]
+                    .strip()
+                )
 
                 BANNED_USERS.add(
                     target
@@ -1975,9 +2375,18 @@ def webhook():
                     "Owner only command."
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        if tl.startswith(".unban "):
+        # ====================================================
+        # OWNER: UNBAN
+        # ====================================================
+
+        if tl.startswith(
+            ".unban "
+        ):
 
             if from_number == OWNER_NUMBER:
 
@@ -1993,9 +2402,15 @@ def webhook():
                         "Usage: `.unban <number>`"
                     )
 
-                    return "OK", 200
+                    return (
+                        "OK",
+                        200
+                    )
 
-                target = parts[1].strip()
+                target = (
+                    parts[1]
+                    .strip()
+                )
 
                 BANNED_USERS.discard(
                     target
@@ -2015,17 +2430,22 @@ def webhook():
                     "Owner only command."
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
+
+        # ====================================================
+        # OWNER: USERS
+        # ====================================================
 
         if tl == ".users":
 
             if from_number == OWNER_NUMBER:
 
-                users_list = get_users_list()
-
                 send_text(
                     from_number,
-                    users_list
+                    get_users_list()
                 )
 
             else:
@@ -2035,13 +2455,18 @@ def webhook():
                     "Owner only command."
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # IMAGE MESSAGE
-        # ----------------------------------------------------
+        # ====================================================
 
-        if msg.get("type") == "image":
+        if msg.get(
+            "type"
+        ) == "image":
 
             image_data = msg.get(
                 "image",
@@ -2066,14 +2491,16 @@ def webhook():
                     "I couldn't retrieve that image."
                 )
 
-                return "OK", 200
+                return (
+                    "OK",
+                    200
+                )
 
             try:
 
                 media_response = requests.get(
-                    (
-                        "https://graph.facebook.com/"
-                        f"v20.0/{image_id}"
+                    graph_url(
+                        image_id
                     ),
                     headers={
                         "Authorization":
@@ -2088,8 +2515,10 @@ def webhook():
                     media_response.json()
                 )
 
-                image_url = media_info.get(
-                    "url"
+                image_url = (
+                    media_info.get(
+                        "url"
+                    )
                 )
 
                 media_mime_type = (
@@ -2108,8 +2537,11 @@ def webhook():
                 user_waiting_image[
                     from_number
                 ] = {
-                    "url": image_url,
-                    "mime_type": media_mime_type
+                    "url":
+                    image_url,
+
+                    "mime_type":
+                    media_mime_type
                 }
 
                 send_text(
@@ -2122,7 +2554,8 @@ def webhook():
             except Exception as e:
 
                 print(
-                    f"[WHATSAPP MEDIA ERROR] {repr(e)}"
+                    "[WHATSAPP MEDIA ERROR]",
+                    repr(e)
                 )
 
                 send_text(
@@ -2131,11 +2564,14 @@ def webhook():
                     "from WhatsApp. Try sending it again."
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
-        # MEMORY / USER FACTS
-        # ----------------------------------------------------
+        # ====================================================
+        # MEMORY
+        # ====================================================
 
         if text:
 
@@ -2163,11 +2599,14 @@ def webhook():
                 learned
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # FORGET MEMORY
-        # ----------------------------------------------------
+        # ====================================================
 
         if tl == "forget me":
 
@@ -2186,11 +2625,135 @@ def webhook():
                 "Memory cleared."
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
+        # HEALTH
+        # ====================================================
+
+        if tl == ".health":
+
+            groq_status = "NOT CONFIGURED"
+
+            if client:
+
+                try:
+
+                    health_test = (
+                        client.chat.completions.create(
+                            model=CHAT_MODEL,
+
+                            messages=[
+                                {
+                                    "role":
+                                    "user",
+
+                                    "content":
+                                    "Reply only with: OK"
+                                }
+                            ],
+
+                            max_completion_tokens=10,
+
+                            stream=False,
+
+                            # GPT-OSS accepts
+                            # low / medium / high.
+                            reasoning_effort="low",
+
+                            # Suppress reasoning output.
+                            include_reasoning=False
+                        )
+                    )
+
+                    if (
+                        health_test.choices
+                        and health_test.choices[0].message
+                    ):
+
+                        groq_status = "ONLINE"
+
+                    else:
+
+                        groq_status = "EMPTY RESPONSE"
+
+                except Exception as e:
+
+                    groq_status = "FAILED"
+
+                    print(
+                        "[HEALTH GROQ ERROR]",
+                        repr(e)
+                    )
+
+            memory_status = (
+                "OK"
+                if conversation_memory is not None
+                else "ERROR"
+            )
+
+            whatsapp_status = (
+                "CONFIGURED"
+                if (
+                    WHATSAPP_TOKEN
+                    and PHONE_NUMBER_ID
+                )
+                else
+                "NOT CONFIGURED"
+            )
+
+            vision_status = (
+                "CONFIGURED"
+                if client
+                else
+                "NOT CONFIGURED"
+            )
+
+            health = (
+                f"〔 *ARIA HEALTH* 〕\n\n"
+
+                f"*Version:* {VERSION}\n"
+
+                f"*Runtime:* {get_runtime()}\n"
+
+                f"*Graph API:* "
+                f"{GRAPH_API_VERSION}\n"
+
+                f"*WhatsApp:* "
+                f"{whatsapp_status}\n"
+
+                f"*Chat Model:* "
+                f"{CHAT_MODEL}\n"
+
+                f"*Groq Chat:* "
+                f"{groq_status}\n"
+
+                f"*Vision Model:* "
+                f"{VISION_MODEL}\n"
+
+                f"*Vision:* "
+                f"{vision_status}\n"
+
+                f"*Memory:* "
+                f"{memory_status}\n"
+            )
+
+            send_text(
+                from_number,
+                health
+            )
+
+            return (
+                "OK",
+                200
+            )
+
+        # ====================================================
         # VISION COMMANDS
-        # ----------------------------------------------------
+        # ====================================================
 
         if tl in [
             ".describe",
@@ -2198,8 +2761,10 @@ def webhook():
             ".solve"
         ]:
 
-            saved_image = user_waiting_image.get(
-                from_number
+            saved_image = (
+                user_waiting_image.get(
+                    from_number
+                )
             )
 
             if not saved_image:
@@ -2209,17 +2774,26 @@ def webhook():
                     "Send an image first."
                 )
 
-                return "OK", 200
+                return (
+                    "OK",
+                    200
+                )
 
-            img_data = user_waiting_image.pop(
-                from_number
+            img_data = (
+                user_waiting_image.pop(
+                    from_number
+                )
             )
 
-            image_url = img_data["url"]
+            image_url = (
+                img_data["url"]
+            )
 
-            mime_type = img_data.get(
-                "mime_type",
-                "image/jpeg"
+            mime_type = (
+                img_data.get(
+                    "mime_type",
+                    "image/jpeg"
+                )
             )
 
             if tl == ".solve":
@@ -2243,19 +2817,21 @@ def webhook():
 
                 result = vision_call(
                     image_url,
+
                     """
 Analyze this image for signs that it may be
 AI-generated, manipulated, edited, misleading,
 or authentic-looking.
 
-Do not claim certainty about authenticity from
-visual inspection alone.
+Do not claim certainty about authenticity
+from visual inspection alone.
 
 Give:
 • What is visibly present
 • Possible signs of editing or generation
 • What cannot be determined from the image alone
 """,
+
                     mime_type
                 )
 
@@ -2268,6 +2844,7 @@ Give:
 
                 result = vision_call(
                     image_url,
+
                     """
 Describe this image clearly.
 
@@ -2281,6 +2858,7 @@ Identify:
 
 If text is unreadable, say so.
 """,
+
                     mime_type
                 )
 
@@ -2295,60 +2873,88 @@ If text is unreadable, say so.
                 f"〔 *RESULT* 〕\n\n{result}"
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
-        # MEDIA COMMANDS
-        # ----------------------------------------------------
+        # ====================================================
+        # PINT COMMANDS
+        # ====================================================
 
-        if tl.startswith(".pint1 "):
+        if tl.startswith(
+            ".pint1 "
+        ):
 
             pint1_unsplash(
                 from_number,
                 text[7:].strip()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        if tl.startswith(".pint2 "):
+        if tl.startswith(
+            ".pint2 "
+        ):
 
             pint2_pexels(
                 from_number,
                 text[7:].strip()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        if tl.startswith(".pint3 "):
+        if tl.startswith(
+            ".pint3 "
+        ):
 
             pint3_anime(
                 from_number,
                 text[7:].strip()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        if tl.startswith(".pint4 "):
+        if tl.startswith(
+            ".pint4 "
+        ):
 
             pint4_comics(
                 from_number,
                 text[7:].strip()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        if tl.startswith(".pint5 "):
+        if tl.startswith(
+            ".pint5 "
+        ):
 
             pint5_education(
                 from_number,
                 text[7:].strip()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # STATUS / MENU
-        # ----------------------------------------------------
+        # ====================================================
 
         if tl in [
             ".status",
@@ -2360,15 +2966,23 @@ If text is unreadable, say so.
                 get_menu()
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # PLAY
-        # ----------------------------------------------------
+        # ====================================================
 
-        if tl.startswith(".play"):
+        if tl.startswith(
+            ".play"
+        ):
 
-            query = text[5:].strip()
+            query = (
+                text[5:]
+                .strip()
+            )
 
             if not query:
 
@@ -2379,20 +2993,21 @@ If text is unreadable, say so.
 
             else:
 
-                result = get_youtube_link(
-                    query
-                )
-
                 send_text(
                     from_number,
-                    result
+                    get_youtube_link(
+                        query
+                    )
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # IMAGE GENERATION
-        # ----------------------------------------------------
+        # ====================================================
 
         if (
             tl.startswith("imagine")
@@ -2424,13 +3039,18 @@ If text is unreadable, say so.
                     parts[1].strip()
                 )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # EXPLAIN
-        # ----------------------------------------------------
+        # ====================================================
 
-        if tl.startswith("explain"):
+        if tl.startswith(
+            "explain"
+        ):
 
             parts = text.split(
                 " ",
@@ -2470,11 +3090,14 @@ If text is unreadable, say so.
                 result
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
-        # ----------------------------------------------------
+        # ====================================================
         # NORMAL AI CHAT
-        # ----------------------------------------------------
+        # ====================================================
 
         if not text:
 
@@ -2483,7 +3106,10 @@ If text is unreadable, say so.
                 "Send me a message."
             )
 
-            return "OK", 200
+            return (
+                "OK",
+                200
+            )
 
         result = ai_call(
             text,
@@ -2504,25 +3130,32 @@ If text is unreadable, say so.
     except Exception as e:
 
         print(
-            f"[WEBHOOK ERROR] {repr(e)}"
+            "[WEBHOOK ERROR]",
+            repr(e)
         )
 
-        # Return 200 to prevent Meta repeatedly retrying
-        # malformed/non-critical events.
-        return "OK", 200
+        return (
+            "OK",
+            200
+        )
 
-    return "OK", 200
+    return (
+        "OK",
+        200
+    )
 
 
 # ============================================================
-# HEALTH CHECK
+# ROOT
 # ============================================================
 
 @app.route("/")
 def home():
 
     return (
-        f"ARIA {VERSION} Running"
+        f"ARIA {VERSION} Running | "
+        f"Graph API {GRAPH_API_VERSION} | "
+        f"Vision {VISION_MODEL}"
     )
 
 
@@ -2560,6 +3193,3 @@ if __name__ == "__main__":
 
 
 
-
-
-                             
