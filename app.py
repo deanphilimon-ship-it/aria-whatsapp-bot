@@ -14,12 +14,12 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 13.0.1
+# VERSION 14.1.0
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "v14.0.0"
+VERSION = "v14.1.0"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -444,123 +444,48 @@ def graph_url(
 # SEND WHATSAPP TEXT
 # ============================================================
 
-def send_text(
-    to,
-    text
-):
+def _split_whatsapp_text(text, max_len=3500):
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return [text] if text else []
+    parts = []
+    remaining = text
+    while len(remaining) > max_len:
+        window = remaining[:max_len]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(". "), window.rfind("! "), window.rfind("? "))
+        if cut < max_len * 0.55:
+            cut = max_len
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return [x for x in parts if x]
 
-    text = clean_ui(text)
 
-    if not text:
-
-        text = (
-            "I couldn't generate a response."
-        )
-
+def send_text(to, text):
+    text = clean_ui(text) or "I couldn't generate a response."
     if not WHATSAPP_TOKEN:
-
-        print(
-            "[WHATSAPP ERROR] "
-            "WHATSAPP_TOKEN is missing."
-        )
-
+        print("[WHATSAPP ERROR] WHATSAPP_TOKEN is missing.")
         return False
-
     if not PHONE_NUMBER_ID:
-
-        print(
-            "[WHATSAPP ERROR] "
-            "PHONE_NUMBER_ID is missing."
-        )
-
+        print("[WHATSAPP ERROR] PHONE_NUMBER_ID is missing.")
         return False
-
-    url = graph_url(
-        f"{PHONE_NUMBER_ID}/messages"
-    )
-
-    headers = {
-        "Authorization":
-        f"Bearer {WHATSAPP_TOKEN}",
-
-        "Content-Type":
-        "application/json"
-    }
-
-    chunks = [
-        text[i:i + 650]
-        for i in range(
-            0,
-            len(text),
-            650
-        )
-    ]
-
+    url = graph_url(f"{PHONE_NUMBER_ID}/messages")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    chunks = _split_whatsapp_text(text)
     success = True
-
     for i, chunk in enumerate(chunks):
-
-        if len(chunks) > 1:
-
-            header = (
-                f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n"
-                f"*Part {i + 1}/{len(chunks)}*\n"
-                f"└──────────────────────────────┘\n\n"
-            )
-
-        else:
-
-            header = (
-                f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n"
-                f"└──────────────────────────────┘\n\n"
-            )
-
-        payload = {
-            "messaging_product":
-            "whatsapp",
-
-            "to":
-            to,
-
-            "type":
-            "text",
-
-            "text": {
-                "body":
-                header + chunk
-            }
-        }
-
+        header = f"〔 *ARIA · {i + 1}/{len(chunks)}* 〕\n\n" if len(chunks) > 1 else ""
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"preview_url": False, "body": header + chunk}}
         try:
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=20
-            )
-
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             if not response.ok:
-
                 success = False
-
-                print(
-                    "[WHATSAPP SEND ERROR]",
-                    response.status_code,
-                    response.text[:2000]
-                )
-
+                print("[WHATSAPP SEND ERROR]", response.status_code, response.text[:1000])
         except Exception as e:
-
             success = False
-
-            print(
-                "[WHATSAPP SEND EXCEPTION]",
-                repr(e)
-            )
-
-        time.sleep(0.5)
-
+            print("[WHATSAPP SEND EXCEPTION]", repr(e))
+        time.sleep(0.3)
     return success
 
 # ============================================================
@@ -2087,31 +2012,39 @@ def check_groq_models():
 # SOLVE IMAGE
 # ============================================================
 
-def solve_image_math(
-    image_url,
-    mime_type=None
-):
+def solve_image_problem(image_url, mime_type=None, mode="universal"):
+    if mode == "math":
+        prompt = """
+You are ARIA's dedicated mathematics solver.
+Read the image carefully and solve the visible mathematical problem.
+Use: 〔 SOLUTION 〕, Given/question, Method or formula, Key working steps, Final answer.
+Keep working clear but concise. Preserve readable numbers, symbols and units.
+If something is unreadable, say exactly what needs to be clearer instead of guessing.
+"""
+    else:
+        prompt = """
+You are ARIA's universal image-problem solver. First identify the problem type:
+mathematics, physics, chemistry, biology, English/language, multiple choice, logic,
+diagram, or another academic/practical task. Then solve the actual problem shown.
 
-    return vision_call(
-        image_url,
+Use:
+〔 SOLUTION 〕
+• Problem type
+• Question (short transcription)
+• Method / formula / rule
+• Important working
 
-        """
-Solve the math problem shown in the image.
+〔 ANSWER 〕
+Final answer.
 
-Read the problem carefully.
+For multiple choice, identify the option and briefly explain why. Do not invent
+text that cannot be read. If the image is unclear, say exactly what is unclear.
+"""
+    return vision_call(image_url, prompt, mime_type)
 
-Show:
-• The information given
-• The relevant formula or method
-• The important calculation steps
-• The final answer clearly
 
-If the image is too unclear to read,
-say exactly what part is unclear.
-""",
-
-        mime_type
-    )
+def solve_image_math(image_url, mime_type=None):
+    return solve_image_problem(image_url, mime_type, mode="math")
 
 # ============================================================
 # LEARN USER FACTS
@@ -2332,39 +2265,49 @@ def get_runtime():
 # ============================================================
 
 def get_menu():
-
     return f"""
 〔 *ARIA {VERSION}* 〕
 
-*AI assistant + WhatsApp automation*
+*AI*
+• `.ask <question>`
+• `.explain <topic>`
+• `.summarize <text>`
+• `.translate <language> <text>`
+• `.define <word>`
 
-〔 *AI* 〕
-• `explain <topic>`
-• `explain <topic> <1-6>`
+*VISION*
+• `.describe` / `.describe detailed`
+• `.read`
+• `.solve`
+• `.math`
+• `.verify`
 
-〔 *VISION* 〕
-• Send image → `.describe`
-• Send image → `.verify`
-• Send image → `.solve`
+*STUDY*
+• `.study <topic>`
+• `.quiz <topic>`
 
-〔 *SYSTEM* 〕
-• `.health` — live dependency checks
-• `.status` — current configuration
-• `.menu` — this command list
+*MEDIA*
+• `.pint`
+• `.photo <query>`
+• `.wallpaper <query>`
+• `.anime <character>`
+• `.comic <query>`
+• `.edu <subject>`
+• `imagine <prompt>`
+• `.play <song name>`
 
-〔 *OWNER* 〕
+*SYSTEM*
+• `.health`
+• `.status`
+• `.menu`
+• `.help <command>`
+
+*OWNER*
 • `.users`
 • `.ban <number>`
 • `.unban <number>`
 
-〔 *MEDIA* 〕
-• `.pint1 <keyword>`
-• `.pint2 <keyword>`
-• `.pint3 <character>`
-• `.pint4 <keyword>`
-• `.pint5 <subject>`
-• `imagine <prompt>`
-• `.play <song name>`
+Legacy `.pint1`–`.pint5` still work.
 """
 
 
@@ -2954,139 +2897,58 @@ def webhook():
         # VISION COMMANDS
         # ====================================================
 
-        if tl in [
-            ".describe",
-            ".verify",
-            ".solve"
-        ]:
-
-            saved_image = (
-                user_waiting_image.get(
-                    from_number
-                )
-            )
-
+        vision_commands = {".describe", ".describe detailed", ".verify", ".solve", ".math", ".read"}
+        if tl in vision_commands:
+            saved_image = user_waiting_image.get(from_number)
             if saved_image:
-
                 saved_at = saved_image.get("saved_at", 0)
-
                 if saved_at and time.time() - saved_at > IMAGE_WAIT_TIMEOUT:
-                    user_waiting_image.pop(
-                        from_number,
-                        None
-                    )
+                    user_waiting_image.pop(from_number, None)
                     saved_image = None
-
             if not saved_image:
-
-                send_text(
-                    from_number,
-                    "No recent image is waiting. Send an image first."
-                )
-
-                return (
-                    "OK",
-                    200
-                )
-
-            img_data = (
-                user_waiting_image.pop(
-                    from_number
-                )
-            )
-
-            image_url = (
-                img_data["url"]
-            )
-
-            mime_type = (
-                img_data.get(
-                    "mime_type",
-                    "image/jpeg"
-                )
-            )
-
+                send_text(from_number, "No recent image is waiting. Send an image first.")
+                return "OK", 200
+            img_data = user_waiting_image.pop(from_number)
+            image_url = img_data["url"]
+            mime_type = img_data.get("mime_type", "image/jpeg")
             if tl == ".solve":
-
-                send_text(
-                    from_number,
-                    "Solving..."
-                )
-
-                result = solve_image_math(
-                    image_url,
-                    mime_type
-                )
-
+                send_text(from_number, "Reading the problem and solving it...")
+                result = solve_image_problem(image_url, mime_type, "universal")
+            elif tl == ".math":
+                send_text(from_number, "Reading the mathematics...")
+                result = solve_image_problem(image_url, mime_type, "math")
+            elif tl == ".read":
+                send_text(from_number, "Reading the text...")
+                result = vision_call(image_url, """Extract the readable text from this image. Return only text you can actually read, preserving useful line breaks. If some text is unclear, mark it [unclear] instead of inventing it.""", mime_type)
             elif tl == ".verify":
-
-                send_text(
-                    from_number,
-                    "Analyzing the image..."
-                )
-
-                result = vision_call(
-                    image_url,
-
-                    """
-Analyze this image for signs that it may be
-AI-generated, manipulated, edited, misleading,
-or authentic-looking.
-
-Do not claim certainty about authenticity
-from visual inspection alone.
-
-Give:
-• What is visibly present
-• Possible signs of editing or generation
-• What cannot be determined from the image alone
-""",
-
-                    mime_type
-                )
-
+                send_text(from_number, "Analyzing the image...")
+                result = vision_call(image_url, """Analyze this image for visible indicators of AI generation, manipulation, editing, or misleading presentation. Give: 〔 IMAGE CHECK 〕, visible evidence, possible indicators, and what cannot be determined from the image alone. Do not claim certainty from visual inspection alone.""", mime_type)
             else:
+                detailed = tl == ".describe detailed"
+                send_text(from_number, "Analyzing image...")
+                prompt = """Describe this image naturally for WhatsApp. Start with one concise sentence, then useful bullet points. Mention readable text only when actually legible. Do not guess identities or unreadable details."""
+                prompt += " Include composition, setting, colors, notable objects, and readable text." if detailed else " Keep it to roughly 100-180 words."
+                result = vision_call(image_url, prompt, mime_type)
+            result = result or "I couldn't process that image."
+            add_to_memory(from_number, "assistant", result)
+            send_text(from_number, result)
+            return "OK", 200
 
-                send_text(
-                    from_number,
-                    "Analyzing image..."
-                )
-
-                result = vision_call(
-                    image_url,
-
-                    """
-Describe this image clearly.
-
-Identify:
-• Main subjects
-• Objects
-• Colors
-• Text that can be read
-• Important visual details
-• Style or setting
-
-If text is unreadable, say so.
-""",
-
-                    mime_type
-                )
-
-            add_to_memory(
-                from_number,
-                "assistant",
-                result
-            )
-
-            send_text(
-                from_number,
-                f"〔 *RESULT* 〕\n\n{result}"
-            )
-
-            return (
-                "OK",
-                200
-            )
+        # ====================================================
+        # MEDIA ALIASES
+        # ====================================================
+        media_aliases = [(".photo", pint1_unsplash), (".wallpaper", pint2_pexels), (".anime", pint3_anime), (".comic", pint4_comics), (".edu", pint5_education)]
+        for command, handler in media_aliases:
+            if tl.startswith(command + " "):
+                query = text[len(command):].strip()
+                if not query:
+                    send_text(from_number, f"Usage: `{command} <query>`")
+                else:
+                    handler(from_number, query)
+                return "OK", 200
+        if tl == ".pint":
+            send_text(from_number, "〔 PINT 〕\n\nChoose:\n• `.photo <query>`\n• `.wallpaper <query>`\n• `.anime <character>`\n• `.comic <query>`\n• `.edu <subject>`")
+            return "OK", 200
 
         # ====================================================
         # PINT COMMANDS
@@ -3191,6 +3053,26 @@ If text is unreadable, say so.
             )
 
         # ====================================================
+        # HELP
+        # ====================================================
+        if tl.startswith(".help"):
+            command = text[5:].strip().lower()
+            help_map = {
+                ".solve": "Send an image, then `.solve`. ARIA identifies the problem type and solves it.",
+                ".math": "Send an image, then `.math`. ARIA focuses on mathematics.",
+                ".read": "Send an image, then `.read`. ARIA extracts readable text.",
+                ".describe": "Send an image, then `.describe`. Use `.describe detailed` for more detail.",
+                ".verify": "Send an image, then `.verify`. ARIA reports visible indicators without claiming forensic certainty.",
+                ".pint": "Use `.photo`, `.wallpaper`, `.anime`, `.comic`, or `.edu`.",
+                ".status": "Shows ARIA's runtime and provider configuration.",
+                ".health": "Checks the main dependencies and AI providers.",
+                ".study": "`.study <topic>` creates concise study notes.",
+                ".quiz": "`.quiz <topic>` creates practice questions.",
+            }
+            send_text(from_number, "Usage: `.help <command>`\n\n" + (help_map.get(command, "Try `.menu` to see the available commands.") if command else "Try `.help solve`, `.help pint`, or `.help status`."))
+            return "OK", 200
+
+        # ====================================================
         # PLAY
         # ====================================================
 
@@ -3267,19 +3149,15 @@ If text is unreadable, say so.
         # EXPLAIN
         # ====================================================
 
-        if tl.startswith(
-            "explain"
-        ):
+        if tl.startswith("explain") or tl.startswith(".explain"):
 
-            parts = text.split(
-                " ",
-                2
-            )
+            command_text = text[1:] if text.startswith(".") else text
+            parts = command_text.split(" ", 2)
 
             if len(parts) == 1:
 
                 result = (
-                    "Usage: `explain <topic>`"
+                    "Usage: `.explain <topic>`"
                 )
 
             elif len(parts) == 2:
@@ -3313,6 +3191,36 @@ If text is unreadable, say so.
                 "OK",
                 200
             )
+
+        # ====================================================
+        # AI CONVENIENCE COMMANDS
+        # ====================================================
+        if tl.startswith(".ask "):
+            result = ai_call(text[5:].strip(), from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl == ".ask":
+            send_text(from_number, "Usage: `.ask <question>`"); return "OK", 200
+        if tl.startswith(".summarize "):
+            result = ai_call(f"Summarize this clearly and briefly:\n\n{text[11:].strip()}", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl == ".summarize":
+            send_text(from_number, "Usage: `.summarize <text>`"); return "OK", 200
+        if tl.startswith(".translate "):
+            parts = text.split(" ", 2)
+            if len(parts) < 3: send_text(from_number, "Usage: `.translate <language> <text>`")
+            else:
+                result = ai_call(f"Translate into {parts[1]}. Return only the natural translation.\n\n{parts[2]}", from_number)
+                add_to_memory(from_number, "assistant", result); send_text(from_number, result)
+            return "OK", 200
+        if tl.startswith(".define "):
+            result = ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl.startswith(".study "):
+            result = ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl.startswith(".quiz "):
+            result = ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
 
         # ====================================================
         # NORMAL AI CHAT
@@ -3395,6 +3303,12 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
+
+
+
+
+
 
 
 
