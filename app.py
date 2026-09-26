@@ -22,16 +22,10 @@ app = Flask(__name__)
 VERSION = "v13.0.1"
 start_time = time.time()
 
-
-# ============================================================
-# META GRAPH API
-# ============================================================
-
 GRAPH_API_VERSION = os.getenv(
     "GRAPH_API_VERSION",
     "v26.0"
 )
-
 
 # ============================================================
 # GLOBAL STATE
@@ -47,7 +41,6 @@ user_profile = {}
 MAX_HISTORY = 15
 MEMORY_FILE = "aria_memory.json"
 
-
 # ============================================================
 # ENVIRONMENT VARIABLES
 # ============================================================
@@ -62,15 +55,12 @@ UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 
-
 # ============================================================
 # GROQ MODELS
 # ============================================================
 
 CHAT_MODEL = "openai/gpt-oss-120b"
-
 VISION_MODEL = "qwen/qwen3.8-27b"
-
 
 # ============================================================
 # GROQ CLIENT
@@ -81,7 +71,6 @@ client = (
     if GROQ_API_KEY
     else None
 )
-
 
 # ============================================================
 # ACCESS CONTROL
@@ -109,7 +98,6 @@ authenticated_users = set()
 
 BANNED_USERS = set()
 
-
 # ============================================================
 # RATE LIMITS
 # ============================================================
@@ -122,7 +110,6 @@ LIMITS = {
     "pint4": 20,
     "pint5": 50,
 }
-
 
 # ============================================================
 # MEMORY
@@ -203,7 +190,6 @@ def save_memory():
 
 load_memory()
 
-
 # ============================================================
 # RATE LIMITER
 # ============================================================
@@ -235,7 +221,6 @@ def check_rate_limit(
     api_requests[key].append(now)
 
     return True
-
 
 # ============================================================
 # AUTHENTICATION
@@ -320,7 +305,6 @@ def check_auth(
         f"Attempts left: {remaining}"
     )
 
-
 # ============================================================
 # USER LIST
 # ============================================================
@@ -379,7 +363,6 @@ def get_users_list():
         )
 
     return "\n".join(lines)
-
 
 # ============================================================
 # WHATSAPP FORMATTING
@@ -440,7 +423,6 @@ def clean_ui(text):
 
     return text.strip()
 
-
 # ============================================================
 # GRAPH API URL
 # ============================================================
@@ -454,7 +436,6 @@ def graph_url(
         f"{GRAPH_API_VERSION}/"
         f"{endpoint}"
     )
-
 
 # ============================================================
 # SEND WHATSAPP TEXT
@@ -579,7 +560,6 @@ def send_text(
 
     return success
 
-
 # ============================================================
 # SEND IMAGE
 # ============================================================
@@ -688,9 +668,8 @@ def send_image_url(
 
         return False
 
-
 # ============================================================
-# PINT1 - UNSPLASH
+# PINT1
 # ============================================================
 
 def pint1_unsplash(
@@ -768,9 +747,8 @@ def pint1_unsplash(
             f"No results on Unsplash for: {query}"
         )
 
-
 # ============================================================
-# PINT2 - WALLHAVEN
+# PINT2
 # ============================================================
 
 def pint2_pexels(
@@ -921,9 +899,8 @@ def pint2_pexels(
         )
     )
 
-
 # ============================================================
-# PINT3 - DANBOORU
+# PINT3
 # ============================================================
 
 def pint3_anime(
@@ -1058,9 +1035,8 @@ def pint3_anime(
             "Try a different character."
         )
 
-
 # ============================================================
-# PINT4 - COMICVINE
+# PINT4
 # ============================================================
 
 def pint4_comics(
@@ -1229,9 +1205,8 @@ def pint4_comics(
             "Try again in a few seconds."
         )
 
-
 # ============================================================
-# PINT5 - EDUCATION
+# PINT5
 # ============================================================
 
 def pint5_education(
@@ -1341,7 +1316,6 @@ def pint5_education(
         )
     )
 
-
 # ============================================================
 # IMAGE GENERATION
 # ============================================================
@@ -1417,9 +1391,8 @@ def imagine_generate(
             )
         )
 
-
 # ============================================================
-# ARIA SYSTEM PROMPT
+# SYSTEM PROMPT
 # ============================================================
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -1464,7 +1437,6 @@ WHATSAPP
 - Use • for bullets when appropriate.
 - Avoid excessive emojis.
 """
-
 
 # ============================================================
 # MEMORY CONTEXT
@@ -1518,7 +1490,6 @@ def build_memory_context(
 
     return context
 
-
 # ============================================================
 # MEMORY WRITE
 # ============================================================
@@ -1554,7 +1525,6 @@ def add_to_memory(
     ][-MAX_HISTORY:]
 
     save_memory()
-
 
 # ============================================================
 # AI CALL
@@ -1610,16 +1580,17 @@ def ai_call(
 
                 temperature=0.6,
 
-                max_completion_tokens=1024,
+                # PATCH:
+                # Compatible with the SDK currently
+                # installed on your Render service.
+                max_tokens=1024,
 
                 top_p=0.95,
 
                 stream=False,
 
-                # GPT-OSS supports low/medium/high.
                 reasoning_effort="medium",
 
-                # Do NOT use reasoning_format with GPT-OSS.
                 include_reasoning=False
             )
         )
@@ -1651,7 +1622,6 @@ def ai_call(
             "Check the Render logs for "
             "[AI ERROR] to see the exact cause."
         )
-
 
 # ============================================================
 # WHATSAPP IMAGE DOWNLOAD
@@ -1735,7 +1705,6 @@ def download_whatsapp_image(
         detected_mime
     )
 
-
 # ============================================================
 # VISION CALL
 # ============================================================
@@ -1807,13 +1776,14 @@ def vision_call(
 
                 temperature=0.3,
 
-                max_completion_tokens=1024,
+                # PATCH:
+                # Changed from max_completion_tokens.
+                max_tokens=1024,
 
                 top_p=0.9,
 
                 stream=False,
 
-                # Qwen 3.8 supports "none".
                 reasoning_effort="none"
             )
         )
@@ -1851,9 +1821,8 @@ def vision_call(
             "[VISION ERROR] to see the exact cause."
         )
 
-
 # ============================================================
-# SOLVE IMAGE MATH
+# SOLVE IMAGE
 # ============================================================
 
 def solve_image_math(
@@ -1881,7 +1850,6 @@ say exactly what part is unclear.
 
         mime_type
     )
-
 
 # ============================================================
 # LEARN USER FACTS
@@ -1934,7 +1902,6 @@ def learn_fact(
         )
 
     return None
-
 
 # ============================================================
 # EDUCATION EXPLANATION
@@ -2056,9 +2023,8 @@ Requirements:
         system=system
     )
 
-
 # ============================================================
-# YOUTUBE SEARCH
+# YOUTUBE
 # ============================================================
 
 def get_youtube_link(
@@ -2074,7 +2040,6 @@ def get_youtube_link(
         f"*{query.title()}*\n\n"
         f"▶️ Tap to search: {youtube_url}"
     )
-
 
 # ============================================================
 # RUNTIME
@@ -2100,9 +2065,12 @@ def get_runtime():
         f"{h}h {m}m {s}s"
     )
 
-
 # ============================================================
 # MENU
+# NOTE:
+# .status and .menu are intentionally still together
+# in this version. We will separate them AFTER the API
+# patch is confirmed working.
 # ============================================================
 
 def get_menu():
@@ -2161,7 +2129,6 @@ def get_menu():
 • `imagine <prompt>`
 • `.play <song name>`
 """
-
 
 # ============================================================
 # WEBHOOK
@@ -2322,7 +2289,7 @@ def webhook():
             )
 
         # ====================================================
-        # OWNER: BAN
+        # OWNER BAN
         # ====================================================
 
         if tl.startswith(
@@ -2381,7 +2348,7 @@ def webhook():
             )
 
         # ====================================================
-        # OWNER: UNBAN
+        # OWNER UNBAN
         # ====================================================
 
         if tl.startswith(
@@ -2436,7 +2403,7 @@ def webhook():
             )
 
         # ====================================================
-        # OWNER: USERS
+        # OWNER USERS
         # ====================================================
 
         if tl == ".users":
@@ -2605,7 +2572,7 @@ def webhook():
             )
 
         # ====================================================
-        # FORGET MEMORY
+        # FORGET
         # ====================================================
 
         if tl == "forget me":
@@ -2656,15 +2623,15 @@ def webhook():
                                 }
                             ],
 
-                            max_completion_tokens=10,
+                            # PATCH:
+                            # Changed from
+                            # max_completion_tokens.
+                            max_tokens=10,
 
                             stream=False,
 
-                            # GPT-OSS accepts
-                            # low / medium / high.
                             reasoning_effort="low",
 
-                            # Suppress reasoning output.
                             include_reasoning=False
                         )
                     )
@@ -3144,7 +3111,6 @@ If text is unreadable, say so.
         200
     )
 
-
 # ============================================================
 # ROOT
 # ============================================================
@@ -3157,7 +3123,6 @@ def home():
         f"Graph API {GRAPH_API_VERSION} | "
         f"Vision {VISION_MODEL}"
     )
-
 
 # ============================================================
 # START SERVER
@@ -3176,8 +3141,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
-
 
 
 
