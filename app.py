@@ -14,12 +14,12 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 14.1.0
+# VERSION 14.1.1
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "v14.1.0"
+VERSION = "v14.1.1"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -64,6 +64,7 @@ COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 CHAT_MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 
 # ============================================================
 # GROQ CLIENT
@@ -1349,7 +1350,11 @@ ACCURACY
 - If uncertain, say so.
 - Never invent sources, facts, API results, files, events, or personal memories.
 - Distinguish facts from assumptions.
-- When the user asks for current information and no live tool/data is available, state that limitation instead of pretending the information is current.
+- When the user asks for current or recent information and no live tool/data is available, state that limitation instead of pretending the information is current.
+- Never claim a specific training-data cutoff date unless the provider explicitly supplies that date.
+- Never say that your knowledge "ends in June 2024" or invent another cutoff date.
+- Do not turn uncertainty about current information into a claim about your training cutoff.
+- If asked "what is your knowledge cutoff?", say that you do not have a reliable provider-supplied cutoff date available in this chat and that current information should be verified with live sources when available.
 
 MEMORY
 - Use supplied conversation memory when relevant.
@@ -1555,8 +1560,10 @@ def gemini_call(
             }
         ],
         "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 1024
+            "maxOutputTokens": 1024,
+            "thinkingConfig": {
+                "thinkingLevel": GEMINI_THINKING_LEVEL
+            }
         }
     }
 
@@ -2351,6 +2358,7 @@ def get_status():
 *Groq Vision:* {VISION_MODEL}
 *Gemini:* {gemini}
 *Gemini Model:* {GEMINI_MODEL}
+*Gemini Thinking:* {GEMINI_THINKING_LEVEL}
 
 〔 *SYSTEMS* 〕
 *WhatsApp:* {whatsapp}
@@ -3303,9 +3311,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
-
-
 
 
 
