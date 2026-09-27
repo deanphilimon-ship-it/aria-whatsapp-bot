@@ -83,8 +83,8 @@ client = (
 OWNER_NUMBER = "2348026177804"
 
 ALLOWED_USERS = [
-    "2348XXXXXXXX",
-    "2349XXXXXXX"
+    "",
+    ""
 ]
 
 PASSWORD = (
