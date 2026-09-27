@@ -19,7 +19,7 @@ from groq import Groq
 
 app = Flask(__name__)
 
-VERSION = "v14.1.1"
+VERSION = "v14.2.0"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -80,14 +80,25 @@ client = (
 # ACCESS CONTROL
 # ============================================================
 
-OWNER_NUMBER = "2348026177804"
+OWNER_NUMBER = os.getenv("OWNER_NUMBER", "2348026177804").strip()
+
+ADMIN_NUMBERS = {
+    n.strip()
+    for n in os.getenv("ADMIN_NUMBERS", "").split(",")
+    if n.strip()
+}
 
 ALLOWED_USERS = [
-    "",
-    ""
+    n.strip()
+    for n in os.getenv("ALLOWED_USERS", "2348XXXXXXXX,2349XXXXXXX").split(",")
+    if n.strip()
 ]
 
-PASSWORD = (
+# Prefer a secret Render environment variable. The weekly fallback is retained
+# for backwards compatibility so an existing deployment does not suddenly lock
+# everyone out before ARIA_PASSWORD is configured.
+ARIA_PASSWORD = os.getenv("ARIA_PASSWORD", "").strip()
+PASSWORD = ARIA_PASSWORD or (
     "ARIA"
     + datetime.now(
         pytz.timezone("Africa/Lagos")
@@ -235,14 +246,12 @@ def check_auth(
     text
 ):
 
-    if (
-        from_number == OWNER_NUMBER
-        or from_number in ALLOWED_USERS
-    ):
+    # The owner is immutable: bans and ordinary authentication state can
+    # never remove the owner's access.
+    if from_number == OWNER_NUMBER:
 
-        authenticated_users.add(
-            from_number
-        )
+        BANNED_USERS.discard(from_number)
+        authenticated_users.add(from_number)
 
         return True, ""
 
@@ -252,6 +261,12 @@ def check_auth(
             False,
             "You are banned from using ARIA."
         )
+
+    if from_number in ADMIN_NUMBERS or from_number in ALLOWED_USERS:
+
+        authenticated_users.add(from_number)
+
+        return True, ""
 
     if from_number in authenticated_users:
 
@@ -856,7 +871,6 @@ def pint3_anime(
             tag in q
             for tag in nsfw_tags
         )
-        and sender != OWNER_NUMBER
     ):
 
         send_text(
@@ -1329,6 +1343,8 @@ You are ARIA, an advanced WhatsApp AI assistant.
 
 IDENTITY
 - Your name is ARIA.
+- ARIA stands for Advanced Response Intelligence Assistant.
+- If asked what ARIA means, use that exact expansion for this bot.
 - Be intelligent, practical, direct and conversational.
 - Do not pretend to be human.
 - Do not claim to have seen, checked or verified something you did not actually receive or access.
@@ -1364,6 +1380,11 @@ PROBLEM SOLVING
 - Solve the actual problem instead of giving generic advice.
 - For calculations, show enough working to make the answer understandable.
 - For technical problems, identify the likely cause before suggesting a fix.
+
+SAFETY
+- Do not generate, encourage, or provide explicit sexual content.
+- Do not eroticize or provide sexualized descriptions of explicit images.
+- Educational, medical, anatomical, safety, and non-explicit discussions are allowed when handled clinically.
 
 WHATSAPP
 - Keep formatting clean and readable.
@@ -2030,7 +2051,7 @@ If something is unreadable, say exactly what needs to be clearer instead of gues
 """
     else:
         prompt = """
-You are ARIA's universal image-problem solver. First identify the problem type:
+You are ARIA's universal image-problem solver. If the image contains explicit sexual content, do not describe or sexualize it; briefly state that explicit content cannot be processed. Otherwise first identify the problem type:
 mathematics, physics, chemistry, biology, English/language, multiple choice, logic,
 diagram, or another academic/practical task. Then solve the actual problem shown.
 
@@ -2268,6 +2289,62 @@ def get_runtime():
     )
 
 # ============================================================
+# CONTENT SAFETY
+# ============================================================
+
+EXPLICIT_PATTERNS = [
+    r"\bporn(?:ography)?\b",
+    r"\bpornographic\b",
+    r"\bnsfw\b",
+    r"\bsex video\b",
+    r"\bsex tape\b",
+    r"\bexplicit sex\b",
+    r"\bsexual intercourse\b",
+    r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",
+    r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",
+    r"\bnaked\s+(?:photo|picture|image|pic)s?\b",
+    r"\b(?:boobs?|breasts?)\s+(?:photo|picture|image|pic)s?\b",
+    r"\b(?:dick|penis|cock|pussy|vagina)\s+(?:photo|picture|image|pic)s?\b",
+]
+
+
+def is_explicit_request(text):
+    if not text:
+        return False
+
+    normalized = re.sub(r"\s+", " ", str(text).lower()).strip()
+
+    # Educational/medical questions containing a sensitive word alone are
+    # not treated as explicit requests. The patterns above require explicit
+    # sexual-media or sexual-act context.
+    return any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in EXPLICIT_PATTERNS
+    )
+
+
+def safety_block_message():
+    return (
+        "I can help with educational, medical, safety, or non-explicit topics, "
+        "but I can't generate or provide explicit sexual content."
+    )
+
+
+def get_about():
+    return f"""
+〔 *ABOUT ARIA* 〕
+
+*ARIA* stands for *Advanced Response Intelligence Assistant*.
+
+ARIA is a WhatsApp AI assistant designed to handle conversation, vision,
+problem solving, study help and media commands.
+
+*Version:* {VERSION}
+*Owner protection:* ENABLED
+*Content safety:* ENABLED
+"""
+
+# ============================================================
 # MENU / STATUS
 # ============================================================
 
@@ -2304,6 +2381,7 @@ def get_menu():
 • `.play <song name>`
 
 *SYSTEM*
+• `.about`
 • `.health`
 • `.status`
 • `.menu`
@@ -2524,6 +2602,20 @@ def webhook():
             )
 
         # ====================================================
+        # GLOBAL CONTENT SAFETY
+        # ====================================================
+
+        if is_explicit_request(text):
+            send_text(
+                from_number,
+                safety_block_message()
+            )
+            return (
+                "OK",
+                200
+            )
+
+        # ====================================================
         # OWNER BAN
         # ====================================================
 
@@ -2554,6 +2646,16 @@ def webhook():
                     parts[1]
                     .strip()
                 )
+
+                if target == OWNER_NUMBER:
+                    send_text(
+                        from_number,
+                        "Owner protection: that number cannot be banned."
+                    )
+                    return (
+                        "OK",
+                        200
+                    )
 
                 BANNED_USERS.add(
                     target
@@ -2613,6 +2715,16 @@ def webhook():
                     parts[1]
                     .strip()
                 )
+
+                if target == OWNER_NUMBER:
+                    send_text(
+                        from_number,
+                        "Owner is permanently protected and does not require unbanning."
+                    )
+                    return (
+                        "OK",
+                        200
+                    )
 
                 BANNED_USERS.discard(
                     target
@@ -2888,7 +3000,11 @@ def webhook():
                 f"〔 *GEMINI FALLBACK* 〕\n"
                 f"*API:* {gemini_status}\n"
                 f"*Vision:* {gemini_vision_status}\n"
-                f"*Model:* {GEMINI_MODEL}\n"
+                f"*Model:* {GEMINI_MODEL}\n\n"
+                f"〔 *SECURITY* 〕\n"
+                f"*Owner:* PROTECTED\n"
+                f"*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'LEGACY FALLBACK'}\n"
+                f"*Content Safety:* ENABLED\n"
             )
 
             send_text(
@@ -3048,6 +3164,16 @@ def webhook():
                 200
             )
 
+        if tl == ".about":
+            send_text(
+                from_number,
+                get_about()
+            )
+            return (
+                "OK",
+                200
+            )
+
         if tl == ".status":
 
             send_text(
@@ -3072,6 +3198,7 @@ def webhook():
                 ".describe": "Send an image, then `.describe`. Use `.describe detailed` for more detail.",
                 ".verify": "Send an image, then `.verify`. ARIA reports visible indicators without claiming forensic certainty.",
                 ".pint": "Use `.photo`, `.wallpaper`, `.anime`, `.comic`, or `.edu`.",
+                ".about": "Shows ARIA's identity and core protections.",
                 ".status": "Shows ARIA's runtime and provider configuration.",
                 ".health": "Checks the main dependencies and AI providers.",
                 ".study": "`.study <topic>` creates concise study notes.",
@@ -3311,12 +3438,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
-
-
-
-
-
 
 
 
