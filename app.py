@@ -90,7 +90,7 @@ ADMIN_NUMBERS = {
 
 ALLOWED_USERS = [
     n.strip()
-    for n in os.getenv("ALLOWED_USERS", "2348XXXXXXXX,2349XXXXXXX").split(",")
+    for n in os.getenv("ALLOWED_USERS", "2349157874791").split(",")
     if n.strip()
 ]
 
