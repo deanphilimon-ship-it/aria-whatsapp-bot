@@ -14,12 +14,12 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 13.0.1
+# VERSION 14.2.2
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "v14.0.0"
+VERSION = "v14.2.2"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -34,7 +34,8 @@ GRAPH_API_VERSION = os.getenv(
 last_explain_topic = {}
 last_explain_fields = {}
 user_waiting_image = {}
-IMAGE_CONTEXT_TIMEOUT = 30 * 60
+last_image_context = {}
+IMAGE_WAIT_TIMEOUT = 30 * 60
 
 conversation_memory = {}
 user_profile = {}
@@ -51,18 +52,26 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
+STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
+TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
+TTS_VOICE = os.getenv("TTS_VOICE", "autumn")
+TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "en")
 
 UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 COMICVINE_KEY = os.getenv("COMICVINE_KEY")
+PINTEREST_ACCESS_TOKEN = (os.getenv("PINTEREST_ACCESS_TOKEN") or os.getenv("PINTEREST_API_KEY") or os.getenv("PINTEREST_TOKEN"))
 
 # ============================================================
 # GROQ MODELS
 # ============================================================
 
 CHAT_MODEL = "openai/gpt-oss-120b"
-VISION_MODEL = "qwen/qwen3.8-27b"
+VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 
 # ============================================================
 # GROQ CLIENT
@@ -78,15 +87,26 @@ client = (
 # ACCESS CONTROL
 # ============================================================
 
-OWNER_NUMBER = "2348026177804"
+OWNER_NUMBER = os.getenv("OWNER_NUMBER", "2348026177804").strip()
 OWNER_NAME = "Philimon Dean"
 
+ADMIN_NUMBERS = {
+    n.strip()
+    for n in os.getenv("ADMIN_NUMBERS", "").split(",")
+    if n.strip()
+}
+
 ALLOWED_USERS = [
-    "2349157874791","2348163864199","2349069226119" 
-    
+    n.strip()
+    for n in os.getenv("ALLOWED_USERS", "2349157874791","2348163864199","2349069226119").split(",")
+    if n.strip()
 ]
 
-PASSWORD = (
+# Prefer a secret Render environment variable. The weekly fallback is retained
+# for backwards compatibility so an existing deployment does not suddenly lock
+# everyone out before ARIA_PASSWORD is configured.
+ARIA_PASSWORD = os.getenv("ARIA_PASSWORD", "").strip()
+PASSWORD = ARIA_PASSWORD or (
     "ARIA"
     + datetime.now(
         pytz.timezone("Africa/Lagos")
@@ -96,6 +116,7 @@ PASSWORD = (
 MAX_TRIES = 4
 
 auth_tries = {}
+voice_enabled_users = set()
 
 authenticated_users = set()
 
@@ -112,6 +133,7 @@ LIMITS = {
     "pint2": 100,
     "pint4": 20,
     "pint5": 50,
+    "pinterest": 20,
 }
 
 # ============================================================
@@ -234,14 +256,12 @@ def check_auth(
     text
 ):
 
-    if (
-        from_number == OWNER_NUMBER
-        or from_number in ALLOWED_USERS
-    ):
+    # The owner is immutable: bans and ordinary authentication state can
+    # never remove the owner's access.
+    if from_number == OWNER_NUMBER:
 
-        authenticated_users.add(
-            from_number
-        )
+        BANNED_USERS.discard(from_number)
+        authenticated_users.add(from_number)
 
         return True, ""
 
@@ -251,6 +271,12 @@ def check_auth(
             False,
             "You are banned from using ARIA."
         )
+
+    if from_number in ADMIN_NUMBERS or from_number in ALLOWED_USERS:
+
+        authenticated_users.add(from_number)
+
+        return True, ""
 
     if from_number in authenticated_users:
 
@@ -314,39 +340,57 @@ def check_auth(
 
 def get_users_list():
 
-    active_users = set()
-    active_users.update(authenticated_users)
-    active_users.update(conversation_memory.keys())
-    active_users.update(user_profile.keys())
-    active_users.update(ALLOWED_USERS)
-    active_users.discard(OWNER_NUMBER)
-    active_users.difference_update(BANNED_USERS)
+    users = set()
+
+    users.update(
+        authenticated_users
+    )
+
+    users.update(
+        conversation_memory.keys()
+    )
+
+    users.update(
+        user_profile.keys()
+    )
+
+    users.update(
+        ALLOWED_USERS
+    )
+
+    users.discard(
+        OWNER_NUMBER
+    )
+
+    if not users:
+
+        return (
+            "〔 *ARIA USERS* 〕\n\n"
+            "No users recorded."
+        )
 
     lines = [
-        "〔 *ARIA USERS PANEL* 〕",
-        f"*Owner:* {OWNER_NAME}",
-        f"*Active:* {len(active_users)}",
-        f"*Banned:* {len(BANNED_USERS)}",
+        "〔 *ARIA USERS* 〕",
         "",
-        "🟢 *ACTIVE USERS*"
+        f"*Authenticated:* "
+        f"{len(authenticated_users)}",
+        f"*Recorded:* {len(users)}",
+        f"*Banned:* {len(BANNED_USERS)}",
+        ""
     ]
 
-    if active_users:
-        for number in sorted(active_users):
-            name = user_profile.get(number, {}).get("name", "Unknown")
-            lines.append(f"• {number} — {name}")
-    else:
-        lines.append("• None")
+    for number in sorted(users):
 
-    lines.extend(["", "⛔ *BANNED USERS*"])
+        status = (
+            "BANNED"
+            if number in BANNED_USERS
+            else "ACTIVE"
+        )
 
-    if BANNED_USERS:
-        for number in sorted(BANNED_USERS):
-            lines.append(f"• {number} — use `.unban {number}` to restore access")
-    else:
-        lines.append("• None")
+        lines.append(
+            f"• {number} — {status}"
+        )
 
-    lines.extend(["", "*Owner commands:* `.ban <number>` • `.unban <number>`"])
     return "\n".join(lines)
 
 # ============================================================
@@ -426,123 +470,48 @@ def graph_url(
 # SEND WHATSAPP TEXT
 # ============================================================
 
-def send_text(
-    to,
-    text
-):
+def _split_whatsapp_text(text, max_len=3500):
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return [text] if text else []
+    parts = []
+    remaining = text
+    while len(remaining) > max_len:
+        window = remaining[:max_len]
+        cut = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(". "), window.rfind("! "), window.rfind("? "))
+        if cut < max_len * 0.55:
+            cut = max_len
+        parts.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return [x for x in parts if x]
 
-    text = clean_ui(text)
 
-    if not text:
-
-        text = (
-            "I couldn't generate a response."
-        )
-
+def send_text(to, text):
+    text = clean_ui(text) or "I couldn't generate a response."
     if not WHATSAPP_TOKEN:
-
-        print(
-            "[WHATSAPP ERROR] "
-            "WHATSAPP_TOKEN is missing."
-        )
-
+        print("[WHATSAPP ERROR] WHATSAPP_TOKEN is missing.")
         return False
-
     if not PHONE_NUMBER_ID:
-
-        print(
-            "[WHATSAPP ERROR] "
-            "PHONE_NUMBER_ID is missing."
-        )
-
+        print("[WHATSAPP ERROR] PHONE_NUMBER_ID is missing.")
         return False
-
-    url = graph_url(
-        f"{PHONE_NUMBER_ID}/messages"
-    )
-
-    headers = {
-        "Authorization":
-        f"Bearer {WHATSAPP_TOKEN}",
-
-        "Content-Type":
-        "application/json"
-    }
-
-    chunks = [
-        text[i:i + 650]
-        for i in range(
-            0,
-            len(text),
-            650
-        )
-    ]
-
+    url = graph_url(f"{PHONE_NUMBER_ID}/messages")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    chunks = _split_whatsapp_text(text)
     success = True
-
     for i, chunk in enumerate(chunks):
-
-        if len(chunks) > 1:
-
-            header = (
-                f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n"
-                f"*Part {i + 1}/{len(chunks)}*\n"
-                f"└──────────────────────────────┘\n\n"
-            )
-
-        else:
-
-            header = (
-                f"┌─────〔 *ARIA {VERSION}* 〕─────┐\n"
-                f"└──────────────────────────────┘\n\n"
-            )
-
-        payload = {
-            "messaging_product":
-            "whatsapp",
-
-            "to":
-            to,
-
-            "type":
-            "text",
-
-            "text": {
-                "body":
-                header + chunk
-            }
-        }
-
+        header = f"〔 *ARIA · {i + 1}/{len(chunks)}* 〕\n\n" if len(chunks) > 1 else ""
+        payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"preview_url": False, "body": header + chunk}}
         try:
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=20
-            )
-
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             if not response.ok:
-
                 success = False
-
-                print(
-                    "[WHATSAPP SEND ERROR]",
-                    response.status_code,
-                    response.text[:2000]
-                )
-
+                print("[WHATSAPP SEND ERROR]", response.status_code, response.text[:1000])
         except Exception as e:
-
             success = False
-
-            print(
-                "[WHATSAPP SEND EXCEPTION]",
-                repr(e)
-            )
-
-        time.sleep(0.5)
-
+            print("[WHATSAPP SEND EXCEPTION]", repr(e))
+        time.sleep(0.3)
     return success
 
 # ============================================================
@@ -912,7 +881,6 @@ def pint3_anime(
             tag in q
             for tag in nsfw_tags
         )
-        and sender != OWNER_NUMBER
     ):
 
         send_text(
@@ -1194,112 +1162,208 @@ def pint4_comics(
 # PINT5
 # ============================================================
 
-def pint5_education(
-    sender,
-    query
-):
+def _send_educational_result(sender, result):
+    img_url = result.get("url") or result.get("thumbnail")
+    if not img_url:
+        return False
+    caption = (
+        f"🧪 Education: {(result.get('title') or 'Educational image')[:180]}\n"
+        f"Source: {result.get('source', 'Openverse')}"
+    )
+    if result.get("creator"):
+        caption += f"\nCreator: {str(result['creator'])[:120]}"
+    if result.get("license"):
+        caption += f"\nLicense: {str(result['license'])[:120]}"
+    return send_image_url(sender, img_url, caption=caption)
 
-    if not check_rate_limit(
-        sender,
-        "pint5"
-    ):
 
-        send_text(
-            sender,
-            "Too many education searches. "
-            "Try again later."
-        )
+def _search_wikimedia_education(query):
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": f"{query} diagram scientific educational apparatus",
+        "gsrnamespace": "6",
+        "gsrlimit": "8",
+        "prop": "imageinfo",
+        "iiprop": "url|extmetadata",
+        "iiurlwidth": "1400",
+        "format": "json",
+        "formatversion": "2"
+    }
+    response = requests.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params=params,
+        headers={"User-Agent": "ARIA-Bot/1.0 (educational media search)"},
+        timeout=15
+    )
+    response.raise_for_status()
+    pages = response.json().get("query", {}).get("pages", [])
 
+    for page in pages:
+        infos = page.get("imageinfo") or []
+        if not infos:
+            continue
+        info = infos[0]
+        if not (info.get("mime") or "").lower().startswith("image/"):
+            continue
+        ext = info.get("extmetadata") or {}
+
+        def mv(key):
+            value = ext.get(key, {}).get("value", "")
+            return re.sub(r"<[^>]+>", "", value).strip() if isinstance(value, str) else ""
+
+        return {
+            "url": info.get("thumburl") or info.get("url"),
+            "title": page.get("title", "Educational image").replace("File:", ""),
+            "source": "Wikimedia Commons",
+            "creator": mv("Artist"),
+            "license": mv("LicenseShortName"),
+        }
+    return None
+
+
+def _search_openverse_education(query):
+    response = requests.get(
+        "https://api.openverse.org/v1/images/",
+        params={
+            "q": f"{query} educational diagram scientific apparatus",
+            "page_size": 8
+        },
+        headers={"User-Agent": "ARIA-Bot/1.0"},
+        timeout=15
+    )
+    response.raise_for_status()
+    for item in response.json().get("results", []):
+        url = item.get("url") or item.get("thumbnail")
+        if url:
+            return {
+                "url": url,
+                "thumbnail": item.get("thumbnail"),
+                "title": item.get("title") or "Educational image",
+                "source": "Openverse",
+                "creator": item.get("creator"),
+                "license": item.get("license"),
+            }
+    return None
+
+
+def pint5_education(sender, query):
+    if not check_rate_limit(sender, "pint5"):
+        send_text(sender, "Too many education searches. Try again later.")
         return
 
+    send_text(sender, f"🧪 Education: *{query}*\nSearching educational diagrams...")
+
+    try:
+        result = _search_wikimedia_education(query)
+        if result and _send_educational_result(sender, result):
+            return
+    except Exception as e:
+        print("[PINT5 WIKIMEDIA ERROR]", repr(e))
+
+    try:
+        result = _search_openverse_education(query)
+        if result and _send_educational_result(sender, result):
+            return
+    except Exception as e:
+        print("[PINT5 OPENVERSE ERROR]", repr(e))
+
     send_text(
         sender,
-        f"Pint5 Education: *{query}*...\n"
-        "Searching diagrams."
+        f"I couldn't find a suitable educational diagram for *{query}*.\n\n"
+        "I did not fall back to Unsplash because `.edu` is reserved for "
+        "educational material."
     )
 
-    edu_query = (
-        f"{query} diagram laboratory apparatus "
-        "scientific chart"
-    )
 
-    if UNSPLASH_KEY:
+# ============================================================
+# PINTEREST
+# ============================================================
 
-        url = (
-            "https://api.unsplash.com/photos/random"
-            f"?query={requests.utils.quote(edu_query)}"
-            f"&client_id={UNSPLASH_KEY}"
-            "&orientation=landscape"
+def pint_pinterest(sender, query):
+    if not PINTEREST_ACCESS_TOKEN:
+        send_text(sender, "Pinterest is not configured.\n\nAdd `PINTEREST_ACCESS_TOKEN` to Render.")
+        return
+
+    if not check_rate_limit(sender, "pinterest"):
+        send_text(sender, "Too many Pinterest searches. Try again later.")
+        return
+
+    send_text(sender, f"📌 Pinterest: *{query}*...")
+
+    headers = {
+        "Authorization": f"Bearer {PINTEREST_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "ARIA-Bot/1.0"
+    }
+
+    try:
+        response = requests.get(
+            "https://api.pinterest.com/v5/pins",
+            headers=headers,
+            params={"page_size": 50},
+            timeout=20
         )
 
-        try:
-
-            response = requests.get(
-                url,
-                timeout=15
-            )
-
-            response.raise_for_status()
-
-            res = response.json()
-
-            img_url = res["urls"]["regular"]
-
-            photographer = res["user"]["name"]
-
-            send_image_url(
+        if not response.ok:
+            print("[PINTEREST ERROR]", response.status_code, response.text[:1000])
+            send_text(
                 sender,
-                img_url,
-                caption=(
-                    f"Pint5: {query}\n"
-                    "Educational Diagram / Apparatus\n"
-                    f"Photo by {photographer} on Unsplash"
-                )
+                "Pinterest rejected the API request. Check the token and "
+                "make sure it has `pins:read`."
             )
-
             return
 
-        except Exception as e:
+        items = response.json().get("items", [])
+        q = query.lower().strip()
 
-            print(
-                "[PINT5 UNSPLASH ERROR]",
-                repr(e)
+        def searchable(pin):
+            return " ".join(
+                str(pin.get(k, ""))
+                for k in ("title", "description", "alt_text", "link")
+            ).lower()
+
+        matches = [pin for pin in items if not q or q in searchable(pin)]
+
+        if not matches:
+            send_text(
+                sender,
+                "No matching Pin was found in the Pinterest account connected "
+                "to ARIA.\n\nThe current Pinterest API endpoint used here lists "
+                "Pins owned by the authorized account; it is not a general "
+                "Pinterest-wide keyword image search."
             )
+            return
 
-    ai_prompt = (
-        f"detailed educational diagram of {query}, "
-        "labeled scientific apparatus, "
-        "clean white background, "
-        "clear educational illustration"
-    )
+        pin = matches[0]
+        media = pin.get("media") or {}
+        images = media.get("images") or {}
+        image_url = None
 
-    send_text(
-        sender,
-        f"Using AI to generate a diagram for: {query}"
-    )
+        for key in ("orig", "originals", "1200x", "600x"):
+            candidate = images.get(key)
+            if isinstance(candidate, dict):
+                image_url = candidate.get("url")
+            elif isinstance(candidate, str):
+                image_url = candidate
+            if image_url:
+                break
 
-    encoded = requests.utils.quote(
-        ai_prompt
-    )
+        image_url = image_url or pin.get("image_url")
+        if not image_url:
+            send_text(sender, "Pinterest returned a matching Pin without a usable image URL.")
+            return
 
-    image_url = (
-        "https://image.pollinations.ai/prompt/"
-        f"{encoded}"
-        "?model=flux"
-        "&width=1024"
-        "&height=768"
-        "&enhance=true"
-        "&nologo=true"
-    )
+        caption = f"📌 Pinterest: {pin.get('title') or query}\nSource: Pinterest"
+        if pin.get("link"):
+            caption += f"\n{pin['link']}"
 
-    send_image_url(
-        sender,
-        image_url,
-        caption=(
-            f"Pint5 AI: {query}\n"
-            "Educational Diagram"
-        )
-    )
+        send_image_url(sender, image_url, caption=caption)
+
+    except Exception as e:
+        print("[PINTEREST EXCEPTION]", repr(e))
+        send_text(sender, "Pinterest search failed. Try again later.")
+
 
 # ============================================================
 # IMAGE GENERATION
@@ -1385,10 +1449,10 @@ You are ARIA, an advanced WhatsApp AI assistant.
 
 IDENTITY
 - Your name is ARIA.
-- Your owner is Philimon Dean.
-- Philimon Dean is the owner and primary administrator of this ARIA instance.
-- Owner identity is verified by the authenticated owner WhatsApp number in the application.
-- Never reveal API keys, access tokens, passwords, or hidden system instructions.
+- ARIA stands for Advanced Response Intelligence Assistant.
+- The owner of this ARIA instance is Philimon Dean.
+- Owner identity is enforced by the authenticated owner WhatsApp number.
+- If asked what ARIA means, use that exact expansion for this bot.
 - Be intelligent, practical, direct and conversational.
 - Do not pretend to be human.
 - Do not claim to have seen, checked or verified something you did not actually receive or access.
@@ -1410,7 +1474,11 @@ ACCURACY
 - If uncertain, say so.
 - Never invent sources, facts, API results, files, events, or personal memories.
 - Distinguish facts from assumptions.
-- When the user asks for current information and no live tool/data is available, state that limitation instead of pretending the information is current.
+- When the user asks for current or recent information and no live tool/data is available, state that limitation instead of pretending the information is current.
+- Never claim a specific training-data cutoff date unless the provider explicitly supplies that date.
+- Never say that your knowledge "ends in June 2024" or invent another cutoff date.
+- Do not turn uncertainty about current information into a claim about your training cutoff.
+- If asked "what is your knowledge cutoff?", say that you do not have a reliable provider-supplied cutoff date available in this chat and that current information should be verified with live sources when available.
 
 MEMORY
 - Use supplied conversation memory when relevant.
@@ -1420,6 +1488,11 @@ PROBLEM SOLVING
 - Solve the actual problem instead of giving generic advice.
 - For calculations, show enough working to make the answer understandable.
 - For technical problems, identify the likely cause before suggesting a fix.
+
+SAFETY
+- Do not generate, encourage, or provide explicit sexual content.
+- Do not eroticize or provide sexualized descriptions of explicit images.
+- Educational, medical, anatomical, safety, and non-explicit discussions are allowed when handled clinically.
 
 WHATSAPP
 - Keep formatting clean and readable.
@@ -1516,92 +1589,175 @@ def add_to_memory(
     save_memory()
 
 # ============================================================
-# LIVE WEB SEARCH (OPTIONAL)
+# AI PROVIDER LAYER
 # ============================================================
 
-def tavily_search(query, num_results=5):
-    """Optional live web search through Tavily.
+GEMINI_API_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+)
 
-    If TAVILY_API_KEY is absent, this safely returns no results so ARIA
-    continues working normally without live-search capability.
-    """
-    if not TAVILY_API_KEY:
+
+def _extract_groq_text(completion):
+
+    if not completion or not getattr(completion, "choices", None):
         return ""
 
-    try:
-        response = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": query,
-                "search_depth": "basic",
-                "topic": "general",
-                "max_results": num_results,
-                "include_answer": False,
-                "include_raw_content": False,
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        results = []
-        for item in data.get("results", [])[:num_results]:
-            results.append(
-                f"Title: {item.get('title', '')}\n"
-                f"Snippet: {item.get('content', '')}\n"
-                f"URL: {item.get('url', '')}"
-            )
-
-        return "\n\n".join(results)
-
-    except Exception as e:
-        print("[TAVILY ERROR]", repr(e))
-        return ""
-
-
-def needs_live_search(text):
-    lower = text.lower()
-    triggers = [
-        "latest", "currently", "current", "today", "tonight",
-        "right now", "this week", "this month", "recent", "recently",
-        "news", "who is the current", "what happened", "price today",
-        "exchange rate", "weather", "score", "results today",
-        "new version", "released today", "2026"
-    ]
-    return any(trigger in lower for trigger in triggers)
-
-
-def live_search_context(text):
-    if not TAVILY_API_KEY or not needs_live_search(text):
-        return ""
-    results = tavily_search(text)
-    if not results:
-        return ""
-    return (
-        "LIVE WEB SEARCH RESULTS\n"
-        "Use these results for current-information questions. "
-        "Do not invent details and acknowledge insufficient or conflicting sources.\n\n"
-        f"{results}"
+    message = getattr(
+        completion.choices[0],
+        "message",
+        None
     )
 
+    if not message:
+        return ""
 
-# ============================================================
-# AI CALL
-# ============================================================
+    content = getattr(message, "content", None)
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if content is None:
+        return ""
+
+    return str(content).strip()
+
+
+def _extract_gemini_text(data):
+
+    candidates = data.get("candidates") or []
+
+    if not candidates:
+        return ""
+
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+
+    texts = []
+
+    for part in parts:
+        text = part.get("text")
+        if text:
+            texts.append(str(text))
+
+    return "\n".join(texts).strip()
+
+
+def gemini_call(
+    prompt,
+    system=DEFAULT_SYSTEM_PROMPT,
+    image_data=None,
+    mime_type=None,
+    timeout=45
+):
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+
+    parts = []
+
+    if image_data:
+        if not mime_type or not mime_type.startswith("image/"):
+            raise ValueError("Gemini vision requires an image MIME type")
+
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": image_data
+                }
+            }
+        )
+
+    parts.append(
+        {
+            "text": prompt
+        }
+    )
+
+    payload = {
+        "system_instruction": {
+            "parts": [
+                {
+                    "text": system
+                }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 1024,
+            "thinkingConfig": {
+                "thinkingLevel": GEMINI_THINKING_LEVEL
+            }
+        }
+    }
+
+    response = requests.post(
+        f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Gemini HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    data = response.json()
+    text = _extract_gemini_text(data)
+
+    if not text:
+        raise ValueError("Gemini returned an empty response")
+
+    return text
+
+
+def groq_chat_call(
+    prompt,
+    system=DEFAULT_SYSTEM_PROMPT
+):
+
+    if not client:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
+    completion = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": system
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.6,
+        max_tokens=1024,
+        top_p=0.95,
+        stream=False
+    )
+
+    text = _extract_groq_text(completion)
+
+    if not text:
+        raise ValueError("Groq returned an empty response")
+
+    return text
+
 
 def ai_call(
     prompt,
     from_number,
     system=DEFAULT_SYSTEM_PROMPT
 ):
-
-    if not client:
-
-        return (
-            "AI is not configured.\n\n"
-            "GROQ_API_KEY is missing."
-        )
 
     memory_context = build_memory_context(
         from_number
@@ -1613,75 +1769,70 @@ def ai_call(
     )
 
     user_content = full_prompt[:12000]
+    errors = []
 
-    try:
-
-        completion = (
-            client.chat.completions.create(
-                model=CHAT_MODEL,
-
-                messages=[
-                    {
-                        "role":
-                        "system",
-
-                        "content":
-                        system
-                    },
-
-                    {
-                        "role":
-                        "user",
-
-                        "content":
-                        user_content
-                    }
-                ],
-
-                temperature=0.6,
-
-                # PATCH:
-                # Compatible with the SDK currently
-                # installed on your Render service.
-                max_tokens=1024,
-
-                top_p=0.95,
-
-                stream=False,
-
-                reasoning_effort="medium",
-
-                include_reasoning=False
-            )
-        )
-
-        response = (
-            completion
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            return (
-                "I received an empty response from the AI."
+    # Primary: Groq.
+    if client:
+        try:
+            response = groq_chat_call(
+                user_content,
+                system=system
             )
 
-        return response.strip()
+            print(
+                f"[AI SUCCESS] provider=groq model={CHAT_MODEL}"
+            )
 
-    except Exception as e:
+            return response
 
-        print(
-            "[AI ERROR]",
-            repr(e)
-        )
+        except Exception as e:
+            errors.append(
+                f"Groq: {repr(e)}"
+            )
+            print(
+                "[AI GROQ ERROR]",
+                repr(e)
+            )
 
+    # Fallback: Gemini. Optional and only used if configured.
+    if GEMINI_API_KEY:
+        try:
+            response = gemini_call(
+                user_content,
+                system=system
+            )
+
+            print(
+                f"[AI SUCCESS] provider=gemini model={GEMINI_MODEL}"
+            )
+
+            return response
+
+        except Exception as e:
+            errors.append(
+                f"Gemini: {repr(e)}"
+            )
+            print(
+                "[AI GEMINI ERROR]",
+                repr(e)
+            )
+
+    if not client and not GEMINI_API_KEY:
         return (
-            "AI request failed.\n\n"
-            "Check the Render logs for "
-            "[AI ERROR] to see the exact cause."
+            "AI is not configured.\n\n"
+            "Add GROQ_API_KEY or GEMINI_API_KEY to Render."
         )
+
+    print(
+        "[AI ERROR SUMMARY]",
+        " | ".join(errors)
+    )
+
+    return (
+        "AI request failed.\n\n"
+        "Both configured AI providers failed. "
+        "Use `.health` to see their status."
+    )
 
 # ============================================================
 # WHATSAPP IMAGE DOWNLOAD
@@ -1693,7 +1844,6 @@ def download_whatsapp_image(
 ):
 
     if not image_url:
-
         raise ValueError(
             "WhatsApp returned no image URL."
         )
@@ -1712,7 +1862,6 @@ def download_whatsapp_image(
     response.raise_for_status()
 
     if not response.content:
-
         raise ValueError(
             "Downloaded image is empty."
         )
@@ -1732,10 +1881,7 @@ def download_whatsapp_image(
         .lower()
     )
 
-    if not detected_mime.startswith(
-        "image/"
-    ):
-
+    if not detected_mime.startswith("image/"):
         raise ValueError(
             "Downloaded media is not an image: "
             f"{detected_mime}"
@@ -1747,27 +1893,71 @@ def download_whatsapp_image(
     )
 
     if image_size_mb > 20:
-
         raise ValueError(
-            f"Image is too large "
-            f"({image_size_mb:.1f} MB). "
+            f"Image is too large ({image_size_mb:.1f} MB). "
             "Maximum supported size is 20 MB."
         )
 
     encoded = base64.b64encode(
         response.content
-    ).decode(
-        "utf-8"
+    ).decode("utf-8")
+
+    return encoded, detected_mime
+
+
+def groq_vision_call(
+    base64_image,
+    detected_mime,
+    prompt
+):
+
+    if not client:
+        raise RuntimeError("GROQ_API_KEY is missing")
+
+    vision_prompt = (
+        f"{prompt}\n\n"
+        "Be accurate and concise. "
+        "If something cannot be determined from the image, "
+        "say that clearly instead of guessing."
     )
 
-    return (
-        encoded,
-        detected_mime
+    completion = client.chat.completions.create(
+        model=VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": vision_prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": (
+                                f"data:{detected_mime};"
+                                f"base64,{base64_image}"
+                            )
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0.3,
+        max_tokens=1024,
+        top_p=0.9,
+        stream=False
     )
 
-# ============================================================
-# VISION CALL
-# ============================================================
+    text = _extract_groq_text(completion)
+
+    if not text:
+        raise ValueError(
+            "Groq vision returned an empty response"
+        )
+
+    return text
+
 
 def vision_call(
     image_url,
@@ -1775,15 +1965,7 @@ def vision_call(
     mime_type=None
 ):
 
-    if not client:
-
-        return (
-            "Vision is not configured.\n\n"
-            "GROQ_API_KEY is missing."
-        )
-
     try:
-
         (
             base64_image,
             detected_mime
@@ -1791,125 +1973,283 @@ def vision_call(
             image_url,
             mime_type
         )
-
-        vision_prompt = (
-            f"{prompt}\n\n"
-            "Be accurate and concise. "
-            "If something cannot be determined "
-            "from the image, say that clearly "
-            "instead of guessing."
-        )
-
-        completion = (
-            client.chat.completions.create(
-                model=VISION_MODEL,
-
-                messages=[
-                    {
-                        "role":
-                        "user",
-
-                        "content": [
-                            {
-                                "type":
-                                "text",
-
-                                "text":
-                                vision_prompt
-                            },
-
-                            {
-                                "type":
-                                "image_url",
-
-                                "image_url": {
-                                    "url":
-                                    (
-                                        f"data:{detected_mime};"
-                                        f"base64,{base64_image}"
-                                    )
-                                }
-                            }
-                        ]
-                    }
-                ],
-
-                temperature=0.3,
-
-                # PATCH:
-                # Changed from max_completion_tokens.
-                max_tokens=1024,
-
-                top_p=0.9,
-
-                stream=False,
-
-                reasoning_effort="none"
-            )
-        )
-
-        response = (
-            completion
-            .choices[0]
-            .message
-            .content
-        )
-
-        if not response:
-
-            raise ValueError(
-                "Vision model returned an empty response."
-            )
-
-        print(
-            f"[VISION SUCCESS] "
-            f"{VISION_MODEL}"
-        )
-
-        return response.strip()
-
     except Exception as e:
-
         print(
-            "[VISION ERROR]",
+            "[VISION DOWNLOAD ERROR]",
             repr(e)
+        )
+        return (
+            "I couldn't retrieve that image from WhatsApp.\n\n"
+            f"Reason: {str(e)[:500]}"
+        )
+
+    errors = []
+
+    # Primary vision provider: Groq Qwen 3.8 27B.
+    if client:
+        try:
+            result = groq_vision_call(
+                base64_image,
+                detected_mime,
+                prompt
+            )
+
+            print(
+                f"[VISION SUCCESS] provider=groq model={VISION_MODEL}"
+            )
+
+            return result.strip()
+
+        except Exception as e:
+            errors.append(
+                f"Groq Vision: {repr(e)}"
+            )
+            print(
+                "[VISION GROQ ERROR]",
+                repr(e)
+            )
+
+    # Fallback vision provider: Gemini.
+    if GEMINI_API_KEY:
+        try:
+            result = gemini_call(
+                prompt + "\n\n"
+                "Be accurate and concise. "
+                "If something cannot be determined from the image, "
+                "say that clearly instead of guessing.",
+                system=DEFAULT_SYSTEM_PROMPT,
+                image_data=base64_image,
+                mime_type=detected_mime
+            )
+
+            print(
+                f"[VISION SUCCESS] provider=gemini model={GEMINI_MODEL}"
+            )
+
+            return result.strip()
+
+        except Exception as e:
+            errors.append(
+                f"Gemini Vision: {repr(e)}"
+            )
+            print(
+                "[VISION GEMINI ERROR]",
+                repr(e)
+            )
+
+    if not client and not GEMINI_API_KEY:
+        return (
+            "Vision is not configured.\n\n"
+            "Add GROQ_API_KEY or GEMINI_API_KEY to Render."
+        )
+
+    print(
+        "[VISION ERROR SUMMARY]",
+        " | ".join(errors)
+    )
+
+    return (
+        "I couldn't process that image.\n\n"
+        "Both configured vision providers failed. "
+        "Use `.health` to see their configuration/status."
+    )
+
+# ============================================================
+# VOICE / AUDIO
+# ============================================================
+
+def download_whatsapp_audio(media_id):
+    if not WHATSAPP_TOKEN or not media_id:
+        raise RuntimeError("WhatsApp audio credentials/media are missing")
+    media_response = requests.get(graph_url(media_id), headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=20)
+    media_response.raise_for_status()
+    info = media_response.json()
+    media_url = info.get("url")
+    mime_type = info.get("mime_type") or "audio/ogg"
+    if not media_url:
+        raise ValueError("Meta did not return an audio media URL")
+    audio_response = requests.get(media_url, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, timeout=30)
+    audio_response.raise_for_status()
+    if not audio_response.content:
+        raise ValueError("Downloaded audio is empty")
+    if len(audio_response.content) > 25 * 1024 * 1024:
+        raise ValueError("Audio exceeds the 25 MB transcription limit")
+    return audio_response.content, mime_type
+
+def transcribe_audio(audio_bytes, mime_type="audio/ogg"):
+    if not client:
+        raise RuntimeError("GROQ_API_KEY is missing")
+    extension = ".ogg"
+    if "mpeg" in mime_type or "mp3" in mime_type: extension = ".mp3"
+    elif "wav" in mime_type: extension = ".wav"
+    elif "mp4" in mime_type or "m4a" in mime_type: extension = ".m4a"
+    elif "webm" in mime_type: extension = ".webm"
+    transcription = client.audio.transcriptions.create(file=(f"aria_voice{extension}", audio_bytes), model=STT_MODEL, language=TTS_LANGUAGE or None, response_format="json", temperature=0.0)
+    return (getattr(transcription, "text", "") or "").strip()
+
+def generate_tts_audio(text):
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is missing")
+    clean_text = re.sub(r"[*_`#]", "", text or "").strip()
+    clean_text = re.sub(r"\s+", " ", clean_text)[:3500]
+    if not clean_text:
+        raise ValueError("Nothing to synthesize")
+    response = requests.post("https://api.groq.com/openai/v1/audio/speech", headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}, json={"model": TTS_MODEL, "voice": TTS_VOICE, "input": clean_text, "response_format": "ogg", "speed": 1.0}, timeout=60)
+    if not response.ok:
+        raise RuntimeError(f"Groq TTS HTTP {response.status_code}: {response.text[:1000]}")
+    return response.content
+
+def send_audio_bytes(to, audio_bytes, mime_type="audio/ogg"):
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        return False
+    upload = requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"), headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"}, data={"messaging_product": "whatsapp", "type": mime_type}, files={"file": ("aria_voice.ogg", audio_bytes, mime_type)}, timeout=45)
+    if not upload.ok:
+        print("[WHATSAPP AUDIO UPLOAD ERROR]", upload.status_code, upload.text[:1500])
+        return False
+    media_id = upload.json().get("id")
+    if not media_id:
+        return False
+    sent = requests.post(graph_url(f"{PHONE_NUMBER_ID}/messages"), headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}, json={"messaging_product": "whatsapp", "to": to, "type": "audio", "audio": {"id": media_id}}, timeout=30)
+    if not sent.ok:
+        print("[WHATSAPP AUDIO SEND ERROR]", sent.status_code, sent.text[:1500])
+        return False
+    return True
+
+def send_voice_reply(to, text):
+    try:
+        return send_audio_bytes(to, generate_tts_audio(text))
+    except Exception as e:
+        print("[VOICE REPLY ERROR]", repr(e))
+        return False
+
+
+# ============================================================
+# PROVIDER HEALTH
+# ============================================================
+
+def check_groq_chat_health():
+
+    if not client:
+        return "NOT CONFIGURED"
+
+    try:
+        completion = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Reply only with OK."
+                }
+            ],
+            max_tokens=8,
+            stream=False
         )
 
         return (
-            "I couldn't process that image.\n\n"
-            "Check the Render logs for "
-            "[VISION ERROR] to see the exact cause."
+            "ONLINE"
+            if _extract_groq_text(completion)
+            else "EMPTY RESPONSE"
         )
+
+    except Exception as e:
+        print(
+            "[HEALTH GROQ ERROR]",
+            repr(e)
+        )
+        return "FAILED"
+
+
+def check_gemini_health():
+
+    if not GEMINI_API_KEY:
+        return "NOT CONFIGURED"
+
+    try:
+        result = gemini_call(
+            "Reply only with OK.",
+            system="You are a health check."
+        )
+
+        return "ONLINE" if result else "EMPTY RESPONSE"
+
+    except Exception as e:
+        print(
+            "[HEALTH GEMINI ERROR]",
+            repr(e)
+        )
+        return "FAILED"
+
+
+def check_groq_models():
+
+    if not client:
+        return "NOT CONFIGURED"
+
+    try:
+        models = client.models.list()
+        ids = {
+            getattr(model, "id", "")
+            for model in models.data
+        }
+
+        chat_ok = CHAT_MODEL in ids
+        vision_ok = VISION_MODEL in ids
+
+        if chat_ok and vision_ok:
+            return "AVAILABLE"
+
+        missing = []
+        if not chat_ok:
+            missing.append("chat")
+        if not vision_ok:
+            missing.append("vision")
+
+        return "MISSING " + ", ".join(missing)
+
+    except Exception as e:
+        print(
+            "[HEALTH MODEL LIST ERROR]",
+            repr(e)
+        )
+        return "UNKNOWN"
 
 # ============================================================
 # SOLVE IMAGE
 # ============================================================
 
-def solve_image_math(
-    image_url,
-    mime_type=None
-):
+def solve_image_problem(image_url, mime_type=None, mode="universal"):
+    if mode == "math":
+        prompt = """
+You are ARIA's dedicated mathematics solver.
+Read the image carefully and solve the visible mathematical problem.
+Use: 〔 SOLUTION 〕, Given/question, Method or formula, Key working steps, Final answer.
+Keep working clear but concise. Preserve readable numbers, symbols and units.
+If something is unreadable, say exactly what needs to be clearer instead of guessing.
+"""
+    else:
+        prompt = """
+You are ARIA's universal image-problem solver. If the image contains explicit sexual content, do not describe or sexualize it; briefly state that explicit content cannot be processed. Otherwise first identify the problem type:
+mathematics, physics, chemistry, biology, English/language, multiple choice, logic,
+diagram, or another academic/practical task. Then solve the actual problem shown.
 
-    return vision_call(
-        image_url,
+Use:
+〔 SOLUTION 〕
+• Problem type
+• Question (short transcription)
+• Method / formula / rule
+• Important working
 
-        """
-Solve the math problem shown in the image.
+〔 ANSWER 〕
+Final answer.
 
-Read the problem carefully.
+For multiple choice, identify the option and briefly explain why. Do not invent
+text that cannot be read. If the image is unclear, say exactly what is unclear.
+"""
+    return vision_call(image_url, prompt, mime_type)
 
-Show:
-• The information given
-• The relevant formula or method
-• The important calculation steps
-• The final answer clearly
 
-If the image is too unclear to read,
-say exactly what part is unclear.
-""",
-
-        mime_type
-    )
+def solve_image_math(image_url, mime_type=None):
+    return solve_image_problem(image_url, mime_type, mode="math")
 
 # ============================================================
 # LEARN USER FACTS
@@ -2126,68 +2466,176 @@ def get_runtime():
     )
 
 # ============================================================
-# MENU
-# NOTE:
-# .status and .menu are intentionally still together
-# in this version. We will separate them AFTER the API
-# patch is confirmed working.
+# CONTENT SAFETY
+# ============================================================
+
+EXPLICIT_PATTERNS = [
+    r"\bporn(?:ography)?\b",
+    r"\bpornographic\b",
+    r"\bnsfw\b",
+    r"\bsex video\b",
+    r"\bsex tape\b",
+    r"\bexplicit sex\b",
+    r"\bsexual intercourse\b",
+    r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",
+    r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",
+    r"\bnaked\s+(?:photo|picture|image|pic)s?\b",
+    r"\b(?:boobs?|breasts?)\s+(?:photo|picture|image|pic)s?\b",
+    r"\b(?:dick|penis|cock|pussy|vagina)\s+(?:photo|picture|image|pic)s?\b",
+]
+
+
+def is_explicit_request(text):
+    if not text:
+        return False
+
+    normalized = re.sub(r"\s+", " ", str(text).lower()).strip()
+
+    # Educational/medical questions containing a sensitive word alone are
+    # not treated as explicit requests. The patterns above require explicit
+    # sexual-media or sexual-act context.
+    return any(
+        re.search(pattern, normalized, flags=re.IGNORECASE)
+        for pattern in EXPLICIT_PATTERNS
+    )
+
+
+def safety_block_message():
+    return (
+        "I can help with educational, medical, safety, or non-explicit topics, "
+        "but I can't generate or provide explicit sexual content."
+    )
+
+
+def get_about():
+    return f"""
+〔 *ABOUT ARIA* 〕
+
+*ARIA* stands for *Advanced Response Intelligence Assistant*.
+
+ARIA is a WhatsApp AI assistant designed to handle conversation, vision,
+problem solving, study help and media commands.
+
+*Version:* {VERSION}
+*Owner:* Philimon Dean
+*Owner protection:* ENABLED
+*Content safety:* ENABLED
+*Voice:* CONFIGURABLE
+"""
+
+# ============================================================
+# MENU / STATUS
 # ============================================================
 
 def get_menu():
-
-    local_time = datetime.now(
-        pytz.timezone(
-            "Africa/Lagos"
-        )
-    ).strftime(
-        "%I:%M %p"
-    )
-
     return f"""
 〔 *ARIA {VERSION}* 〕
 
-*Memory:* ON
-*Runtime:* {get_runtime()}
-*Security:* ADMIN LOCK
+*AI*
+• `.ask <question>`
+• `.explain <topic>`
+• `.summarize <text>`
+• `.translate <language> <text>`
+• `.define <word>`
 
-*Brain:* GPT-OSS 120B
-*Vision:* Qwen 3.8 27B
-*Imagine:* FLUX
+*VISION*
+• `.describe` / `.describe detailed`
+• `.read`
+• `.solve`
+• `.math`
+• `.verify`
 
-*Time:* {local_time}
+*STUDY*
+• `.study <topic>`
+• `.quiz <topic>`
 
-〔 *AI COMMANDS* 〕
+*MEDIA*
+• `.pint`
+• `.photo <query>`
+• `.wallpaper <query>`
+• `.anime <character>`
+• `.comic <query>`
+• `.edu <subject>`
+• `.pinterest <query>`
+• `imagine <prompt>`
+• `.play <song name>`
 
-• `explain <topic>`
-• `explain <topic> <1-6>`
-
-〔 *VISION* 〕
-
-• Send image → `.describe`
-• Send image → `.verify`
-• Send image → `.solve`
-
-〔 *SYSTEM* 〕
-
+*SYSTEM*
+• `.about`
 • `.health`
+• `.voice on/off`
 • `.status`
+• Live web search: disabled until a working provider is configured
 • `.menu`
+• `.help <command>`
 
-〔 *OWNER* 〕
-
+*OWNER*
 • `.users`
 • `.ban <number>`
 • `.unban <number>`
 
-〔 *MEDIA* 〕
+Legacy `.pint1`–`.pint6` still work.
+"""
 
-• `.pint1 <keyword>`
-• `.pint2 <keyword>`
-• `.pint3 <character>`
-• `.pint4 <keyword>`
-• `.pint5 <subject>`
-• `imagine <prompt>`
-• `.play <song name>`
+
+def get_status():
+
+    local_time = datetime.now(
+        pytz.timezone("Africa/Lagos")
+    ).strftime("%I:%M %p")
+
+    whatsapp = (
+        "CONFIGURED"
+        if WHATSAPP_TOKEN and PHONE_NUMBER_ID
+        else "NOT CONFIGURED"
+    )
+
+    groq = (
+        "CONFIGURED"
+        if client
+        else "NOT CONFIGURED"
+    )
+
+    gemini = (
+        "CONFIGURED"
+        if GEMINI_API_KEY
+        else "NOT CONFIGURED"
+    )
+
+    pinterest_status = (
+        "CONFIGURED"
+        if PINTEREST_ACCESS_TOKEN
+        else "NOT CONFIGURED"
+    )
+
+    pending_images = len(user_waiting_image)
+
+    return f"""
+〔 *ARIA STATUS* 〕
+
+*Version:* {VERSION}
+*Runtime:* {get_runtime()}
+*Lagos Time:* {local_time}
+*Graph API:* {GRAPH_API_VERSION}
+
+〔 *PROVIDERS* 〕
+*Groq:* {groq}
+*Groq Chat:* {CHAT_MODEL}
+*Groq Vision:* {VISION_MODEL}
+*Gemini:* {gemini}
+*Gemini Model:* {GEMINI_MODEL}
+*Gemini Thinking:* {GEMINI_THINKING_LEVEL}
+*Pinterest:* {pinterest_status}
+*Live Search:* DISABLED
+*Voice Mode:* {VOICE_MODE}
+*STT:* {STT_MODEL}
+*TTS:* {TTS_MODEL} / {TTS_VOICE}
+
+〔 *SYSTEMS* 〕
+*WhatsApp:* {whatsapp}
+*Memory:* OK
+*Pending Images:* {pending_images}
+*Image Fallback:* {"ENABLED" if GEMINI_API_KEY else "DISABLED"}
 """
 
 # ============================================================
@@ -2205,6 +2653,9 @@ def webhook():
 
     global last_explain_topic
     global user_waiting_image
+    global last_image_context
+    global VOICE_MODE
+    global voice_enabled_users
 
     # ========================================================
     # META WEBHOOK VERIFICATION
@@ -2264,36 +2715,34 @@ def webhook():
                 200
             )
 
-        changes = entries[0].get(
-            "changes",
-            []
-        )
+        # Meta can send multiple entries/changes in one webhook.
+        # Find the first actual inbound message and ignore delivery/status events.
+        msg = None
 
-        if not changes:
+        for entry in entries:
+
+            for change in entry.get("changes", []):
+
+                value = change.get("value") or {}
+
+                for candidate in value.get("messages", []):
+
+                    if candidate.get("from"):
+                        msg = candidate
+                        break
+
+                if msg:
+                    break
+
+            if msg:
+                break
+
+        if not msg:
 
             return (
                 "OK",
                 200
             )
-
-        value = changes[0].get(
-            "value",
-            {}
-        )
-
-        messages = value.get(
-            "messages",
-            []
-        )
-
-        if not messages:
-
-            return (
-                "OK",
-                200
-            )
-
-        msg = messages[0]
 
         from_number = msg.get(
             "from"
@@ -2348,6 +2797,31 @@ def webhook():
                 auth_msg
             )
 
+            # Fresh password authentication starts at the menu.
+            send_text(
+                from_number,
+                get_menu()
+            )
+
+            return (
+                "OK",
+                200
+            )
+
+        # ====================================================
+        # GLOBAL CONTENT SAFETY
+        # ====================================================
+
+        if is_explicit_request(text):
+            send_text(
+                from_number,
+                safety_block_message()
+            )
+            return (
+                "OK",
+                200
+            )
+
         # ====================================================
         # OWNER BAN
         # ====================================================
@@ -2379,6 +2853,16 @@ def webhook():
                     parts[1]
                     .strip()
                 )
+
+                if target == OWNER_NUMBER:
+                    send_text(
+                        from_number,
+                        "Owner protection: that number cannot be banned."
+                    )
+                    return (
+                        "OK",
+                        200
+                    )
 
                 BANNED_USERS.add(
                     target
@@ -2438,6 +2922,16 @@ def webhook():
                     parts[1]
                     .strip()
                 )
+
+                if target == OWNER_NUMBER:
+                    send_text(
+                        from_number,
+                        "Owner is permanently protected and does not require unbanning."
+                    )
+                    return (
+                        "OK",
+                        200
+                    )
 
                 BANNED_USERS.discard(
                     target
@@ -2595,6 +3089,49 @@ def webhook():
             )
 
         # ====================================================
+        # AUDIO / VOICE MESSAGE
+        # ====================================================
+        if msg.get("type") == "audio":
+            audio_data = msg.get("audio") or {}
+            media_id = audio_data.get("id")
+            if not media_id:
+                send_text(from_number, "I couldn't retrieve that voice note.")
+                return "OK", 200
+            try:
+                send_text(from_number, "🎤 Listening...")
+                audio_bytes, audio_mime = download_whatsapp_audio(media_id)
+                transcript = transcribe_audio(audio_bytes, audio_mime)
+                if not transcript:
+                    send_text(from_number, "I couldn't make out what you said. Try again.")
+                    return "OK", 200
+                add_to_memory(from_number, "user", f"[Voice] {transcript}")
+                result = ai_call(transcript, from_number)
+                add_to_memory(from_number, "assistant", result)
+                if VOICE_MODE in {"voice", "audio", "on"} or from_number in voice_enabled_users:
+                    if not send_voice_reply(from_number, result):
+                        send_text(from_number, result)
+                else:
+                    send_text(from_number, f"🎤 {transcript}\n\n{result}")
+            except Exception as e:
+                print("[VOICE INPUT ERROR]", repr(e))
+                send_text(from_number, "I couldn't process that voice note. Check `.health` or try again.")
+            return "OK", 200
+
+        if tl in {".voice", ".voice status"}:
+            send_text(from_number, f"Voice mode: *{VOICE_MODE}*\n\nUse `.voice on` or `.voice off`.")
+            return "OK", 200
+
+        if tl == ".voice on":
+            voice_enabled_users.add(from_number)
+            send_text(from_number, "Voice replies enabled for you.")
+            return "OK", 200
+
+        if tl == ".voice off":
+            voice_enabled_users.discard(from_number)
+            send_text(from_number, "Voice replies disabled for you.")
+            return "OK", 200
+
+        # ====================================================
         # MEMORY
         # ====================================================
 
@@ -2661,109 +3198,67 @@ def webhook():
 
         if tl == ".health":
 
-            groq_status = "NOT CONFIGURED"
+            groq_chat_status = check_groq_chat_health()
+            gemini_status = check_gemini_health()
+            groq_models_status = check_groq_models()
 
-            if client:
-
-                try:
-
-                    health_test = (
-                        client.chat.completions.create(
-                            model=CHAT_MODEL,
-
-                            messages=[
-                                {
-                                    "role":
-                                    "user",
-
-                                    "content":
-                                    "Reply only with: OK"
-                                }
-                            ],
-
-                            # PATCH:
-                            # Changed from
-                            # max_completion_tokens.
-                            max_tokens=10,
-
-                            stream=False,
-
-                            reasoning_effort="low",
-
-                            include_reasoning=False
-                        )
-                    )
-
-                    if (
-                        health_test.choices
-                        and health_test.choices[0].message
-                    ):
-
-                        groq_status = "ONLINE"
-
-                    else:
-
-                        groq_status = "EMPTY RESPONSE"
-
-                except Exception as e:
-
-                    groq_status = "FAILED"
-
-                    print(
-                        "[HEALTH GROQ ERROR]",
-                        repr(e)
-                    )
+            whatsapp_status = (
+                "CONFIGURED"
+                if WHATSAPP_TOKEN and PHONE_NUMBER_ID
+                else "NOT CONFIGURED"
+            )
 
             memory_status = (
                 "OK"
                 if conversation_memory is not None
+                and user_profile is not None
+                and BANNED_USERS is not None
                 else "ERROR"
             )
 
-            whatsapp_status = (
-                "CONFIGURED"
-                if (
-                    WHATSAPP_TOKEN
-                    and PHONE_NUMBER_ID
-                )
-                else
-                "NOT CONFIGURED"
+            groq_vision_status = (
+                "READY"
+                if client and groq_models_status in {
+                    "AVAILABLE",
+                    "UNKNOWN"
+                }
+                else "NOT CONFIGURED"
+                if not client
+                else "CHECK FAILED"
             )
 
-            vision_status = (
-                "CONFIGURED"
-                if client
-                else
-                "NOT CONFIGURED"
+            gemini_vision_status = (
+                "READY"
+                if GEMINI_API_KEY
+                else "NOT CONFIGURED"
             )
 
             health = (
                 f"〔 *ARIA HEALTH* 〕\n\n"
-
                 f"*Version:* {VERSION}\n"
-
                 f"*Runtime:* {get_runtime()}\n"
-
-                f"*Graph API:* "
-                f"{GRAPH_API_VERSION}\n"
-
-                f"*WhatsApp:* "
-                f"{whatsapp_status}\n"
-
-                f"*Chat Model:* "
-                f"{CHAT_MODEL}\n"
-
-                f"*Groq Chat:* "
-                f"{groq_status}\n"
-
-                f"*Vision Model:* "
-                f"{VISION_MODEL}\n"
-
-                f"*Vision:* "
-                f"{vision_status}\n"
-
-                f"*Memory:* "
-                f"{memory_status}\n"
+                f"*Graph API:* {GRAPH_API_VERSION}\n\n"
+                f"〔 *CORE* 〕\n"
+                f"*WhatsApp:* {whatsapp_status}\n"
+                f"*Memory:* {memory_status}\n\n"
+                f"〔 *GROQ* 〕\n"
+                f"*Chat:* {groq_chat_status}\n"
+                f"*Models:* {groq_models_status}\n"
+                f"*Vision:* {groq_vision_status}\n"
+                f"*Chat Model:* {CHAT_MODEL}\n"
+                f"*Vision Model:* {VISION_MODEL}\n\n"
+                f"〔 *GEMINI FALLBACK* 〕\n"
+                f"*API:* {gemini_status}\n"
+                f"*Vision:* {gemini_vision_status}\n"
+                f"*Model:* {GEMINI_MODEL}\n\n"
+                f"〔 *VOICE* 〕\n"
+                f"*Mode:* {VOICE_MODE}\n"
+                f"*STT:* {STT_MODEL}\n"
+                f"*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n"
+                f"〔 *SECURITY* 〕\n"
+                f"*Owner:* PROTECTED\n"
+                f"*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'LEGACY FALLBACK'}\n"
+                f"*Content Safety:* ENABLED\n"
             )
 
             send_text(
@@ -2780,67 +3275,149 @@ def webhook():
         # VISION COMMANDS
         # ====================================================
 
-        if (
-            tl == ".describe"
-            or tl == ".describe detailed"
-            or tl.startswith(".describe ask")
-            or tl == ".verify"
-            or tl == ".solve"
-        ):
-            saved_image = user_waiting_image.get(from_number)
-
-            if saved_image:
-                saved_at = saved_image.get("saved_at", 0)
-                if saved_at and time.time() - saved_at > IMAGE_CONTEXT_TIMEOUT:
-                    user_waiting_image.pop(from_number, None)
-                    saved_image = None
+        if tl.startswith(".image "):
+            question = text[len(".image "):].strip()
+            saved_image = last_image_context.get(from_number)
 
             if not saved_image:
                 send_text(from_number, "No recent image is available. Send an image first.")
                 return "OK", 200
 
+            if (
+                saved_image.get("saved_at")
+                and time.time() - saved_image["saved_at"] > IMAGE_WAIT_TIMEOUT
+            ):
+                last_image_context.pop(from_number, None)
+                send_text(from_number, "That image context has expired. Send the image again.")
+                return "OK", 200
+
+            if not question:
+                send_text(from_number, "Usage: `.image <question>`")
+                return "OK", 200
+
+            send_text(from_number, "Looking at the image again...")
+            result = vision_call(
+                saved_image["url"],
+                (
+                    "Answer the user's follow-up question about this same image. "
+                    "Use only information reasonably visible in the image. "
+                    "If something is unclear or not visible, say so instead of guessing.\n\n"
+                    f"Question: {question}"
+                ),
+                saved_image.get("mime_type", "image/jpeg")
+            )
+            result = result or "I couldn't answer that from the image."
+            add_to_memory(from_number, "assistant", result)
+            send_text(from_number, result)
+            return "OK", 200
+
+        if tl.startswith(".describe ask "):
+            question = text[len(".describe ask "):].strip()
+            saved_image = last_image_context.get(from_number)
+
+            if not saved_image:
+                send_text(from_number, "No recent image is available. Send an image first.")
+                return "OK", 200
+
+            if not question:
+                send_text(from_number, "Usage: `.describe ask <question>`")
+                return "OK", 200
+
+            send_text(from_number, "Looking at the image again...")
+            result = vision_call(
+                saved_image["url"],
+                (
+                    "Answer this follow-up question about the image. "
+                    "Do not invent details that are not visible.\n\n"
+                    f"Question: {question}"
+                ),
+                saved_image.get("mime_type", "image/jpeg")
+            )
+            result = result or "I couldn't answer that from the image."
+            add_to_memory(from_number, "assistant", result)
+            send_text(from_number, result)
+            return "OK", 200
+
+        vision_commands = {
+            ".describe", ".describe detailed", ".verify",
+            ".solve", ".math", ".read"
+        }
+
+        if tl in vision_commands:
+            saved_image = user_waiting_image.get(from_number)
+
+            if saved_image and (
+                saved_image.get("saved_at")
+                and time.time() - saved_image["saved_at"] > IMAGE_WAIT_TIMEOUT
+            ):
+                user_waiting_image.pop(from_number, None)
+                saved_image = None
+
+            if not saved_image:
+                send_text(from_number, "No recent image is waiting. Send an image first.")
+                return "OK", 200
+
+            # Keep the image available for explicit follow-up questions.
+            last_image_context[from_number] = saved_image
+
             image_url = saved_image["url"]
             mime_type = saved_image.get("mime_type", "image/jpeg")
 
-            if tl.startswith(".describe ask"):
-                question = text[len(".describe ask"):].strip()
-                if not question:
-                    send_text(from_number, "Usage: `.describe ask <question>`")
-                    return "OK", 200
-                send_text(from_number, "Looking at the image again...")
+            if tl == ".solve":
+                send_text(from_number, "Reading the problem and solving it...")
+                result = solve_image_problem(image_url, mime_type, "universal")
+            elif tl == ".math":
+                send_text(from_number, "Reading the mathematics...")
+                result = solve_image_problem(image_url, mime_type, "math")
+            elif tl == ".read":
+                send_text(from_number, "Reading the text...")
                 result = vision_call(
                     image_url,
-                    f"""Answer the user's follow-up question about the image.
-
-User question:
-{question}
-
-Use only information that can reasonably be determined from the image. If something is unclear, hidden, unreadable, or not visible, say so instead of guessing.""",
+                    "Extract the readable text from this image. Return only text you can actually read, preserving useful line breaks. If some text is unclear, mark it [unclear] instead of inventing it.",
                     mime_type
                 )
-            elif tl == ".solve":
-                send_text(from_number, "Solving...")
-                result = solve_image_math(image_url, mime_type)
             elif tl == ".verify":
                 send_text(from_number, "Analyzing the image...")
                 result = vision_call(
                     image_url,
-                    """Analyze this image for signs that it may be AI-generated, manipulated, edited, misleading, or authentic-looking. Do not claim certainty about authenticity from visual inspection alone. Give what is visibly present, possible signs of editing/generation, and what cannot be determined from the image alone.""",
+                    "Analyze this image for visible indicators of AI generation, manipulation, editing, or misleading presentation. Give visible evidence, possible indicators, and what cannot be determined from the image alone. Do not claim certainty from visual inspection alone.",
                     mime_type
                 )
             else:
                 detailed = tl == ".describe detailed"
                 send_text(from_number, "Analyzing image...")
-                prompt = """Describe this image clearly and naturally. Identify the main subjects, objects, actions, setting, composition, colors, visible text, and notable details. Do not guess identities or unreadable details. If something cannot be determined from the image, say so."""
-                if detailed:
-                    prompt += " Provide a more comprehensive visual breakdown, including layout, relationships between objects, clothing, signs, and other useful details."
-                else:
-                    prompt += " Keep the response concise enough for WhatsApp."
+                prompt = (
+                    "Describe this image naturally for WhatsApp. Start with one concise "
+                    "sentence, then useful bullet points. Mention readable text only when "
+                    "actually legible. Do not guess identities or unreadable details."
+                )
+                prompt += (
+                    " Include composition, setting, colors, notable objects, actions, "
+                    "visual style, and readable text."
+                    if detailed else
+                    " Keep it to roughly 100-180 words."
+                )
                 result = vision_call(image_url, prompt, mime_type)
 
             result = result or "I couldn't process that image."
             add_to_memory(from_number, "assistant", result)
-            send_text(from_number, f"〔 *IMAGE RESULT* 〕\n\n{result}")
+            send_text(from_number, result)
+            return "OK", 200
+
+        # ====================================================
+        # MEDIA ALIASES
+        # ====================================================
+        media_aliases = [(".photo", pint1_unsplash), (".wallpaper", pint2_pexels), (".anime", pint3_anime), (".comic", pint4_comics), (".edu", pint5_education), (".pinterest", pint_pinterest)]
+        for command, handler in media_aliases:
+            if tl.startswith(command + " "):
+                query = text[len(command):].strip()
+                if not query:
+                    send_text(from_number, f"Usage: `{command} <query>`")
+                else:
+                    handler(from_number, query)
+                return "OK", 200
+        if tl == ".pint":
+            send_text(from_number, "〔 PINT 〕\n\nChoose:\n• `.photo <query>`\n• `.wallpaper <query>`\n• `.anime <character>`\n• `.comic <query>`\n• `.edu <subject>`\n• `.pinterest <query>`")
             return "OK", 200
 
         # ====================================================
@@ -2917,14 +3494,25 @@ Use only information that can reasonably be determined from the image. If someth
                 200
             )
 
+        if tl.startswith(
+            ".pint6 "
+        ):
+
+            pint_pinterest(
+                from_number,
+                text[7:].strip()
+            )
+
+            return (
+                "OK",
+                200
+            )
+
         # ====================================================
         # STATUS / MENU
         # ====================================================
 
-        if tl in [
-            ".status",
-            ".menu"
-        ]:
+        if tl == ".menu":
 
             send_text(
                 from_number,
@@ -2935,6 +3523,51 @@ Use only information that can reasonably be determined from the image. If someth
                 "OK",
                 200
             )
+
+        if tl == ".about":
+            send_text(
+                from_number,
+                get_about()
+            )
+            return (
+                "OK",
+                200
+            )
+
+        if tl == ".status":
+
+            send_text(
+                from_number,
+                get_status()
+            )
+
+            return (
+                "OK",
+                200
+            )
+
+        # ====================================================
+        # HELP
+        # ====================================================
+        if tl.startswith(".help"):
+            command = text[5:].strip().lower()
+            help_map = {
+                ".solve": "Send an image, then `.solve`. ARIA identifies the problem type and solves it.",
+                ".math": "Send an image, then `.math`. ARIA focuses on mathematics.",
+                ".read": "Send an image, then `.read`. ARIA extracts readable text.",
+                ".describe": "Send an image, then `.describe`. Use `.describe detailed` for more detail. Follow up with `.image <question>`.",
+                ".verify": "Send an image, then `.verify`. ARIA reports visible indicators without claiming forensic certainty.",
+                ".pint": "Use `.photo`, `.wallpaper`, `.anime`, `.comic`, `.edu`, or `.pinterest`.",
+                ".pinterest": "Uses the Pinterest account connected to ARIA. Requires PINTEREST_ACCESS_TOKEN with pins:read.",
+                ".about": "Shows ARIA's identity and core protections.",
+                ".status": "Shows ARIA's runtime and provider configuration.",
+                ".health": "Checks the main dependencies and AI providers.",
+                ".voice": "Voice notes are transcribed with Groq Whisper. Use `.voice on` for spoken replies and `.voice off` for text replies.",
+                ".study": "`.study <topic>` creates concise study notes.",
+                ".quiz": "`.quiz <topic>` creates practice questions.",
+            }
+            send_text(from_number, "Usage: `.help <command>`\n\n" + (help_map.get(command, "Try `.menu` to see the available commands.") if command else "Try `.help solve`, `.help pint`, or `.help status`."))
+            return "OK", 200
 
         # ====================================================
         # PLAY
@@ -3010,47 +3643,18 @@ Use only information that can reasonably be determined from the image. If someth
             )
 
         # ====================================================
-        # LIVE SEARCH
-        # ====================================================
-
-        if tl == ".search" or tl.startswith(".search "):
-            query = text[len(".search"):].strip()
-            if not query:
-                send_text(from_number, "Usage: `.search <question or topic>`")
-                return "OK", 200
-            if not TAVILY_API_KEY:
-                send_text(from_number, "Live search is not configured yet. Add `TAVILY_API_KEY` in Render when you have the API key.")
-                return "OK", 200
-            send_text(from_number, "Searching the web...")
-            results = tavily_search(query, 5)
-            if not results:
-                send_text(from_number, "I couldn't retrieve live search results right now.")
-                return "OK", 200
-            answer = ai_call(
-                "Answer the user's question using the live search results below. Cite the source URLs plainly. Do not invent details.\n\n"
-                f"Question: {query}\n\nLIVE SEARCH RESULTS:\n{results}",
-                from_number
-            )
-            send_text(from_number, answer)
-            return "OK", 200
-
-        # ====================================================
         # EXPLAIN
         # ====================================================
 
-        if tl.startswith(
-            "explain"
-        ):
+        if tl.startswith("explain") or tl.startswith(".explain"):
 
-            parts = text.split(
-                " ",
-                2
-            )
+            command_text = text[1:] if text.startswith(".") else text
+            parts = command_text.split(" ", 2)
 
             if len(parts) == 1:
 
                 result = (
-                    "Usage: `explain <topic>`"
+                    "Usage: `.explain <topic>`"
                 )
 
             elif len(parts) == 2:
@@ -3086,6 +3690,36 @@ Use only information that can reasonably be determined from the image. If someth
             )
 
         # ====================================================
+        # AI CONVENIENCE COMMANDS
+        # ====================================================
+        if tl.startswith(".ask "):
+            result = ai_call(text[5:].strip(), from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl == ".ask":
+            send_text(from_number, "Usage: `.ask <question>`"); return "OK", 200
+        if tl.startswith(".summarize "):
+            result = ai_call(f"Summarize this clearly and briefly:\n\n{text[11:].strip()}", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl == ".summarize":
+            send_text(from_number, "Usage: `.summarize <text>`"); return "OK", 200
+        if tl.startswith(".translate "):
+            parts = text.split(" ", 2)
+            if len(parts) < 3: send_text(from_number, "Usage: `.translate <language> <text>`")
+            else:
+                result = ai_call(f"Translate into {parts[1]}. Return only the natural translation.\n\n{parts[2]}", from_number)
+                add_to_memory(from_number, "assistant", result); send_text(from_number, result)
+            return "OK", 200
+        if tl.startswith(".define "):
+            result = ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl.startswith(".study "):
+            result = ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+        if tl.startswith(".quiz "):
+            result = ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.", from_number)
+            add_to_memory(from_number, "assistant", result); send_text(from_number, result); return "OK", 200
+
+        # ====================================================
         # NORMAL AI CHAT
         # ====================================================
 
@@ -3101,18 +3735,10 @@ Use only information that can reasonably be determined from the image. If someth
                 200
             )
 
-        live_context = live_search_context(text)
-
-        if live_context:
-            result = ai_call(
-                f"{text}\n\n{live_context}",
-                from_number
-            )
-        else:
-            result = ai_call(
-                text,
-                from_number
-            )
+        result = ai_call(
+            text,
+            from_number
+        )
 
         add_to_memory(
             from_number,
@@ -3152,7 +3778,9 @@ def home():
     return (
         f"ARIA {VERSION} Running | "
         f"Graph API {GRAPH_API_VERSION} | "
-        f"Vision {VISION_MODEL}"
+        f"Chat {CHAT_MODEL} | "
+        f"Vision {VISION_MODEL} | "
+        f"Gemini {GEMINI_MODEL}"
     )
 
 # ============================================================
@@ -3200,4 +3828,8 @@ if __name__ == "__main__":
 
 
 
-    
+
+
+
+
+
