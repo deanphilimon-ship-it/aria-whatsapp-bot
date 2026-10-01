@@ -97,9 +97,9 @@ ADMIN_NUMBERS = {
 }
 
 ALLOWED_USERS = [
-    n.strip()
-    for n in os.getenv("ALLOWED_USERS", "2349157874791","2348163864199","2349069226119").split(",")
-    if n.strip()
+    u.strip()
+    for u in os.getenv("ALLOWED_USERS", "").split(",")
+    if u.strip()
 ]
 
 # Prefer a secret Render environment variable. The weekly fallback is retained
