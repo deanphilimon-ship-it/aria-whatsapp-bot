@@ -1,3 +1,4 @@
+
 from flask import Flask, request
 import requests
 import os
@@ -19,7 +20,7 @@ from groq import Groq
 
 app = Flask(__name__)
 
-VERSION = "v14.2.2"
+VERSION = "v14.2.3"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -63,6 +64,10 @@ UNSPLASH_KEY = os.getenv("UNSPLASH_KEY")
 PIXABAY_KEY = os.getenv("PIXABAY_KEY")
 COMICVINE_KEY = os.getenv("COMICVINE_KEY")
 PINTEREST_ACCESS_TOKEN = (os.getenv("PINTEREST_ACCESS_TOKEN") or os.getenv("PINTEREST_API_KEY") or os.getenv("PINTEREST_TOKEN"))
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "flux").strip() or "flux"
+IMAGE_WIDTH = int(os.getenv("IMAGE_WIDTH", "1024"))
+IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
+IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
 
 # ============================================================
 # GROQ MODELS
@@ -97,9 +102,9 @@ ADMIN_NUMBERS = {
 }
 
 ALLOWED_USERS = [
-    u.strip()
-    for u in os.getenv("ALLOWED_USERS", "").split(",")
-    if u.strip()
+    n.strip()
+    for n in os.getenv("ALLOWED_USERS", "2348XXXXXXXX,2349XXXXXXX").split(",")
+    if n.strip()
 ]
 
 # Prefer a secret Render environment variable. The weekly fallback is retained
@@ -518,108 +523,136 @@ def send_text(to, text):
 # SEND IMAGE
 # ============================================================
 
-def send_image_url(
-    to,
-    image_url,
-    caption=""
-):
+def _guess_image_mime(content_type, image_url):
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if mime.startswith("image/"):
+        return mime
+    lower = (image_url or "").lower().split("?", 1)[0]
+    if lower.endswith(".png"):
+        return "image/png"
+    if lower.endswith(".webp"):
+        return "image/webp"
+    if lower.endswith(".gif"):
+        return "image/gif"
+    return "image/jpeg"
 
-    if not image_url:
 
-        send_text(
-            to,
-            "I couldn't find an image to send."
-        )
-
-        return False
-
-    if not WHATSAPP_TOKEN:
-
-        print(
-            "[WHATSAPP IMAGE ERROR] "
-            "WHATSAPP_TOKEN missing."
-        )
-
-        return False
-
-    if not PHONE_NUMBER_ID:
-
-        print(
-            "[WHATSAPP IMAGE ERROR] "
-            "PHONE_NUMBER_ID missing."
-        )
-
-        return False
-
-    url = graph_url(
-        f"{PHONE_NUMBER_ID}/messages"
+def _upload_whatsapp_media(image_bytes, mime_type):
+    """Upload an image to WhatsApp and return its media ID."""
+    upload_url = graph_url(f"{PHONE_NUMBER_ID}/media")
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    response = requests.post(
+        upload_url,
+        headers=headers,
+        data={
+            "messaging_product": "whatsapp",
+            "type": mime_type,
+        },
+        files={"file": ("aria_image", image_bytes, mime_type)},
+        timeout=45,
     )
+    if not response.ok:
+        raise RuntimeError(
+            f"WhatsApp media upload HTTP {response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+    media_id = response.json().get("id")
+    if not media_id:
+        raise RuntimeError("WhatsApp media upload returned no media ID")
+    return media_id
 
+
+def send_image_url(to, image_url, caption=""):
+    """Send a public image by downloading it first, then using a WhatsApp media ID.
+
+    This is more reliable than asking WhatsApp to fetch third-party URLs directly,
+    especially for Wikimedia, Pinterest and generated-image hosts.
+    """
+    if not image_url:
+        send_text(to, "I couldn't find an image to send.")
+        return False
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        print("[WHATSAPP IMAGE ERROR] WhatsApp credentials are missing.")
+        return False
+
+    message_url = graph_url(f"{PHONE_NUMBER_ID}/messages")
     headers = {
-        "Authorization":
-        f"Bearer {WHATSAPP_TOKEN}",
-
-        "Content-Type":
-        "application/json"
-    }
-
-    payload = {
-        "messaging_product":
-        "whatsapp",
-
-        "to":
-        to,
-
-        "type":
-        "image",
-
-        "image": {
-            "link":
-            image_url,
-
-            "caption":
-            caption[:1024]
-        }
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
     }
 
     try:
+        # Download the source ourselves so WhatsApp does not have to fetch it.
+        image_response = requests.get(
+            image_url,
+            headers={"User-Agent": "ARIA-Bot/1.0"},
+            timeout=45,
+        )
+        image_response.raise_for_status()
+        image_bytes = image_response.content
+        if not image_bytes:
+            raise ValueError("Image source returned an empty file")
+        if len(image_bytes) > 5 * 1024 * 1024:
+            raise ValueError("Image is larger than WhatsApp's 5 MB image limit")
 
+        mime_type = _guess_image_mime(
+            image_response.headers.get("Content-Type"),
+            image_url,
+        )
+        if mime_type not in {"image/jpeg", "image/png"}:
+            # WhatsApp Cloud API image messages support JPEG/PNG.
+            raise ValueError(f"Unsupported image type for WhatsApp: {mime_type}")
+
+        media_id = _upload_whatsapp_media(image_bytes, mime_type)
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "image",
+            "image": {
+                "id": media_id,
+                "caption": caption[:1024],
+            },
+        }
         response = requests.post(
-            url,
+            message_url,
             headers=headers,
             json=payload,
-            timeout=30
+            timeout=30,
         )
-
         if not response.ok:
-
-            print(
-                "[WHATSAPP IMAGE ERROR]",
-                response.status_code,
-                response.text[:2000]
+            raise RuntimeError(
+                f"WhatsApp image send HTTP {response.status_code}: "
+                f"{response.text[:1500]}"
             )
-
-            send_text(
-                to,
-                "WhatsApp couldn't send that image."
-            )
-
-            return False
-
         return True
 
     except Exception as e:
+        print("[WHATSAPP IMAGE MEDIA ERROR]", repr(e))
 
-        print(
-            "[WHATSAPP IMAGE EXCEPTION]",
-            repr(e)
-        )
+        # Last-resort fallback: let WhatsApp fetch the public URL itself.
+        try:
+            fallback_payload = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "image",
+                "image": {
+                    "link": image_url,
+                    "caption": caption[:1024],
+                },
+            }
+            fallback = requests.post(
+                message_url,
+                headers=headers,
+                json=fallback_payload,
+                timeout=30,
+            )
+            if fallback.ok:
+                return True
+            print("[WHATSAPP IMAGE LINK FALLBACK ERROR]", fallback.status_code, fallback.text[:1500])
+        except Exception as fallback_error:
+            print("[WHATSAPP IMAGE FALLBACK EXCEPTION]", repr(fallback_error))
 
-        send_text(
-            to,
-            "The image could not be delivered."
-        )
-
+        send_text(to, "The image could not be delivered.")
         return False
 
 # ============================================================
@@ -837,10 +870,10 @@ def pint2_pexels(
     flux_url = (
         "https://image.pollinations.ai/prompt/"
         f"{encoded}"
-        "?model=flux"
-        "&width=1024"
-        "&height=1536"
-        "&enhance=true"
+        f"?model={requests.utils.quote(IMAGE_MODEL)}"
+        f"&width={IMAGE_WIDTH}"
+        f"&height={max(IMAGE_HEIGHT, 1536)}"
+        f"&enhance={str(IMAGE_ENHANCE).lower()}"
         "&nologo=true"
     )
 
@@ -1294,53 +1327,40 @@ def pint_pinterest(sender, query):
     headers = {
         "Authorization": f"Bearer {PINTEREST_ACCESS_TOKEN}",
         "Content-Type": "application/json",
-        "User-Agent": "ARIA-Bot/1.0"
+        "User-Agent": "ARIA-Bot/1.0",
     }
 
     try:
+        # /pins lists the authenticated account's Pins. For a keyword command,
+        # Pinterest provides /search/pins, which searches that user's Pins.
         response = requests.get(
-            "https://api.pinterest.com/v5/pins",
+            "https://api.pinterest.com/v5/search/pins",
             headers=headers,
-            params={"page_size": 50},
-            timeout=20
+            params={"query": query, "page_size": 25},
+            timeout=20,
         )
 
-        if not response.ok:
-            print("[PINTEREST ERROR]", response.status_code, response.text[:1000])
-            send_text(
-                sender,
-                "Pinterest rejected the API request. Check the token and "
-                "make sure it has `pins:read`."
-            )
+        if response.status_code == 401:
+            print("[PINTEREST 401]", response.text[:1000])
+            send_text(sender, "Pinterest rejected the access token (401). Generate a fresh production token with `pins:read` and update `PINTEREST_ACCESS_TOKEN` in Render.")
             return
+        if response.status_code == 403:
+            print("[PINTEREST 403]", response.text[:1000])
+            send_text(sender, "Pinterest refused the search request (403). Your app/token may not have access to Pin search yet.")
+            return
+        response.raise_for_status()
 
         items = response.json().get("items", [])
-        q = query.lower().strip()
-
-        def searchable(pin):
-            return " ".join(
-                str(pin.get(k, ""))
-                for k in ("title", "description", "alt_text", "link")
-            ).lower()
-
-        matches = [pin for pin in items if not q or q in searchable(pin)]
-
-        if not matches:
-            send_text(
-                sender,
-                "No matching Pin was found in the Pinterest account connected "
-                "to ARIA.\n\nThe current Pinterest API endpoint used here lists "
-                "Pins owned by the authorized account; it is not a general "
-                "Pinterest-wide keyword image search."
-            )
+        if not items:
+            send_text(sender, f"No Pinterest Pins matched *{query}*.")
             return
 
-        pin = matches[0]
+        # Prefer a Pin with a usable image, then choose the first result.
+        pin = next((item for item in items if (item.get("media") or {}).get("images")), items[0])
         media = pin.get("media") or {}
         images = media.get("images") or {}
         image_url = None
-
-        for key in ("orig", "originals", "1200x", "600x"):
+        for key in ("1200x", "600x", "400x300", "150x150", "orig", "originals"):
             candidate = images.get(key)
             if isinstance(candidate, dict):
                 image_url = candidate.get("url")
@@ -1349,7 +1369,6 @@ def pint_pinterest(sender, query):
             if image_url:
                 break
 
-        image_url = image_url or pin.get("image_url")
         if not image_url:
             send_text(sender, "Pinterest returned a matching Pin without a usable image URL.")
             return
@@ -1357,12 +1376,11 @@ def pint_pinterest(sender, query):
         caption = f"📌 Pinterest: {pin.get('title') or query}\nSource: Pinterest"
         if pin.get("link"):
             caption += f"\n{pin['link']}"
-
         send_image_url(sender, image_url, caption=caption)
 
     except Exception as e:
         print("[PINTEREST EXCEPTION]", repr(e))
-        send_text(sender, "Pinterest search failed. Try again later.")
+        send_text(sender, "Pinterest search failed. Check the token/scopes and try again.")
 
 
 # ============================================================
@@ -1403,10 +1421,10 @@ def imagine_generate(
     flux_url = (
         "https://image.pollinations.ai/prompt/"
         f"{encoded}"
-        "?model=flux"
-        "&width=1024"
-        "&height=1024"
-        "&enhance=true"
+        f"?model={requests.utils.quote(IMAGE_MODEL)}"
+        f"&width={IMAGE_WIDTH}"
+        f"&height={IMAGE_HEIGHT}"
+        f"&enhance={str(IMAGE_ENHANCE).lower()}"
         "&nologo=true"
         f"&seed={seed}"
     )
@@ -1838,70 +1856,59 @@ def ai_call(
 # WHATSAPP IMAGE DOWNLOAD
 # ============================================================
 
-def download_whatsapp_image(
-    image_url,
-    mime_type=None
-):
+def download_whatsapp_image(image_ref, mime_type=None):
+    """Download a WhatsApp image using a fresh media URL.
 
-    if not image_url:
-        raise ValueError(
-            "WhatsApp returned no image URL."
+    WhatsApp media URLs are temporary. We therefore keep the media ID and
+    retrieve a fresh URL immediately before vision processing.
+    """
+    if not image_ref:
+        raise ValueError("WhatsApp returned no image reference.")
+    if not WHATSAPP_TOKEN:
+        raise RuntimeError("WHATSAPP_TOKEN is missing")
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+    # Incoming WhatsApp images are stored as media IDs in ARIA. For backwards
+    # compatibility, a full URL is also accepted.
+    if str(image_ref).startswith("http://") or str(image_ref).startswith("https://"):
+        media_url = image_ref
+        resolved_mime = mime_type
+    else:
+        media_response = requests.get(
+            graph_url(str(image_ref)),
+            headers=headers,
+            timeout=20,
         )
+        media_response.raise_for_status()
+        media_info = media_response.json()
+        media_url = media_info.get("url")
+        resolved_mime = mime_type or media_info.get("mime_type")
+        if not media_url:
+            raise ValueError("Meta did not return a media URL.")
 
-    headers = {
-        "Authorization":
-        f"Bearer {WHATSAPP_TOKEN}"
-    }
-
-    response = requests.get(
-        image_url,
-        headers=headers,
-        timeout=30
-    )
-
+    # Media URLs expire quickly, so this request must happen right after the
+    # URL is retrieved.
+    response = requests.get(media_url, headers=headers, timeout=30)
     response.raise_for_status()
-
     if not response.content:
-        raise ValueError(
-            "Downloaded image is empty."
-        )
+        raise ValueError("Downloaded image is empty.")
 
     detected_mime = (
-        mime_type
-        or response.headers.get(
-            "Content-Type",
-            "image/jpeg"
-        )
-    )
-
-    detected_mime = (
-        detected_mime
-        .split(";")[0]
-        .strip()
-        .lower()
-    )
+        resolved_mime
+        or response.headers.get("Content-Type", "image/jpeg")
+    ).split(";", 1)[0].strip().lower()
 
     if not detected_mime.startswith("image/"):
+        raise ValueError(f"Downloaded media is not an image: {detected_mime}")
+
+    image_size_mb = len(response.content) / (1024 * 1024)
+    if image_size_mb > 5:
         raise ValueError(
-            "Downloaded media is not an image: "
-            f"{detected_mime}"
+            f"Image is too large ({image_size_mb:.1f} MB). WhatsApp Cloud API supports images up to 5 MB."
         )
 
-    image_size_mb = (
-        len(response.content)
-        / (1024 * 1024)
-    )
-
-    if image_size_mb > 20:
-        raise ValueError(
-            f"Image is too large ({image_size_mb:.1f} MB). "
-            "Maximum supported size is 20 MB."
-        )
-
-    encoded = base64.b64encode(
-        response.content
-    ).decode("utf-8")
-
+    encoded = base64.b64encode(response.content).decode("utf-8")
     return encoded, detected_mime
 
 
@@ -2556,7 +2563,7 @@ def get_menu():
 • `.anime <character>`
 • `.comic <query>`
 • `.edu <subject>`
-• `.pinterest <query>`
+• `.pinterest <query>` (Pinterest keyword search)
 • `imagine <prompt>`
 • `.play <song name>`
 
@@ -3036,12 +3043,6 @@ def webhook():
                     media_response.json()
                 )
 
-                image_url = (
-                    media_info.get(
-                        "url"
-                    )
-                )
-
                 media_mime_type = (
                     media_info.get(
                         "mime_type"
@@ -3049,16 +3050,12 @@ def webhook():
                     or incoming_mime_type
                 )
 
-                if not image_url:
-
-                    raise ValueError(
-                        "Meta did not return a media URL."
-                    )
-
+                # Keep the durable media ID instead of Meta's temporary
+                # lookaside URL. A fresh URL is resolved when vision runs.
                 user_waiting_image[
                     from_number
                 ] = {
-                    "url": image_url,
+                    "media_id": image_id,
                     "mime_type": media_mime_type,
                     "saved_at": time.time()
                 }
@@ -3297,7 +3294,7 @@ def webhook():
 
             send_text(from_number, "Looking at the image again...")
             result = vision_call(
-                saved_image["url"],
+                saved_image.get("media_id") or saved_image.get("url"),
                 (
                     "Answer the user's follow-up question about this same image. "
                     "Use only information reasonably visible in the image. "
@@ -3325,7 +3322,7 @@ def webhook():
 
             send_text(from_number, "Looking at the image again...")
             result = vision_call(
-                saved_image["url"],
+                saved_image.get("media_id") or saved_image.get("url"),
                 (
                     "Answer this follow-up question about the image. "
                     "Do not invent details that are not visible.\n\n"
@@ -3360,7 +3357,7 @@ def webhook():
             # Keep the image available for explicit follow-up questions.
             last_image_context[from_number] = saved_image
 
-            image_url = saved_image["url"]
+            image_url = saved_image.get("media_id") or saved_image.get("url")
             mime_type = saved_image.get("mime_type", "image/jpeg")
 
             if tl == ".solve":
@@ -3417,7 +3414,7 @@ def webhook():
                     handler(from_number, query)
                 return "OK", 200
         if tl == ".pint":
-            send_text(from_number, "〔 PINT 〕\n\nChoose:\n• `.photo <query>`\n• `.wallpaper <query>`\n• `.anime <character>`\n• `.comic <query>`\n• `.edu <subject>`\n• `.pinterest <query>`")
+            send_text(from_number, "〔 PINT 〕\n\nChoose:\n• `.photo <query>`\n• `.wallpaper <query>`\n• `.anime <character>`\n• `.comic <query>`\n• `.edu <subject>`\n• `.pinterest <query>` (Pinterest keyword search)")
             return "OK", 200
 
         # ====================================================
@@ -3800,17 +3797,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
-
-
-
-
-
-
-
-
-
-
 
 
 
