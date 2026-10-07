@@ -1,4 +1,3 @@
-
 from flask import Flask, request
 import requests
 import os
@@ -6,6 +5,10 @@ import base64
 import json
 import re
 import hashlib
+import hmac
+import atexit
+import threading
+from collections import OrderedDict
 from datetime import datetime
 import pytz
 import time
@@ -15,12 +18,12 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 14.2.2
+# VERSION 14.2.5
 # ============================================================
 
 app = Flask(__name__)
 
-VERSION = "v14.2.3"
+VERSION = "v14.2.5"
 start_time = time.time()
 
 GRAPH_API_VERSION = os.getenv(
@@ -51,6 +54,8 @@ MEMORY_FILE = "aria_memory.json"
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+# Meta App Secret (App settings > Basic). Used to verify webhook signatures.
+APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -92,7 +97,9 @@ client = (
 # ACCESS CONTROL
 # ============================================================
 
-OWNER_NUMBER = os.getenv("OWNER_NUMBER", "2348026177804").strip()
+OWNER_NUMBER = os.getenv("OWNER_NUMBER", "").strip()
+if not OWNER_NUMBER:
+    print("[WARNING] OWNER_NUMBER is not set. Owner commands are disabled.")
 OWNER_NAME = "Philimon Dean"
 
 ADMIN_NUMBERS = {
@@ -103,20 +110,17 @@ ADMIN_NUMBERS = {
 
 ALLOWED_USERS = [
     n.strip()
-    for n in os.getenv("ALLOWED_USERS", "2348XXXXXXXX,2349XXXXXXX").split(",")
+    for n in os.getenv("ALLOWED_USERS", "").split(",")
     if n.strip()
 ]
 
-# Prefer a secret Render environment variable. The weekly fallback is retained
-# for backwards compatibility so an existing deployment does not suddenly lock
-# everyone out before ARIA_PASSWORD is configured.
+# Password login is only enabled when ARIA_PASSWORD is set in the environment.
+# There is no guessable fallback. Without it, only the owner, admins and
+# ALLOWED_USERS can use ARIA.
 ARIA_PASSWORD = os.getenv("ARIA_PASSWORD", "").strip()
-PASSWORD = ARIA_PASSWORD or (
-    "ARIA"
-    + datetime.now(
-        pytz.timezone("Africa/Lagos")
-    ).strftime("%Y%W")
-)
+PASSWORD = ARIA_PASSWORD or None
+if not PASSWORD:
+    print("[WARNING] ARIA_PASSWORD is not set. Password login is disabled.")
 
 MAX_TRIES = 4
 
@@ -132,6 +136,7 @@ BANNED_USERS = set()
 # ============================================================
 
 api_requests = defaultdict(list)
+_rate_lock = threading.Lock()
 
 LIMITS = {
     "pint1": 20,
@@ -139,86 +144,241 @@ LIMITS = {
     "pint4": 20,
     "pint5": 50,
     "pinterest": 20,
+    # Max AI chat calls per user per hour (owner and admins exempt).
+    "ai": int(os.getenv("AI_LIMIT_PER_HOUR", "40")),
 }
 
 # ============================================================
 # MEMORY
 # ============================================================
 
-def load_memory():
+# Optional free persistent store (Upstash Redis REST). If these env vars
+# are missing or Upstash is unreachable, ARIA falls back to the local file.
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+REMOTE_ENABLED = bool(UPSTASH_URL and UPSTASH_TOKEN)
+KEY_DATA = "aria:data"
+KEY_BANNED = "aria:banned"
+REMOTE_FLUSH_SECONDS = int(os.getenv("REMOTE_FLUSH_SECONDS", "30"))
+
+_memory_lock = threading.Lock()
+_remote_lock = threading.Lock()
+_dirty = False
+_last_banned = None
+
+
+def remote_cmd(*args):
+
+    r = requests.post(
+        UPSTASH_URL,
+        headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        json=list(args),
+        timeout=5
+    )
+
+    r.raise_for_status()
+
+    return r.json().get("result")
+
+
+def _snapshot():
+
+    # Another thread may change the dicts mid-dump; retry a few times.
+    for _ in range(3):
+        try:
+            return json.dumps(
+                {
+                    "convo": conversation_memory,
+                    "profile": user_profile
+                },
+                ensure_ascii=False
+            )
+        except RuntimeError:
+            time.sleep(0.05)
+
+    return None
+
+
+def flush_remote(bans_only=False):
+
+    global _dirty
+    global _last_banned
+
+    if not REMOTE_ENABLED:
+        return
+
+    with _remote_lock:
+
+        try:
+
+            banned_now = sorted(BANNED_USERS)
+
+            if banned_now != _last_banned:
+                remote_cmd(
+                    "SET",
+                    KEY_BANNED,
+                    json.dumps(banned_now)
+                )
+                _last_banned = banned_now
+
+            if not bans_only:
+
+                snap = _snapshot()
+
+                if snap:
+                    remote_cmd("SET", KEY_DATA, snap)
+                    _dirty = False
+
+        except Exception as e:
+
+            print("[REMOTE SAVE ERROR]", repr(e))
+
+
+def _apply_memory(data, banned):
 
     global conversation_memory
     global user_profile
     global BANNED_USERS
 
-    if not os.path.exists(MEMORY_FILE):
-        return
+    conversation_memory = data.get("convo", {})
+    user_profile = data.get("profile", {})
+    BANNED_USERS = set(banned)
 
-    try:
 
-        with open(
-            MEMORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+def load_memory():
 
-            data = json.load(f)
+    global _last_banned
 
-        conversation_memory = data.get(
-            "convo",
-            {}
-        )
+    data = None
+    banned = None
 
-        user_profile = data.get(
-            "profile",
-            {}
-        )
+    # 1. Try the remote store.
+    if REMOTE_ENABLED:
 
-        BANNED_USERS = set(
-            data.get(
-                "banned",
-                []
-            )
-        )
+        try:
 
-    except Exception as e:
+            raw = remote_cmd("GET", KEY_DATA)
+            raw_b = remote_cmd("GET", KEY_BANNED)
 
-        print(
-            "[MEMORY LOAD ERROR]",
-            repr(e)
-        )
+            if raw:
+                data = json.loads(raw)
+
+            if raw_b:
+                banned = json.loads(raw_b)
+                _last_banned = sorted(banned)
+
+            print("[MEMORY] Loaded from Upstash")
+
+        except Exception as e:
+
+            print("[REMOTE LOAD ERROR]", repr(e))
+
+    # 2. Fall back to the local file for anything missing.
+    if (data is None or banned is None) and os.path.exists(MEMORY_FILE):
+
+        try:
+
+            with open(
+                MEMORY_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                local = json.load(f)
+
+            if data is None:
+                data = {
+                    "convo": local.get("convo", {}),
+                    "profile": local.get("profile", {})
+                }
+
+            if banned is None:
+                banned = local.get("banned", [])
+
+            print("[MEMORY] Loaded from local file")
+
+        except Exception as e:
+
+            print("[MEMORY LOAD ERROR]", repr(e))
+
+    _apply_memory(
+        data or {},
+        banned or []
+    )
 
 
 def save_memory():
 
+    global _dirty
+
     try:
 
-        with open(
-            MEMORY_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
+        with _memory_lock:
 
-            json.dump(
-                {
-                    "convo": conversation_memory,
-                    "profile": user_profile,
-                    "banned": list(BANNED_USERS)
-                },
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
+            with open(
+                MEMORY_FILE + ".tmp",
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                json.dump(
+                    {
+                        "convo": conversation_memory,
+                        "profile": user_profile,
+                        "banned": list(BANNED_USERS)
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2
+                )
+
+            os.replace(MEMORY_FILE + ".tmp", MEMORY_FILE)
 
     except Exception as e:
 
-        print(
-            "[MEMORY SAVE ERROR]",
-            repr(e)
-        )
+        print("[MEMORY SAVE ERROR]", repr(e))
+
+    if REMOTE_ENABLED:
+
+        _dirty = True
+
+        # Bans are saved to the remote store immediately.
+        if sorted(BANNED_USERS) != _last_banned:
+            flush_remote(bans_only=True)
+
+
+def _remote_flusher():
+
+    while True:
+
+        time.sleep(REMOTE_FLUSH_SECONDS)
+
+        if _dirty:
+            flush_remote()
 
 
 load_memory()
+
+if REMOTE_ENABLED:
+
+    threading.Thread(
+        target=_remote_flusher,
+        daemon=True
+    ).start()
+
+    atexit.register(
+        lambda: flush_remote() if _dirty else None
+    )
+
+    # Push local-only data up on the first run.
+    _dirty = True
+
+else:
+
+    print(
+        "[WARNING] Upstash is not configured. Memory and bans "
+        "only live in the local file and are lost on redeploy."
+    )
 
 # ============================================================
 # RATE LIMITER
@@ -233,22 +393,24 @@ def check_rate_limit(
 
     key = f"{number}_{api_name}"
 
-    api_requests[key] = [
-        t
-        for t in api_requests[key]
-        if now - t < 3600
-    ]
+    with _rate_lock:
 
-    if len(
-        api_requests[key]
-    ) >= LIMITS.get(
-        api_name,
-        100
-    ):
+        api_requests[key] = [
+            t
+            for t in api_requests[key]
+            if now - t < 3600
+        ]
 
-        return False
+        if len(
+            api_requests[key]
+        ) >= LIMITS.get(
+            api_name,
+            100
+        ):
 
-    api_requests[key].append(now)
+            return False
+
+        api_requests[key].append(now)
 
     return True
 
@@ -263,7 +425,7 @@ def check_auth(
 
     # The owner is immutable: bans and ordinary authentication state can
     # never remove the owner's access.
-    if from_number == OWNER_NUMBER:
+    if OWNER_NUMBER and from_number == OWNER_NUMBER:
 
         BANNED_USERS.discard(from_number)
         authenticated_users.add(from_number)
@@ -287,9 +449,9 @@ def check_auth(
 
         return True, ""
 
-    if (
-        text.strip().upper()
-        == PASSWORD.upper()
+    if PASSWORD and hmac.compare_digest(
+        text.strip().upper().encode(),
+        PASSWORD.upper().encode()
     ):
 
         authenticated_users.add(
@@ -1777,6 +1939,17 @@ def ai_call(
     system=DEFAULT_SYSTEM_PROMPT
 ):
 
+    if (
+        from_number != OWNER_NUMBER
+        and from_number not in ADMIN_NUMBERS
+        and not check_rate_limit(from_number, "ai")
+    ):
+
+        return (
+            "You've reached the hourly AI limit. "
+            "Please try again in a while."
+        )
+
     memory_context = build_memory_context(
         from_number
     )
@@ -2649,6 +2822,46 @@ def get_status():
 # WEBHOOK
 # ============================================================
 
+# ============================================================
+# WEBHOOK SECURITY + DUPLICATE PROTECTION
+# ============================================================
+
+_seen_ids = OrderedDict()
+_seen_lock = threading.Lock()
+SEEN_MAX = 2000
+
+
+def verify_signature(raw_body, header):
+    """Verify Meta's X-Hub-Signature-256 header."""
+    if not APP_SECRET:
+        # Not configured: allow, but this is insecure (warned at startup).
+        return True
+    if not header or not header.startswith("sha256="):
+        return False
+    expected = hmac.new(
+        APP_SECRET.encode(),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, header[7:])
+
+
+def is_duplicate(msg_id):
+    """True if this WhatsApp message id was already handled."""
+    if not msg_id:
+        return False
+    with _seen_lock:
+        if msg_id in _seen_ids:
+            return True
+        _seen_ids[msg_id] = time.time()
+        while len(_seen_ids) > SEEN_MAX:
+            _seen_ids.popitem(last=False)
+    return False
+
+
+if not APP_SECRET:
+    print("[WARNING] WHATSAPP_APP_SECRET is not set. Webhook signatures are NOT verified.")
+
 @app.route(
     "/webhook",
     methods=[
@@ -2697,11 +2910,47 @@ def webhook():
     # PARSE WEBHOOK
     # ========================================================
 
-    try:
+    raw_body = request.get_data()
 
-        data = request.get_json(
-            silent=True
+    if not verify_signature(
+        raw_body,
+        request.headers.get("X-Hub-Signature-256")
+    ):
+
+        print("[WEBHOOK] Invalid signature rejected")
+
+        return (
+            "Forbidden",
+            403
         )
+
+    data = request.get_json(
+        silent=True
+    )
+
+    # Reply to Meta immediately; do the slow work (AI, images, voice)
+    # in a background thread so Meta never times out and retries.
+    threading.Thread(
+        target=process_webhook,
+        args=(data,),
+        daemon=True
+    ).start()
+
+    return (
+        "OK",
+        200
+    )
+
+
+def process_webhook(data):
+
+    global last_explain_topic
+    global user_waiting_image
+    global last_image_context
+    global VOICE_MODE
+    global voice_enabled_users
+
+    try:
 
         if not data:
 
@@ -2756,6 +3005,13 @@ def webhook():
         )
 
         if not from_number:
+
+            return (
+                "OK",
+                200
+            )
+
+        if is_duplicate(msg.get("id")):
 
             return (
                 "OK",
@@ -3254,7 +3510,7 @@ def webhook():
                 f"*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n"
                 f"〔 *SECURITY* 〕\n"
                 f"*Owner:* PROTECTED\n"
-                f"*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'LEGACY FALLBACK'}\n"
+                f"*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n"
                 f"*Content Safety:* ENABLED\n"
             )
 
@@ -3797,6 +4053,13 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
+
+
+
+
+
+
 
 
 
