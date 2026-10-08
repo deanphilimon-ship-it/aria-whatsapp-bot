@@ -1,4 +1,3 @@
-
 from flask import Flask, request
 import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile
 from collections import OrderedDict, defaultdict
@@ -8,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 15.1
+# VERSION 15.2
 # ============================================================
 app = Flask(__name__)
-VERSION = "v15.1"
+VERSION = "v15.2"
 start_time = time.time()
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
 
@@ -79,7 +78,7 @@ MAX_TRIES = 4
 auth_tries, voice_enabled_users, authenticated_users, BANNED_USERS = {}, set(), set(), set()
 api_requests = defaultdict(list)
 _rate_lock = threading.Lock()
-LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40"))}
+LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"live":int(os.getenv("LIVE_LIMIT_PER_HOUR","20")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40"))}
 
 def check_rate_limit(number, api_name):
     now=time.time(); key=f"{number}_{api_name}"
@@ -482,7 +481,7 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT):
 
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT):
     if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
+    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
     if client:
         try:return groq_chat_call(full,system)
         except Exception as e:errors.append(f"Groq: {e}")
@@ -769,9 +768,9 @@ EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bs
 def is_explicit_request(text):return bool(text) and any(re.search(p,re.sub(r"\s+"," ",str(text).lower()).strip(),re.I) for p in EXPLICIT_PATTERNS)
 def safety_block_message():return "I can help with educational, medical, safety, or non-explicit topics, but I can't generate or provide explicit sexual content."
 def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Responsive Intelligent Assistant.\n\nARIA is a WhatsApp AI assistant designed for conversation, vision, problem solving, study help, documents, reminders and media commands.\n\nVersion: {VERSION}\nOwner: Philimon Dean\nOwner protection: ENABLED\nContent safety: ENABLED\nVoice: CONFIGURABLE\n"""
-def get_menu():return f"""〔 ARIA {VERSION} 〕\n\nAI\n• .ask <question>\n• .explain <topic>\n• .summarize <text>\n• .translate <language> <text>\n• .define <word>\n\nVISION\n• .describe / .describe detailed\n• .describe ask <question>\n• .read\n• .solve\n• .math\n• .verify\n\nSTUDY\n• .study <topic>\n• .quiz <topic>\n\nDOCUMENTS\n• Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX\n• Ask questions about the latest document\n• .doc <question>\n\nMEDIA\n• .photo <query>\n• .wallpaper <query>\n• .anime <character>\n• .comic <query>\n• .edu <subject>\n• .pinterest <query>\n• .create <prompt>\n• .imagine <prompt> (legacy alias)\n• .play <song name>\n\nREMINDERS\n• .remind me to study at 8pm\n• .remind me tomorrow at 7am to call John\n• .remind me in 30 minutes to check\n• .reminders\n• .remind cancel <id>\n\nSYSTEM\n• .about\n• .health\n• .voice on/off\n• .status\n• .menu\n• .help <command>\n\nOWNER\n• .users\n• .ban <number>\n• .unban <number>\n\nLegacy .pint1–.pint6 still work."""
+def get_menu():return f"""〔 ARIA {VERSION} 〕\n\nAI\n• .ask <question>\n• .explain <topic>\n• .summarize <text>\n• .translate <language> <text>\n• .define <word>\n\nLIVE WEB (Gemini + Google Search)\n• .search <question>\n• .news <topic>\n• .verify <claim>\n• Time-sensitive questions search the web automatically\n\nVISION\n• .describe / .describe detailed\n• .describe ask <question>\n• .read\n• .solve\n• .math\n• .verify (checks edits/AI signs + live fact-check)\n\nSTUDY\n• .study <topic>\n• .quiz <topic>\n\nDOCUMENTS\n• Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX\n• Ask questions about the latest document\n• .doc <question>\n\nMEDIA\n• .photo <query>\n• .wallpaper <query>\n• .anime <character>\n• .comic <query>\n• .edu <subject>\n• .pinterest <query>\n• .create <prompt>\n• .imagine <prompt> (legacy alias)\n• .play <song name>\n\nREMINDERS\n• .remind me to study at 8pm\n• .remind me tomorrow at 7am to call John\n• .remind me in 30 minutes to check\n• .reminders\n• .remind cancel <id>\n\nSYSTEM\n• .about\n• .health\n• .voice on/off\n• .status\n• .menu\n• .help <command>\n\nOWNER\n• .users\n• .ban <number>\n• .unban <number>\n\nLegacy .pint1–.pint6 still work."""
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)} ({'Upstash' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)} ({'Upstash' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Gemini + Google Search)' if LIVE_ENABLED else 'OFF - needs GEMINI_API_KEY'}\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -803,6 +802,55 @@ def is_duplicate(msg_id):
     return False
 if not APP_SECRET:print("[WARNING] WHATSAPP_APP_SECRET is not set. Webhook signatures are NOT verified.")
 
+# ============================================================
+# LIVE WEB SEARCH (Gemini Google Search grounding, uses GEMINI_API_KEY)
+# ============================================================
+LIVE_ENABLED=bool(GEMINI_API_KEY)  # live search runs on your Gemini key (Google Search grounding)
+_LIVE_RE=re.compile(r"\b(today|tonight|yesterday|tomorrow|latest|currently|current|right now|news|breaking|headlines?|price of|stock|share price|exchange rate|score|scores|fixtures?|weather|forecast|trending|this (?:week|month|year)|just (?:happened|announced|released)|update on|release date|who (?:is|are) the (?:current )?(?:president|prime minister|ceo|governor|king|champion)|2026)\b",re.I)
+def needs_live(text):return bool(_LIVE_RE.search(text or ""))
+def _now_str():
+    try:return datetime.now(_tz()).strftime("%A, %d %B %Y, %I:%M %p %Z")
+    except Exception:return datetime.utcnow().strftime("%A, %d %B %Y, %H:%M UTC")
+_LIVE_SYSTEM="You answer using live web information for WhatsApp. Be concise. Give dates for time-sensitive facts. If sources disagree or the evidence is thin, say so plainly. Never invent facts, quotes or sources."
+def gemini_search_call(prompt,system=_LIVE_SYSTEM,timeout=45):
+    payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":[{"text":prompt}]}],"tools":[{"google_search":{}}],"generationConfig":{"maxOutputTokens":1200}}
+    r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout); r.raise_for_status(); data=r.json()
+    text=_extract_gemini_text(data)
+    if not text:raise ValueError("Gemini returned an empty grounded response")
+    names=[]
+    try:
+        for ch in ((data.get("candidates") or [{}])[0].get("groundingMetadata") or {}).get("groundingChunks",[]):
+            t=((ch.get("web") or {}).get("title") or "").strip()
+            if t and t not in names:names.append(t)
+    except Exception:pass
+    return text,names[:3]
+def _fmt_sources(names):return ("\n\n🌐 Sources: "+", ".join(names)) if names else "\n\n🌐 Live web search"
+def live_answer(question,query=None):
+    errors=[]
+    if GEMINI_API_KEY:
+        try:
+            text,names=gemini_search_call(f"Current date/time: {_now_str()}\n\n{question}"); return text.strip()+_fmt_sources(names)
+        except Exception as e:errors.append(f"Gemini: {e!r}"); print("[LIVE GEMINI ERROR]",repr(e))
+    raise RuntimeError("; ".join(errors) or "Live search is not configured")
+def smart_ask(prompt,user,force=False,query=None):
+    if LIVE_ENABLED and (force or needs_live(prompt)):
+        if check_rate_limit(user,"live"):
+            try:
+                ctx=build_memory_context(user,prompt,skip_last_user=True,max_chars=1200)
+                return live_answer((ctx+"\n\n" if ctx else "")+f"User question: {prompt}",query or prompt)
+            except Exception as e:print("[LIVE FALLBACK]",repr(e))
+        elif force:return "You've reached the hourly live-search limit. Try again later."
+    return ai_call(prompt,user)
+def _verify_claims(user,media_id,mime):
+    if not LIVE_ENABLED:return "\n\n🌐 Live fact-check is off (add GEMINI_API_KEY)."
+    if not check_rate_limit(user,"live"):return "\n\n🌐 Live fact-check skipped: hourly live-search limit reached."
+    try:
+        claims=vision_call(media_id,"List any specific factual claims, headlines, quotes, dates, statistics or event descriptions shown in this image as plain text (max 4 short lines). If the image contains no checkable claims, reply exactly NONE.",mime).strip()
+        if not claims or claims.upper().startswith("NONE"):return "\n\n🌐 No checkable text claims found in the image."
+        res=live_answer(f"Fact-check these claims taken from an image, using current reliable sources. For each claim say Supported, Disputed, False or Unverified, with one short reason and the date of the evidence. Do not guess.\n\nClaims:\n{claims}",claims[:300])
+        return "\n\n〔 *LIVE FACT-CHECK* 〕\n"+res
+    except Exception as e:print("[VERIFY LIVE ERROR]",repr(e)); return "\n\n🌐 Live fact-check failed. Try `.verify <claim>` instead."
+
 _CONTROL_PREFIXES=(".remind",".health",".status",".menu",".about",".help",".voice",".users",".ban",".unban",".image",".describe",".verify",".solve",".math",".read",".pint",".photo",".wallpaper",".anime",".comic",".edu",".pinterest",".play",".create",".imagine",".doc")
 def _is_control_command(tl):return tl.startswith(_CONTROL_PREFIXES)
 
@@ -814,7 +862,7 @@ def _send_vision_for_user(user,command):
     if command==".solve":r=solve_image_problem(u,mime)
     elif command==".math":r=solve_image_problem(u,mime,"math")
     elif command==".read":r=vision_call(u,"Extract readable text only. Preserve useful line breaks and mark unclear text as [unclear].",mime)
-    elif command==".verify":r=vision_call(u,"Analyze visible indicators of AI generation, manipulation, editing or misleading presentation. State evidence and limitations; do not claim forensic certainty.",mime)
+    elif command==".verify":r=vision_call(u,"Analyze visible indicators of AI generation, manipulation, editing or misleading presentation. State evidence and limitations; do not claim forensic certainty.",mime); r+=_verify_claims(user,u,mime)
     else:r=vision_call(u,"Describe this image naturally for WhatsApp. Mention setting, objects, actions, colors, composition and readable text only when legible. Do not guess identities.",mime)
     add_to_memory(user,"assistant",r);send_text(user,r)
 
@@ -875,7 +923,7 @@ def process_webhook(data):
                 if re.match(r"^\.?remind\s+me\b",spoken,re.I):
                     text="."+spoken.lstrip(".").rstrip(" .!?");tl=text.lower();routed=True;send_text(user,f"🎤 {tr}")
                 else:
-                    add_to_memory(user,"user",f"[Voice] {tr}");result=ai_call(tr,user);add_to_memory(user,"assistant",result)
+                    add_to_memory(user,"user",f"[Voice] {tr}");result=smart_ask(tr,user);add_to_memory(user,"assistant",result)
                     if VOICE_MODE in {"voice","audio","on"} or user in voice_enabled_users:
                         if not send_voice_reply(user,result):send_text(user,result)
                     else:send_text(user,f"🎤 {tr}\n\n{result}")
@@ -910,8 +958,25 @@ def process_webhook(data):
         if tl==".health":
             health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
 
+        if tl.startswith(".verify "):
+            claim=text[8:].strip()[:1000]
+            if not LIVE_ENABLED:r="Live verification isn't configured. Add GEMINI_API_KEY."
+            elif not check_rate_limit(user,"live"):r="You've reached the hourly live-search limit. Try again later."
+            else:
+                send_text(user,"🌐 Checking live sources...")
+                try:r="〔 *LIVE VERIFY* 〕\n\n"+live_answer(f"Fact-check this claim using current reliable sources. Start with a verdict (Supported / Disputed / False / Unverified), then give 2-4 short reasons with dates. Do not guess.\n\nClaim: {claim}",claim[:300])
+                except Exception as e:print("[VERIFY ERROR]",repr(e));r="Live check failed. Try again shortly."
+            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+        if tl in {".search",".news"}:send_text(user,"Usage: `.search <question>` or `.news <topic>`");return "OK",200
+        if tl.startswith((".search ",".news ")):
+            cmd,_,q=text.partition(" ");q=q.strip()[:500]
+            if not LIVE_ENABLED:send_text(user,"Live search isn't configured. Add GEMINI_API_KEY.");return "OK",200
+            send_text(user,"🌐 Searching...")
+            r=smart_ask(f"What is the latest news on: {q}? Give 3-5 short bullet points, each with its date." if cmd.lower()==".news" else q,user,force=True,query=q)
+            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+
         if tl==".image" or tl.startswith(".image "):
-            send_text(user,"`.image` is not a vision follow-up in ARIA v15.1.\n\nFor AI image generation use:\n`.create <prompt>`\n\nFor analysing a WhatsApp image, send the image first, then use `.describe`, `.read`, `.solve`, `.math`, or `.verify`.");return "OK",200
+            send_text(user,"`.image` is not a vision follow-up in ARIA v15.2.\n\nFor AI image generation use:\n`.create <prompt>`\n\nFor analysing a WhatsApp image, send the image first, then use `.describe`, `.read`, `.solve`, `.math`, or `.verify`.");return "OK",200
         if tl.startswith(".describe ask "):
             saved=user_waiting_image.get(user)
             if not saved:return send_text(user,"No recent image is waiting. Send an image first.") or "OK"
@@ -936,7 +1001,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify`.",".create":"Generate an image with `.create <prompt>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -950,7 +1015,7 @@ def process_webhook(data):
             topic,field=(mm.group(1).strip(),mm.group(2)) if mm else (args,"all")
             r="Usage: `.explain <topic>`" if not topic else ai_explain(topic,field,user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl.startswith(".ask "):
-            r=ai_call(text[5:].strip(),user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r=smart_ask(text[5:].strip(),user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl==".ask":send_text(user,"Usage: `.ask <question>`");return "OK",200
         if tl.startswith(".summarize "):r=ai_call(f"Summarize this clearly and briefly:\n\n{text[11:].strip()}",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl==".summarize":send_text(user,"Usage: `.summarize <text>`");return "OK",200
@@ -969,7 +1034,7 @@ def process_webhook(data):
             # Only use document context when it is clearly the active context.
             r=ask_about_document(user,text);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if not text:send_text(user,"Send me a message.");return "OK",200
-        r=ai_call(text,user);add_to_memory(user,"assistant",r);send_text(user,r)
+        r=smart_ask(text,user);add_to_memory(user,"assistant",r);send_text(user,r)
     except Exception as e:print("[WEBHOOK ERROR]",repr(e))
     return "OK",200
 
@@ -981,6 +1046,11 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
 
 
 
