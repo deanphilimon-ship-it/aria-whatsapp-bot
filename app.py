@@ -1,3 +1,4 @@
+
 from flask import Flask, request
 import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile
 from collections import OrderedDict, defaultdict
@@ -7,10 +8,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 15.0
+# VERSION 15.1
 # ============================================================
 app = Flask(__name__)
-VERSION = "v15.0"
+VERSION = "v15.1"
 start_time = time.time()
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
 
@@ -30,6 +31,9 @@ MEMORY_FILE = "aria_memory.json"
 DOCUMENT_CONTEXT_LIMIT = 12000
 document_context = {}
 DOCUMENT_WAIT_TIMEOUT = 2 * 60 * 60
+MAX_MEMORY_CONTEXT_CHARS = 3500
+MAX_PROMPT_CHARS = 14000
+MAX_REMINDERS_PER_USER = 20
 
 # ============================================================
 # ENVIRONMENT
@@ -53,7 +57,7 @@ IMAGE_MODEL = os.getenv("IMAGE_MODEL", "flux").strip() or "flux"
 IMAGE_WIDTH = int(os.getenv("IMAGE_WIDTH", "1024"))
 IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
-CHAT_MODEL = "openai/gpt-oss-120b"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b")
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
@@ -75,7 +79,7 @@ MAX_TRIES = 4
 auth_tries, voice_enabled_users, authenticated_users, BANNED_USERS = {}, set(), set(), set()
 api_requests = defaultdict(list)
 _rate_lock = threading.Lock()
-LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40"))}
+LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40"))}
 
 def check_rate_limit(number, api_name):
     now=time.time(); key=f"{number}_{api_name}"
@@ -171,6 +175,7 @@ def check_auth(from_number,text):
         authenticated_users.add(from_number); return True,""
     if PASSWORD and hmac.compare_digest(text.strip().upper().encode(),PASSWORD.upper().encode()):
         authenticated_users.add(from_number); auth_tries[from_number]=0; return True,"Access Granted.\n\nWelcome to ARIA."
+    if not text.strip():return False,"Private Bot\n\nSend password to unlock."
     auth_tries[from_number]=auth_tries.get(from_number,0)+1
     if auth_tries[from_number]>=MAX_TRIES:
         BANNED_USERS.add(from_number); save_memory(); return False,"Locked. Too many incorrect attempts."
@@ -286,7 +291,7 @@ def pint3_anime(sender,query):
     if any(x in q for x in ["naked","nude","boobs","pussy","sex","nsfw"]):return send_text(sender,"SFW only. Try Goku, Naruto, Luffy, etc.")
     send_text(sender,f"Pint3 Danbooru: *{query}*...")
     try:
-        r=requests.get("https://danbooru.donmai.us/posts.json",params={"tags":q,"limit":1,"random":"true"},headers={"User-Agent":"ARIA-Bot/1.0"},timeout=15); r.raise_for_status(); posts=r.json()
+        r=requests.get("https://danbooru.donmai.us/posts.json",params={"tags":f"{q} rating:g","limit":1,"random":"true"},headers={"User-Agent":"ARIA-Bot/1.0"},timeout=15); r.raise_for_status(); posts=r.json()
         if not posts:return send_text(sender,f"No results for: *{query}*")
         p=posts[0]; u=p.get("large_file_url") or p.get("file_url"); u=("https://danbooru.donmai.us"+u if u and u.startswith("/") else u)
         if not u:return send_text(sender,"Danbooru returned a result without an image.")
@@ -364,7 +369,7 @@ def pint_pinterest(sender,query):
 
 def imagine_generate(sender,prompt):
     send_text(sender,f"FLUX AI generating:\n*{prompt}*...")
-    enhanced=prompt+", ultra detailed, cinematic lighting, sharp focus, high quality, professional artwork"; encoded=requests.utils.quote(enhanced); seed=int(hashlib.sha256(prompt.encode()).hexdigest()[:8],16)%100000
+    enhanced=prompt+", ultra detailed, cinematic lighting, sharp focus, high quality, professional artwork"; encoded=requests.utils.quote(enhanced); seed=uuid.uuid4().int%100000
     url=f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(IMAGE_MODEL)}&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}"
     if not send_image_url(sender,url,f"FLUX: {prompt}\nModel: FLUX"):
         turbo=f"https://image.pollinations.ai/prompt/{encoded}?model=turbo&width=1024&height=1024&nologo=true"; send_image_url(sender,turbo,f"AI: {prompt}\nFallback: Turbo")
@@ -392,27 +397,43 @@ SAFETY
 - Do not generate explicit sexual content. Educational, medical, anatomical, safety and non-explicit discussions may be handled clinically.
 """
 
-def build_memory_context(from_number,current_input=""):
-    p=user_profile.get(from_number,{})
-    out=[]
-    if p.get("name"):out.append(f"You are talking to {p['name']}.")
+def build_memory_context(from_number,current_input="",skip_last_user=False,max_chars=None):
+    max_chars=max_chars or MAX_MEMORY_CONTEXT_CHARS
+    p=user_profile.get(from_number,{}); head=[]
+    if p.get("name"):head.append(f"You are talking to {p['name']}.")
     facts=p.get("facts",[]); prefs=p.get("preferences",[])
-    if facts:out.append("Long-term facts:\n"+"\n".join(f"- {x}" for x in facts[-LONG_TERM_FACT_LIMIT:]))
-    if prefs:out.append("Preferences:\n"+"\n".join(f"- {x}" for x in prefs[-LONG_TERM_FACT_LIMIT:]))
-    msgs=conversation_memory.get(from_number,[])
-    if msgs:
-        recent=msgs[-RECENT_MEMORY_MESSAGES:]; out.append("Recent conversation:\n"+"\n".join(f"{m.get('role','unknown')}: {str(m.get('content',''))[:500]}" for m in recent))
-        if len(msgs)>RECENT_MEMORY_MESSAGES and current_input:
-            terms={x.lower() for x in re.findall(r"[a-zA-Z0-9]{4,}",current_input) if x.lower() not in {"what","when","where","which","that","this","with","from","about"}}
-            scored=[]
-            for m in msgs[:-RECENT_MEMORY_MESSAGES]:
-                c=str(m.get("content","")); score=sum(c.lower().count(t) for t in terms)
-                if score:scored.append((score,c,m.get("role","unknown")))
-            scored.sort(reverse=True)
-            if scored:out.append("Relevant older memory:\n"+"\n".join(f"{r}: {c[:500]}" for _,c,r in scored[:6]))
+    if facts:head.append("Long-term facts:\n"+"\n".join(f"- {str(x)[:200]}" for x in facts[-15:]))
+    if prefs:head.append("Preferences:\n"+"\n".join(f"- {str(x)[:200]}" for x in prefs[-10:]))
+    head_text="\n\n".join(head)
+    msgs=list(conversation_memory.get(from_number,[]))
+    if skip_last_user and msgs and msgs[-1].get("role")=="user":msgs=msgs[:-1]
+    budget=max(max_chars-len(head_text),800)
+    older_block=""
+    if len(msgs)>RECENT_MEMORY_MESSAGES and current_input:
+        stop={"what","when","where","which","that","this","with","from","about"}
+        terms={x.lower() for x in re.findall(r"[a-zA-Z0-9]{4,}",current_input) if x.lower() not in stop}
+        scored=[]
+        for m in msgs[:-RECENT_MEMORY_MESSAGES]:
+            c=str(m.get("content","")); score=sum(c.lower().count(t) for t in terms)
+            if score:scored.append((score,c,m.get("role","unknown")))
+        scored.sort(key=lambda x:x[0],reverse=True)
+        if scored:older_block=("Relevant older memory:\n"+"\n".join(f"{r}: {c[:300]}" for _,c,r in scored[:4]))[:budget//3]
+    recent_budget=budget-len(older_block); kept=[]; used=0
+    for m in reversed(msgs[-RECENT_MEMORY_MESSAGES:]):
+        line=f"{m.get('role','unknown')}: {str(m.get('content',''))[:400]}"
+        if kept and used+len(line)+1>recent_budget:break
+        kept.append(line); used+=len(line)+1
+    kept.reverse()
+    out=[]
+    if head_text:out.append(head_text)
+    if kept:out.append("Recent conversation:\n"+"\n".join(kept))
+    if older_block:out.append(older_block)
     return "\n\n".join(out)
 
+_NO_MEMORY_PREFIXES=("AI request failed","AI is not configured","You've reached the hourly","I couldn't","No recent image","No recent document")
 def add_to_memory(from_number,role,content):
+    if not str(content or "").strip():return
+    if role=="assistant" and str(content).startswith(_NO_MEMORY_PREFIXES):return
     conversation_memory.setdefault(from_number,[]).append({"role":role,"content":content}); conversation_memory[from_number]=conversation_memory[from_number][-MAX_HISTORY:]; save_memory()
 
 def remember_user_fact(from_number,fact):
@@ -449,7 +470,7 @@ def gemini_call(prompt,system=DEFAULT_SYSTEM_PROMPT,image_data=None,mime_type=No
     parts=[]
     if image_data:parts.append({"inline_data":{"mime_type":mime_type,"data":image_data}})
     parts.append({"text":prompt}); payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
-    r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",params={"key":GEMINI_API_KEY},headers={"Content-Type":"application/json"},json=payload,timeout=timeout); r.raise_for_status(); text=_extract_gemini_text(r.json())
+    r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout); r.raise_for_status(); text=_extract_gemini_text(r.json())
     if not text:raise ValueError("Gemini returned an empty response")
     return text
 
@@ -461,12 +482,12 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT):
 
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT):
     if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt); full=(ctx+"\n\n" if ctx else "")+f"User: {prompt}"; errors=[]
+    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
     if client:
-        try:return groq_chat_call(full[:12000],system)
+        try:return groq_chat_call(full,system)
         except Exception as e:errors.append(f"Groq: {e}")
     if GEMINI_API_KEY:
-        try:return gemini_call(full[:12000],system)
+        try:return gemini_call(full,system)
         except Exception as e:errors.append(f"Gemini: {e}")
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors))); return "AI request failed.\n\nBoth configured AI providers failed. Use `.health` to see their status." if (client or GEMINI_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY or GEMINI_API_KEY to Render."
 
@@ -494,7 +515,10 @@ def vision_call(image_url,prompt,mime_type=None):
     try:b64,mime=download_whatsapp_image(image_url,mime_type)
     except Exception as e:return f"I couldn't retrieve that image from WhatsApp.\n\nReason: {str(e)[:500]}"
     if client:
-        try:return groq_vision_call(b64,mime,prompt).strip()
+        try:
+            out=groq_vision_call(b64,mime,prompt).strip()
+            if out:return out
+            print("[VISION GROQ] empty response, trying fallback")
         except Exception as e:print("[VISION GROQ ERROR]",repr(e))
     if GEMINI_API_KEY:
         try:return gemini_call(prompt+"\n\nBe accurate and concise. If something cannot be determined, say so.",image_data=b64,mime_type=mime).strip()
@@ -556,13 +580,28 @@ def _read_xlsx_document(data):
     for ws in wb.worksheets:
         chunks.append(f"[Sheet: {ws.title}]\n"+"\n".join(" | ".join("" if v is None else str(v) for v in row) for row in ws.iter_rows(values_only=True)))
     return _clean_document_text("\n\n".join(chunks))
+def _pptx_shape_text(shape):
+    try:
+        if getattr(shape,"shape_type",None)==6:return "\n".join(filter(None,(_pptx_shape_text(s) for s in shape.shapes)))
+        if getattr(shape,"has_table",False) and shape.has_table:return "\n".join(" | ".join(c.text for c in row.cells) for row in shape.table.rows)
+        if getattr(shape,"has_text_frame",False) and shape.has_text_frame:return shape.text_frame.text
+    except Exception:pass
+    return ""
 def _read_pptx_document(data):
     from pptx import Presentation
-    p=Presentation(io.BytesIO(data)); return _clean_document_text("\n\n".join("\n".join(s.text for s in slide.shapes if hasattr(s,"text")) for slide in p.slides))
-def parse_document(filename,data):
+    p=Presentation(io.BytesIO(data)); slides=[]
+    for i,slide in enumerate(p.slides,1):
+        body="\n".join(filter(None,(_pptx_shape_text(s) for s in slide.shapes))); notes=""
+        try:
+            if slide.has_notes_slide:notes=slide.notes_slide.notes_text_frame.text.strip()
+        except Exception:pass
+        slides.append(f"[Slide {i}]\n{body}"+(f"\n[Notes] {notes}" if notes else ""))
+    return _clean_document_text("\n\n".join(slides))
+_MIME_EXT={"application/pdf":"pdf","application/vnd.openxmlformats-officedocument.wordprocessingml.document":"docx","text/plain":"txt","text/markdown":"md","text/csv":"csv","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":"xlsx","application/vnd.openxmlformats-officedocument.presentationml.presentation":"pptx"}
+def parse_document(filename,data,mime=None):
     if len(data)>DOCUMENT_MAX_BYTES:raise ValueError("Document exceeds the 15 MB limit.")
-    ext=filename.lower().rsplit(".",1)[-1] if "." in filename else "txt"
-    if ext not in SUPPORTED_DOCUMENT_TYPES:raise ValueError("Unsupported document type. Supported: PDF, DOCX, TXT, MD, CSV, XLSX, PPTX.")
+    ext=filename.lower().rsplit(".",1)[-1].strip() if "." in filename else _MIME_EXT.get((mime or "").split(";")[0].strip().lower(),"")
+    if ext not in SUPPORTED_DOCUMENT_TYPES:raise ValueError("Unsupported document type. Supported: PDF, DOCX, TXT, MD, CSV, XLSX, PPTX.\n\nOld .doc/.xls/.ppt files must be re-saved as .docx/.xlsx/.pptx first.")
     text={"pdf":_read_pdf_document,"docx":_read_docx_document,"txt":_read_text_document,"md":_read_text_document,"csv":_read_csv_document,"xlsx":_read_xlsx_document,"pptx":_read_pptx_document}[ext](data)
     if not text:raise ValueError("No readable text was found. A scanned/image-only PDF may require OCR/vision.")
     return text
@@ -581,18 +620,37 @@ def ask_about_document(user,question):
 # REMINDERS
 # ============================================================
 REMINDER_FILE="aria_reminders.json"; reminders={}; _reminder_lock=threading.Lock()
+KEY_REMINDERS="aria:reminders"; _reminders_synced=not REMOTE_ENABLED
+def _sync_reminders_remote():
+    global _reminders_synced
+    if _reminders_synced or not REMOTE_ENABLED:return
+    raw=remote_cmd("GET",KEY_REMINDERS)
+    if raw:
+        for k,v in json.loads(raw).items():reminders.setdefault(k,v)
+    _reminders_synced=True
 def load_reminders():
     global reminders
+    data={}
     try:
         if os.path.exists(REMINDER_FILE):
-            with open(REMINDER_FILE,encoding="utf-8") as f:reminders=json.load(f)
+            with open(REMINDER_FILE,encoding="utf-8") as f:data=json.load(f)
     except Exception as e:print("[REMINDER LOAD ERROR]",repr(e))
+    reminders=data if isinstance(data,dict) else {}
+    try:
+        _sync_reminders_remote()
+        if REMOTE_ENABLED:print("[REMINDERS] Synced with Upstash")
+    except Exception as e:print("[REMINDER REMOTE LOAD ERROR]",repr(e))
 def save_reminders():
     try:
         tmp=REMINDER_FILE+".tmp"
         with open(tmp,"w",encoding="utf-8") as f:json.dump(reminders,f,ensure_ascii=False,indent=2)
         os.replace(tmp,REMINDER_FILE)
     except Exception as e:print("[REMINDER SAVE ERROR]",repr(e))
+    if REMOTE_ENABLED:
+        try:
+            _sync_reminders_remote()
+            remote_cmd("SET",KEY_REMINDERS,json.dumps(reminders,ensure_ascii=False))
+        except Exception as e:print("[REMINDER REMOTE SAVE ERROR]",repr(e))
 def _tz():
     try:return pytz.timezone(ARIA_TIMEZONE)
     except Exception:return pytz.utc
@@ -608,64 +666,100 @@ def _parse_clock(s):
     elif h>23:return None
     return h,minute
 
+_WEEKDAYS={"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+def _clock_token(tok):
+    t=tok.strip().lower()
+    if t=="noon":return 12,0
+    if t=="midnight":return 0,0
+    return _parse_clock(t)
+def _clean_task(s):
+    s=re.sub(r"\s+"," ",s).strip(" ,.;:-")
+    s=re.sub(r"^(?:to|that)\s+","",s,flags=re.I)
+    s=re.sub(r"\s+(?:to|on|at|by)$","",s,flags=re.I)
+    return s.strip(" ,.;:-")[:300]
+def _loc(tz,d,h,m):return tz.localize(datetime(d.year,d.month,d.day,h,m))
+
 def parse_reminder(text):
-    raw=text.strip(); body=raw[7:].strip() if raw.lower().startswith(".remind") else raw
-    if body.lower().startswith("me "):body=body[3:].strip()
+    raw=re.sub(r"\b([ap])\.m\.?",r"\1m",text.strip(),flags=re.I)
+    body=re.sub(r"^\.?remind(?:ers?)?\b","",raw,flags=re.I).strip()
+    body=re.sub(r"^me\b\s*","",body,flags=re.I).strip()
     tz=_tz(); now=datetime.now(tz)
-    # .remind me to study in 30 minutes / .remind me in 30 minutes to study
-    m=re.match(r"(?:to\s+)?(.+?)\s+in\s+(\d+)\s+(minute|minutes|hour|hours|day|days)$",body,re.I)
+    # relative: "in 30 minutes", "in 2 hours", "in 3 days" (anywhere in the sentence)
+    m=re.search(r"\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\b",body,re.I)
     if m:
-        task=m.group(1).strip(); delta=int(m.group(2)); unit=m.group(3).lower(); seconds=delta*(60 if unit.startswith("minute") else 3600 if unit.startswith("hour") else 86400); return task,now+timedelta(seconds=seconds)
-    m=re.match(r"in\s+(\d+)\s+(minute|minutes|hour|hours|day|days)\s+to\s+(.+)$",body,re.I)
-    if m:
-        delta=int(m.group(1)); unit=m.group(2).lower(); task=m.group(3).strip(); seconds=delta*(60 if unit.startswith("minute") else 3600 if unit.startswith("hour") else 86400); return task,now+timedelta(seconds=seconds)
-    m=re.match(r"(?:to\s+)?(.+?)\s+(?:tomorrow\s+)?at\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)$",body,re.I)
-    if m:
-        task=m.group(1).strip(); clock=_parse_clock(m.group(2));
-        if clock:
-            h,minute=clock; dt=tz.localize(datetime(now.year,now.month,now.day,h,minute))
-            if dt<=now:dt+=timedelta(days=1)
-            return task,dt
-    m=re.match(r"tomorrow\s+at\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)\s+to\s+(.+)$",body,re.I)
-    if m:
-        clock=_parse_clock(m.group(1));
-        if clock:
-            h,minute=clock; d=now+timedelta(days=1); return m.group(2).strip(),tz.localize(datetime(d.year,d.month,d.day,h,minute))
-    m=re.match(r"(.+?)\s+tomorrow\s+at\s+([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)$",body,re.I)
-    if m:
-        clock=_parse_clock(m.group(2));
-        if clock:
-            h,minute=clock; d=now+timedelta(days=1); return m.group(1).strip(),tz.localize(datetime(d.year,d.month,d.day,h,minute))
-    return None,None
+        n=int(m.group(1)); u=m.group(2).lower(); secs=n*(60 if u.startswith("min") else 3600 if u.startswith(("hour","hr")) else 86400)
+        if n<=0 or secs>365*86400:return None,None
+        task=_clean_task(body[:m.start()]+" "+body[m.end():])
+        return (task,now+timedelta(seconds=secs)) if task else (None,None)
+    # absolute: optional day word + a clock time
+    dm=re.search(r"\b(?:on\s+)?(?:next\s+)?(tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",body,re.I)
+    cms=list(re.finditer(r"\bat\s+(noon|midnight|\d{1,2}(?::\d{2})?\s*(?:am|pm)?)(?!\w)|(?<![\w:])(\d{1,2}(?::\d{2})?\s*(?:am|pm))(?!\w)",body,re.I))
+    if not cms:return None,None
+    cm=cms[-1]; clock=_clock_token(cm.group(1) or cm.group(2))
+    if not clock:return None,None
+    h,mi=clock; spans=[cm.span()]+([dm.span()] if dm else []); rest=body
+    for a,b in sorted(spans,reverse=True):rest=rest[:a]+" "+rest[b:]
+    task=_clean_task(rest)
+    if not task:return None,None
+    base=now.date(); word=dm.group(1).lower() if dm else None
+    if word=="tomorrow":base=base+timedelta(days=1)
+    elif word in _WEEKDAYS:base=base+timedelta(days=(_WEEKDAYS[word]-base.weekday())%7)
+    dt=_loc(tz,base,h,mi)
+    if dt<=now:
+        if word in ("today","tonight","tomorrow"):return None,None
+        dt=_loc(tz,base+timedelta(days=7 if word in _WEEKDAYS else 1),h,mi)
+    return task,dt
 
 def create_reminder(user,task,when):
-    rid=uuid.uuid4().hex[:8]; reminders[rid]={"id":rid,"user":user,"task":task,"due":when.isoformat(),"created":time.time()}; save_reminders(); return rid
+    rid=uuid.uuid4().hex[:8]
+    with _reminder_lock:
+        reminders[rid]={"id":rid,"user":user,"task":task,"due":when.isoformat(),"created":time.time()}; save_reminders()
+    return rid
+def list_reminders(user):
+    with _reminder_lock:return sorted((dict(r) for r in reminders.values() if r.get("user")==user),key=lambda r:r.get("due",""))
+def cancel_reminder(user,rid):
+    with _reminder_lock:
+        r=reminders.get(rid)
+        if r and r.get("user")==user:reminders.pop(rid,None); save_reminders(); return True
+    return False
+def _fmt_due(r):
+    try:return datetime.fromisoformat(r["due"]).astimezone(_tz()).strftime("%d %b %Y %I:%M %p")
+    except Exception:return "unknown time"
 
 def reminder_worker():
     while True:
         time.sleep(10); due=[]; now=datetime.now(pytz.utc)
         with _reminder_lock:
             for rid,r in list(reminders.items()):
+                if r.get("retry_at",0)>time.time():continue
                 try:
-                    dt=datetime.fromisoformat(r["due"]); dt=dt if dt.tzinfo else _tz().localize(dt); due.append((rid,r)) if dt.astimezone(pytz.utc)<=now else None
-                except Exception: due.append((rid,r))
-            for rid,r in due: reminders.pop(rid,None)
-            if due:save_reminders()
-        for rid,r in due:
-            send_text(r["user"],f"⏰ *Reminder*\n\n{r.get('task','Reminder')}\n\nID: `{rid}`")
+                    dt=datetime.fromisoformat(r["due"]); dt=dt if dt.tzinfo else _tz().localize(dt); dt=dt.astimezone(pytz.utc)
+                    if dt<=now:due.append((rid,dict(r),dt))
+                except Exception:due.append((rid,dict(r),None))
+        for rid,r,dt in due:
+            late=dt is not None and (now-dt).total_seconds()>300
+            ok=send_text(r.get("user"),f"⏰ *Reminder*{' (late)' if late else ''}\n\n{r.get('task','Reminder')}\n\nID: `{rid}`")
+            with _reminder_lock:
+                cur=reminders.get(rid)
+                if not cur:continue
+                if ok or dt is None:reminders.pop(rid,None)
+                else:
+                    cur["attempts"]=cur.get("attempts",0)+1; cur["retry_at"]=time.time()+60*cur["attempts"]
+                    if cur["attempts"]>=8:reminders.pop(rid,None)
+                save_reminders()
 load_reminders(); threading.Thread(target=reminder_worker,daemon=True).start()
 
 # ============================================================
 # EDUCATION / STATUS / SAFETY
 # ============================================================
+EXPLAIN_FIELDS=["Biology","Chemistry","Pharmacology","Clinical","Pathophysiology","Exam Tips"]
 def ai_explain(topic,field_num,from_number):
-    fields=["Biology","Chemistry","Pharmacology","Clinical","Pathophysiology","Exam Tips"]
-    if field_num=="all":last_explain_topic[from_number]=topic;last_explain_fields[from_number]=fields;return f"〔 *{topic.title()} - 6 FIELDS* 〕\n\n"+"\n".join(f"{i}. {x}" for i,x in enumerate(fields,1))+f"\n\nReply `explain {topic} 3` for Pharmacology."
+    fields=EXPLAIN_FIELDS
+    if str(field_num)=="all":last_explain_topic[from_number]=topic;return f"〔 *{topic.title()} - 6 FIELDS* 〕\n\n"+"\n".join(f"{i}. {x}" for i,x in enumerate(fields,1))+f"\n\nReply `.explain {topic} 3` for Pharmacology."
     try:idx=int(field_num)-1
-    except ValueError:return "Usage: `explain psychology 2`"
-    if from_number not in last_explain_fields:return "Ask `explain psychology` first to see the fields."
-    if idx<0 or idx>=len(last_explain_fields[from_number]):return "Choose a field from 1 to 6."
-    field=last_explain_fields[from_number][idx]
+    except ValueError:return "Usage: `.explain psychology 2`"
+    if idx<0 or idx>=len(fields):return "Choose a field from 1 to 6."
+    field=fields[idx]
     return ai_call(f"Deep dive into '{topic}' from the {field} perspective. Use examples and exam-relevant details.",from_number,system="You are a knowledgeable professor helping a student. Explain accurately, teach rather than merely define, use clear examples, no markdown tables, and highlight exam-relevant points.")
 
 def get_youtube_link(query):return f"*{query.title()}*\n\n▶️ Tap to search: https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
@@ -675,9 +769,9 @@ EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bs
 def is_explicit_request(text):return bool(text) and any(re.search(p,re.sub(r"\s+"," ",str(text).lower()).strip(),re.I) for p in EXPLICIT_PATTERNS)
 def safety_block_message():return "I can help with educational, medical, safety, or non-explicit topics, but I can't generate or provide explicit sexual content."
 def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Responsive Intelligent Assistant.\n\nARIA is a WhatsApp AI assistant designed for conversation, vision, problem solving, study help, documents, reminders and media commands.\n\nVersion: {VERSION}\nOwner: Philimon Dean\nOwner protection: ENABLED\nContent safety: ENABLED\nVoice: CONFIGURABLE\n"""
-def get_menu():return f"""〔 ARIA {VERSION} 〕\n\nAI\n• .ask <question>\n• .explain <topic>\n• .summarize <text>\n• .translate <language> <text>\n• .define <word>\n\nVISION\n• .describe / .describe detailed\n• .describe ask <question>\n• .read\n• .solve\n• .math\n• .verify\n\nSTUDY\n• .study <topic>\n• .quiz <topic>\n\nDOCUMENTS\n• Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX\n• Ask questions about the latest document\n\nMEDIA\n• .photo <query>\n• .wallpaper <query>\n• .anime <character>\n• .comic <query>\n• .edu <subject>\n• .pinterest <query>\n• .create <prompt>\n• .imagine <prompt> (legacy alias)\n• .play <song name>\n\nREMINDERS\n• .remind me to study at 8pm\n• .remind me tomorrow at 7am to call John\n• .remind me in 30 minutes to check\n• .reminders\n• .remind cancel <id>\n\nSYSTEM\n• .about\n• .health\n• .voice on/off\n• .status\n• .menu\n• .help <command>\n\nOWNER\n• .users\n• .ban <number>\n• .unban <number>\n\nLegacy .pint1–.pint6 still work."""
+def get_menu():return f"""〔 ARIA {VERSION} 〕\n\nAI\n• .ask <question>\n• .explain <topic>\n• .summarize <text>\n• .translate <language> <text>\n• .define <word>\n\nVISION\n• .describe / .describe detailed\n• .describe ask <question>\n• .read\n• .solve\n• .math\n• .verify\n\nSTUDY\n• .study <topic>\n• .quiz <topic>\n\nDOCUMENTS\n• Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX\n• Ask questions about the latest document\n• .doc <question>\n\nMEDIA\n• .photo <query>\n• .wallpaper <query>\n• .anime <character>\n• .comic <query>\n• .edu <subject>\n• .pinterest <query>\n• .create <prompt>\n• .imagine <prompt> (legacy alias)\n• .play <song name>\n\nREMINDERS\n• .remind me to study at 8pm\n• .remind me tomorrow at 7am to call John\n• .remind me in 30 minutes to check\n• .reminders\n• .remind cancel <id>\n\nSYSTEM\n• .about\n• .health\n• .voice on/off\n• .status\n• .menu\n• .help <command>\n\nOWNER\n• .users\n• .ban <number>\n• .unban <number>\n\nLegacy .pint1–.pint6 still work."""
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)}\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)} ({'Upstash' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -708,6 +802,9 @@ def is_duplicate(msg_id):
         while len(_seen_ids)>SEEN_MAX:_seen_ids.popitem(last=False)
     return False
 if not APP_SECRET:print("[WARNING] WHATSAPP_APP_SECRET is not set. Webhook signatures are NOT verified.")
+
+_CONTROL_PREFIXES=(".remind",".health",".status",".menu",".about",".help",".voice",".users",".ban",".unban",".image",".describe",".verify",".solve",".math",".read",".pint",".photo",".wallpaper",".anime",".comic",".edu",".pinterest",".play",".create",".imagine",".doc")
+def _is_control_command(tl):return tl.startswith(_CONTROL_PREFIXES)
 
 def _send_vision_for_user(user,command):
     saved=user_waiting_image.get(user)
@@ -765,48 +862,56 @@ def process_webhook(data):
         if msg.get("type")=="document":
             d=msg.get("document") or {}; mid=d.get("id"); filename=d.get("filename") or "document.txt"
             try:
-                r=requests.get(graph_url(mid),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=20);r.raise_for_status();info=r.json();url=info.get("url");mime=info.get("mime_type") or "application/octet-stream";rawdoc=requests.get(url,headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=30);rawdoc.raise_for_status();textdoc=parse_document(filename,rawdoc.content);store_document_context(user,filename,textdoc);send_text(user,f"Document received: *{filename}*\n\nI extracted the readable text. Ask me anything about it.")
+                r=requests.get(graph_url(mid),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=20);r.raise_for_status();info=r.json();url=info.get("url");mime=info.get("mime_type") or "application/octet-stream";rawdoc=requests.get(url,headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=30);rawdoc.raise_for_status();textdoc=parse_document(filename,rawdoc.content,mime);note=f"\n\nNote: this document is long, so I will use the first {DOCUMENT_CONTEXT_LIMIT:,} characters." if len(textdoc)>DOCUMENT_CONTEXT_LIMIT else "";store_document_context(user,filename,textdoc);send_text(user,f"Document received: *{filename}*\n\nI extracted the readable text. Ask me anything about it, or use `.doc <question>`.{note}")
             except Exception as e:print("[DOCUMENT ERROR]",repr(e));send_text(user,f"I couldn't read that document.\n\n{str(e)[:500]}")
             return "OK",200
         if msg.get("type")=="audio":
+            routed=False
             try:
                 send_text(user,"🎤 Listening...");a,m=download_whatsapp_audio((msg.get("audio") or {}).get("id"));tr=transcribe_audio(a,m)
                 if not tr:return send_text(user,"I couldn't make out what you said. Try again.") or "OK"
-                add_to_memory(user,"user",f"[Voice] {tr}");result=ai_call(tr,user);add_to_memory(user,"assistant",result)
-                if VOICE_MODE in {"voice","audio","on"} or user in voice_enabled_users:
-                    if not send_voice_reply(user,result):send_text(user,result)
-                else:send_text(user,f"🎤 {tr}\n\n{result}")
+                if is_explicit_request(tr):send_text(user,safety_block_message());return "OK",200
+                spoken=re.sub(r"\b([ap])\.m\.?",r"\1m",tr,flags=re.I).strip()
+                if re.match(r"^\.?remind\s+me\b",spoken,re.I):
+                    text="."+spoken.lstrip(".").rstrip(" .!?");tl=text.lower();routed=True;send_text(user,f"🎤 {tr}")
+                else:
+                    add_to_memory(user,"user",f"[Voice] {tr}");result=ai_call(tr,user);add_to_memory(user,"assistant",result)
+                    if VOICE_MODE in {"voice","audio","on"} or user in voice_enabled_users:
+                        if not send_voice_reply(user,result):send_text(user,result)
+                    else:send_text(user,f"🎤 {tr}\n\n{result}")
             except Exception as e:print("[VOICE INPUT ERROR]",repr(e));send_text(user,"I couldn't process that voice note. Check `.health` or try again.")
-            return "OK",200
+            if not routed:return "OK",200
 
         if tl in {".voice",".voice status"}:send_text(user,f"Voice mode: *{VOICE_MODE}*\n\nUse `.voice on` or `.voice off`.");return "OK",200
         if tl==".voice on":voice_enabled_users.add(user);send_text(user,"Voice replies enabled for you.");return "OK",200
         if tl==".voice off":voice_enabled_users.discard(user);send_text(user,"Voice replies disabled for you.");return "OK",200
-        if text:add_to_memory(user,"user",text)
+        if text and not _is_control_command(tl):add_to_memory(user,"user",text[5:].strip() if tl.startswith(".ask ") else text)
         learned=learn_fact(user,text)
         if learned:add_to_memory(user,"assistant",learned);send_text(user,learned);return "OK",200
         if tl=="forget me":forget_user_memory(user);send_text(user,"Memory cleared.");return "OK",200
 
         if tl.startswith(".remind"):
             if tl in {".remind",".remind list",".reminders"}:
-                active=[r for r in reminders.values() if r.get("user")==user]
-                if not active:send_text(user,"You have no active reminders.")
-                else:send_text(user,"〔 *REMINDERS* 〕\n\n"+"\n".join(f"• `{r['id']}` — {r['task']} — {datetime.fromisoformat(r['due']).astimezone(_tz()).strftime('%d %b %Y %I:%M %p')}" for r in active))
+                active=list_reminders(user)
+                if not active:send_text(user,"You have no active reminders.\n\nTry `.remind me to study at 8pm`.")
+                else:send_text(user,"〔 *REMINDERS* 〕\n\n"+"\n".join(f"• `{r['id']}` — {r['task']} — {_fmt_due(r)}" for r in active)+"\n\nCancel with `.remind cancel <id>`")
                 return "OK",200
-            if tl.startswith(".remind cancel "):
-                rid=text.split(None,2)[2].strip(); r=reminders.get(rid)
-                if r and r.get("user")==user:reminders.pop(rid,None);save_reminders();send_text(user,f"Reminder `{rid}` cancelled.")
+            if tl.startswith(".remind cancel"):
+                parts=text.split(None,2)
+                if len(parts)<3:send_text(user,"Usage: `.remind cancel <id>`")
+                elif cancel_reminder(user,parts[2].strip().strip("`")):send_text(user,f"Reminder `{parts[2].strip().strip('`')}` cancelled.")
                 else:send_text(user,"Reminder not found.")
                 return "OK",200
             task,when=parse_reminder(text)
-            if not task or not when:return send_text(user,"Usage examples:\n`.remind me to study at 8pm`\n`.remind me tomorrow at 7am to call John`\n`.remind me in 30 minutes to check the oven`") or "OK"
+            if not task or not when:return send_text(user,"I couldn't understand that reminder (or the time has already passed).\n\nTry:\n`.remind me to study at 8pm`\n`.remind me tomorrow at 7am to call John`\n`.remind me in 30 minutes to check the oven`\n`.remind me on friday at 5pm to pay rent`\n`.remind me to pray at noon`") or "OK"
+            if user not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and len(list_reminders(user))>=MAX_REMINDERS_PER_USER:return send_text(user,f"You already have {MAX_REMINDERS_PER_USER} active reminders. Cancel one with `.remind cancel <id>`.") or "OK"
             rid=create_reminder(user,task,when);send_text(user,f"⏰ Reminder set.\n\n*{task}*\n{when.astimezone(_tz()).strftime('%d %b %Y, %I:%M %p')}\nID: `{rid}`");return "OK",200
 
         if tl==".health":
             health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* OK\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
 
         if tl==".image" or tl.startswith(".image "):
-            send_text(user,"`.image` is not a vision follow-up in ARIA v15.0.\n\nFor AI image generation use:\n`.create <prompt>`\n\nFor analysing a WhatsApp image, send the image first, then use `.describe`, `.read`, `.solve`, `.math`, or `.verify`.");return "OK",200
+            send_text(user,"`.image` is not a vision follow-up in ARIA v15.1.\n\nFor AI image generation use:\n`.create <prompt>`\n\nFor analysing a WhatsApp image, send the image first, then use `.describe`, `.read`, `.solve`, `.math`, or `.verify`.");return "OK",200
         if tl.startswith(".describe ask "):
             saved=user_waiting_image.get(user)
             if not saved:return send_text(user,"No recent image is waiting. Send an image first.") or "OK"
@@ -834,11 +939,16 @@ def process_webhook(data):
             c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify`.",".create":"Generate an image with `.create <prompt>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
-        if tl.startswith(".create ") or tl.startswith(".imagine ") or tl.startswith("create ") or tl.startswith("imagine "):
-            prompt=text.split(" ",1)[1].strip();imagine_generate(user,prompt);return "OK",200
-        if tl in {".create",".imagine","create","imagine"}:send_text(user,"Usage: `.create <prompt>`\n\nExample: `.create cyberpunk city at night`");return "OK",200
-        if tl.startswith(".explain") or tl.startswith("explain"):
-            ct=text[1:] if text.startswith(".") else text;parts=ct.split(" ",2);r="Usage: `.explain <topic>`" if len(parts)==1 else ai_explain(parts[1],"all",user) if len(parts)==2 else ai_explain(parts[1],parts[2],user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+        if tl.startswith(".create ") or tl.startswith(".imagine "):
+            prompt=text.split(None,1)[1].strip()[:500]
+            if not check_rate_limit(user,"create"):send_text(user,"You've reached the hourly image limit. Try again later.");return "OK",200
+            imagine_generate(user,prompt);return "OK",200
+        if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>`\n\nExample: `.create cyberpunk city at night`");return "OK",200
+        if tl.startswith(".explain") or re.match(r"^explain\s+.+\s+[1-6]$",tl):
+            ct=text[1:] if text.startswith(".") else text; sp=ct.split(None,1); args=sp[1].strip() if len(sp)>1 else ""
+            mm=re.match(r"^(.+?)\s+([1-6])$",args)
+            topic,field=(mm.group(1).strip(),mm.group(2)) if mm else (args,"all")
+            r="Usage: `.explain <topic>`" if not topic else ai_explain(topic,field,user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl.startswith(".ask "):
             r=ai_call(text[5:].strip(),user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl==".ask":send_text(user,"Usage: `.ask <question>`");return "OK",200
@@ -852,8 +962,8 @@ def process_webhook(data):
         if tl.startswith(".define "):r=ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl.startswith(".study "):r=ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if tl.startswith(".quiz "):r=ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
-        if tl.startswith(".doc") or get_document_context(user) and (tl.startswith("document ") or tl.startswith("ask document") or tl.startswith(".document")):
-            q=re.sub(r"^\.?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
+        if re.match(r"^\.(?:doc|document)(?:\s|$)",tl) or (get_document_context(user) and tl.startswith(("document ","ask document"))):
+            q=re.sub(r"^\.?(?:ask\s+)?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
             r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
         if get_document_context(user) and tl.startswith(("what ","who ","when ","where ","why ","how ","summarize", "explain")):
             # Only use document context when it is clearly the active context.
@@ -866,10 +976,11 @@ def process_webhook(data):
 @app.route("/")
 def home():return f"ARIA {VERSION} Running | Graph API {GRAPH_API_VERSION} | Chat {CHAT_MODEL} | Vision {VISION_MODEL} | Gemini {GEMINI_MODEL}"
 
+@app.route("/ping")
+def ping():return "pong",200
+
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
 
 
 
