@@ -1068,9 +1068,19 @@ def check_groq_models():
 # ============================================================
 _seen_ids=OrderedDict(); _seen_lock=threading.Lock(); SEEN_MAX=2000
 def verify_signature(raw_body,header):
-    if not APP_SECRET:return ALLOW_UNSIGNED_WEBHOOKS   # fail closed unless explicitly overridden
-    if not header or not header.startswith("sha256="):return False
-    return hmac.compare_digest(hmac.new(APP_SECRET.encode(),raw_body,hashlib.sha256).hexdigest(),header[7:])
+    if not APP_SECRET:
+        print("[WEBHOOK 403] reason=no_app_secret_configured")
+        return ALLOW_UNSIGNED_WEBHOOKS
+    if not header or not header.startswith("sha256="):
+        print("[WEBHOOK 403] reason=missing_or_malformed_signature_header")
+        return False
+    ok=hmac.compare_digest(
+        hmac.new(APP_SECRET.encode(),raw_body,hashlib.sha256).hexdigest(),
+        header[7:]
+    )
+    if not ok:
+        print("[WEBHOOK 403] reason=signature_mismatch")
+    return ok
 def is_duplicate(msg_id):
     if not msg_id:return False
     with _seen_lock:
