@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.2.3 (reply-to-message context, persistent 48-hour references, plain-text maths)
+# VERSION 17.3.0 (DOCX generation, style-routed images, reply context, plain-text maths)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.2.3"
+VERSION = "v17.3.0"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -73,7 +73,19 @@ UNSPLASH_KEY = _env("UNSPLASH_KEY")
 PIXABAY_KEY = _env("PIXABAY_KEY")
 COMICVINE_KEY = _env("COMICVINE_KEY")
 PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_KEY") or _env("PINTEREST_TOKEN")
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "flux").strip() or "flux"
+# Legacy Pollinations alias remains configurable; generation now selects a model by style.
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "zimage").strip() or "zimage"
+POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
+IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "pollinations").strip().lower()
+if IMAGE_PROVIDER not in {"pollinations", "gemini"}: IMAGE_PROVIDER = "pollinations"
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip() or "gemini-3.1-flash-image"
+POLLINATIONS_IMAGE_BASE = os.getenv("POLLINATIONS_IMAGE_BASE", "https://gen.pollinations.ai").strip().rstrip("/")
+IMAGE_MODEL_ANIME = os.getenv("IMAGE_MODEL_ANIME", "seedream5").strip() or "seedream5"
+IMAGE_MODEL_REALISTIC = os.getenv("IMAGE_MODEL_REALISTIC", "gptimage").strip() or "gptimage"
+IMAGE_MODEL_FANTASY = os.getenv("IMAGE_MODEL_FANTASY", "nanobanana-2").strip() or "nanobanana-2"
+IMAGE_MODEL_POSTER = os.getenv("IMAGE_MODEL_POSTER", "ideogram-v4-turbo").strip() or "ideogram-v4-turbo"
+IMAGE_MODEL_GENERAL = os.getenv("IMAGE_MODEL_GENERAL", "zimage").strip() or "zimage"
+DOCX_MAX_BYTES = 12 * 1024 * 1024
 IMAGE_WIDTH = int(os.getenv("IMAGE_WIDTH", "1024"))
 IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
@@ -111,7 +123,7 @@ pw_fail={}           # number -> [timestamps]
 _access_lock=threading.RLock(); _owner_nudge_ts=0.0
 api_requests = defaultdict(list)
 _rate_lock = threading.Lock()
-LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"live":int(os.getenv("LIVE_LIMIT_PER_HOUR","20")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40")),"vision":int(os.getenv("VISION_LIMIT_PER_HOUR","30"))}
+LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"docx":int(os.getenv("DOCX_LIMIT_PER_HOUR","5")),"live":int(os.getenv("LIVE_LIMIT_PER_HOUR","20")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40")),"vision":int(os.getenv("VISION_LIMIT_PER_HOUR","30"))}
 
 def check_rate_limit(number, api_name):
     now=time.time(); key=f"{number}_{api_name}"
@@ -716,12 +728,307 @@ def pint_pinterest(sender,query):
         send_image_url(sender,u,c)
     except Exception as e:print("[PINTEREST EXCEPTION]",repr(e)); send_text(sender,"Pinterest search failed. Check the token/scopes and try again.")
 
-def imagine_generate(sender,prompt):
-    send_text(sender,f"FLUX AI generating:\n*{prompt}*...")
-    enhanced=prompt+", ultra detailed, cinematic lighting, sharp focus, high quality, professional artwork"; encoded=requests.utils.quote(enhanced); seed=uuid.uuid4().int%100000
-    url=f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(IMAGE_MODEL)}&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}"
-    if not send_image_url(sender,url,f"FLUX: {prompt}\nModel: FLUX"):
-        turbo=f"https://image.pollinations.ai/prompt/{encoded}?model=turbo&width=1024&height=1024&nologo=true"; send_image_url(sender,turbo,f"AI: {prompt}\nFallback: Turbo")
+def detect_image_style(prompt, explicit_style=None):
+    """Return a bounded image style route; never executes user-provided model names."""
+    allowed = {"anime", "realistic", "fantasy", "poster", "general"}
+    if explicit_style and explicit_style.lower() in allowed:
+        return explicit_style.lower()
+    low = str(prompt or "").lower()
+    if re.search(r"\b(poster|flyer|logo|typography|text in the image|banner|cover art|advertisement)\b", low):
+        return "poster"
+    if re.search(r"\b(anime|manga|manhwa|cel.?shaded|anime.?style)\b", low):
+        return "anime"
+    if re.search(r"\b(photorealistic|photorealism|realistic|realism|professional photo|real photo)\b", low):
+        return "realistic"
+    if re.search(r"\b(fantasy|dark fantasy|templar|dragon|mythical|sorcerer|enchanted|epic warrior)\b", low):
+        return "fantasy"
+    return "general"
+
+
+def image_model_for_style(style):
+    return {
+        "anime": IMAGE_MODEL_ANIME,
+        "realistic": IMAGE_MODEL_REALISTIC,
+        "fantasy": IMAGE_MODEL_FANTASY,
+        "poster": IMAGE_MODEL_POSTER,
+        "general": IMAGE_MODEL_GENERAL,
+    }.get(style, IMAGE_MODEL_GENERAL)
+
+
+def enhance_image_prompt(prompt, style):
+    """Add concise composition/style guidance without changing the requested subject."""
+    style_notes = {
+        "anime": "anime or manhwa illustration, confident linework, expressive composition, layered detail, controlled color palette, polished professional finish",
+        "realistic": "photorealistic, physically plausible lighting, natural material texture, realistic anatomy and perspective, sharp professional photography",
+        "fantasy": "cinematic fantasy concept art, intricate believable materials, dramatic atmospheric lighting, rich environmental detail, strong focal subject",
+        "poster": "professional graphic-design poster, clear visual hierarchy, deliberate negative space, crisp layout, legible typography; reproduce only text explicitly requested and do not invent extra lettering",
+        "general": "high-quality professional illustration, clear focal point, coherent composition, intentional lighting, refined details",
+    }
+    p = re.sub(r"\s+", " ", str(prompt or "")).strip()[:700]
+    return f"{p}. Visual direction: {style_notes.get(style, style_notes['general'])}. Avoid blurry details, malformed anatomy, clutter, unintended text, watermarks, and low-resolution appearance."[:1800]
+
+
+def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
+    if not image_bytes or len(image_bytes) > 5 * 1024 * 1024:
+        send_text(to, "The generated image is empty or exceeds WhatsApp's 5 MB image limit.")
+        return False
+    if mime_type not in {"image/jpeg", "image/png"}:
+        send_text(to, "The image provider returned an unsupported format. Try another model.")
+        return False
+    try:
+        mid = _upload_whatsapp_media(image_bytes, mime_type)
+        r = requests.post(graph_url(f"{PHONE_NUMBER_ID}/messages"),
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+            json={"messaging_product":"whatsapp", "to":to, "type":"image", "image":{"id":mid, "caption":caption[:1024]}}, timeout=30)
+        r.raise_for_status()
+        for item in (r.json().get("messages") or []):
+            if item.get("id"):
+                record_message_context(item["id"], to, "outbound", "image", caption, mid, mime_type)
+        return True
+    except Exception as e:
+        print("[GENERATED IMAGE DELIVERY ERROR]", type(e).__name__, str(e)[:400])
+        send_text(to, "The image was generated but WhatsApp could not deliver it. Try again later.")
+        return False
+
+
+def _pollinations_image_bytes(prompt, model, seed):
+    """Use the current authenticated Pollinations endpoint when a key is configured."""
+    if not POLLINATIONS_API_KEY:
+        return None
+    url = f"{POLLINATIONS_IMAGE_BASE}/image/{requests.utils.quote(prompt, safe='')}"
+    params = {"model": model, "width": IMAGE_WIDTH, "height": IMAGE_HEIGHT,
+              "seed": seed, "enhance": str(IMAGE_ENHANCE).lower(), "safe": "true"}
+    r = requests.get(url, params=params, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}", "Accept":"image/jpeg,image/png"}, timeout=100)
+    r.raise_for_status()
+    ctype = (r.headers.get("Content-Type") or "").split(";",1)[0].lower()
+    if ctype not in {"image/jpeg", "image/png"} or not r.content:
+        raise ValueError(f"Pollinations returned unexpected content type: {ctype or 'unknown'}")
+    if len(r.content) > 5 * 1024 * 1024:
+        raise ValueError("Generated image exceeds WhatsApp's 5 MB limit")
+    return r.content, ctype
+
+
+def _gemini_image_bytes(prompt):
+    """Generate one image through the explicitly configured Gemini image model."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing; configure it or set IMAGE_PROVIDER=pollinations")
+    payload = {
+        "contents": [{"role":"user", "parts":[{"text":prompt}]}],
+        "generationConfig": {"responseModalities":["TEXT", "IMAGE"]},
+    }
+    r = requests.post(f"{GEMINI_API_URL}{GEMINI_IMAGE_MODEL}:generateContent",
+        headers={"Content-Type":"application/json", "x-goog-api-key":GEMINI_API_KEY},
+        json=payload, timeout=120)
+    r.raise_for_status()
+    data = r.json()
+    for part in ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []:
+        inline = part.get("inlineData") or part.get("inline_data") or {}
+        encoded = inline.get("data")
+        mime = (inline.get("mimeType") or inline.get("mime_type") or "image/png").split(";",1)[0].lower()
+        if encoded and mime in {"image/jpeg", "image/png"}:
+            raw = base64.b64decode(encoded, validate=True)
+            if not raw: raise ValueError("Gemini returned empty image bytes")
+            if len(raw) > 5 * 1024 * 1024: raise ValueError("Gemini image exceeds WhatsApp's 5 MB image limit")
+            return raw, mime
+    raise ValueError("Gemini returned no supported image data")
+
+
+def imagine_generate(sender, prompt, explicit_style=None):
+    style = detect_image_style(prompt, explicit_style)
+    model = image_model_for_style(style)
+    enhanced = enhance_image_prompt(prompt, style)
+    seed = uuid.uuid4().int % 100000
+    send_text(sender, f"🎨 ARIA is creating your {style} image.\nModel route: {model}\n\n{prompt[:500]}")
+    # Provider choice is explicit. Gemini image generation is optional and may be billable;
+    # Pollinations remains the default because the user prefers a low-cost route.
+    if IMAGE_PROVIDER == "gemini":
+        try:
+            raw, mime = _gemini_image_bytes(enhanced)
+            return _send_image_bytes(sender, raw, mime, f"ARIA image · {style} · Gemini {GEMINI_IMAGE_MODEL}\n{prompt[:700]}")
+        except Exception as e:
+            print("[GEMINI IMAGE ERROR]", type(e).__name__, str(e)[:500])
+            send_text(sender, "Gemini image generation failed. Check GEMINI_API_KEY, GEMINI_IMAGE_MODEL, quota and billing; ARIA did not silently switch providers.")
+            return False
+    # New Pollinations endpoint supports authenticated model routing. A configured key can
+    # consume Pollen credits; this code never buys credits or changes billing settings.
+    if POLLINATIONS_API_KEY:
+        try:
+            result = _pollinations_image_bytes(enhanced, model, seed)
+            if result:
+                raw, mime = result
+                if _send_image_bytes(sender, raw, mime, f"ARIA image · {style} · {model}\n{prompt[:700]}"):
+                    return True
+        except Exception as e:
+            print("[POLLINATIONS IMAGE ERROR]", type(e).__name__, str(e)[:500])
+    # Compatibility fallback for the legacy no-key endpoint. Its availability and free access
+    # are not guaranteed; if it fails, ARIA returns a clear message rather than looping forever.
+    try:
+        encoded = requests.utils.quote(enhanced, safe="")
+        url = (f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(model)}"
+               f"&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}")
+        if send_image_url(sender, url, f"ARIA image · {style} · {model}\n{prompt[:700]}"):
+            return True
+    except Exception as e:
+        print("[LEGACY IMAGE FALLBACK ERROR]", type(e).__name__, str(e)[:400])
+    send_text(sender, "Image generation failed through the configured provider and fallback. Check the image API key/model in Render, then try again. Use `.status` to check ARIA configuration.")
+    return False
+
+
+# ============================================================
+# DOCX GENERATION
+# ============================================================
+def _docx_inline_runs(paragraph, text):
+    """Render basic Markdown bold/code markers as Word runs; leave content literal otherwise."""
+    parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*[^*]+\*)", str(text))
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            paragraph.add_run(part[2:-2]).bold = True
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            paragraph.add_run(part[1:-1]).italic = True
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            run = paragraph.add_run(part[1:-1]); run.font.name = "Consolas"
+        else:
+            paragraph.add_run(part)
+
+
+def build_docx_bytes(title, markdown_text):
+    """Build a formatted editable DOCX from bounded Markdown-like text."""
+    from docx import Document
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    doc = Document()
+    sec = doc.sections[0]
+    sec.top_margin = Inches(0.7); sec.bottom_margin = Inches(0.7)
+    sec.left_margin = Inches(0.8); sec.right_margin = Inches(0.8)
+    normal = doc.styles["Normal"]
+    normal.font.name = "Aptos"; normal.font.size = Pt(10.5)
+    for style_name in ("Title", "Heading 1", "Heading 2", "Heading 3"):
+        try: doc.styles[style_name].font.name = "Aptos Display"
+        except Exception: pass
+    title_p = doc.add_paragraph(style="Title")
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _docx_inline_runs(title_p, str(title or "ARIA Document")[:180])
+    doc.add_paragraph(f"Prepared by ARIA · {datetime.now(_tz()).strftime('%d %B %Y')}")
+    doc.add_paragraph()
+    lines = str(markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # The title is already rendered on the cover; avoid repeating the same first H1.
+    first_nonempty = next((idx for idx, value in enumerate(lines) if value.strip()), None)
+    if first_nonempty is not None:
+        first_h1 = re.match(r"^#\s+(.+)$", lines[first_nonempty].strip())
+        if first_h1 and first_h1.group(1).strip().casefold() == str(title or "").strip().casefold():
+            lines[first_nonempty] = ""
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line or re.fullmatch(r"[-*_]{3,}", line):
+            i += 1; continue
+        # Markdown pipe table: header + separator + zero or more body rows.
+        if line.startswith("|") and i + 1 < len(lines) and re.match(r"^\s*\|?\s*:?-{3,}", lines[i+1]):
+            table_lines = [line]; i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i].strip()); i += 1
+            rows = []
+            for tl in table_lines:
+                cells = [c.strip() for c in tl.strip().strip("|").split("|")]
+                if cells and not all(re.fullmatch(r":?-{3,}:?", c.replace(" ", "")) for c in cells): rows.append(cells)
+            if rows:
+                cols = max(len(r) for r in rows); table = doc.add_table(rows=0, cols=cols)
+                try: table.style = "Light Shading Accent 1"
+                except Exception: table.style = "Table Grid"
+                for ri, vals in enumerate(rows):
+                    cells = table.add_row().cells
+                    for ci in range(cols):
+                        p = cells[ci].paragraphs[0]; _docx_inline_runs(p, vals[ci] if ci < len(vals) else "")
+                        if ri == 0:
+                            for run in p.runs: run.bold = True
+            continue
+        h = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if h:
+            p = doc.add_paragraph(style=f"Heading {len(h.group(1))}"); _docx_inline_runs(p, h.group(2)); i += 1; continue
+        if re.match(r"^[-*+]\s+", line):
+            p = doc.add_paragraph(style="List Bullet"); _docx_inline_runs(p, re.sub(r"^[-*+]\s+", "", line)); i += 1; continue
+        if re.match(r"^\d+[.)]\s+", line):
+            p = doc.add_paragraph(style="List Number"); _docx_inline_runs(p, re.sub(r"^\d+[.)]\s+", "", line)); i += 1; continue
+        if line.startswith(">"):
+            p = doc.add_paragraph(style="Quote"); _docx_inline_runs(p, line.lstrip("> ")); i += 1; continue
+        if line.startswith("```"):
+            i += 1; code_lines=[]
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i]); i += 1
+            p = doc.add_paragraph(); r = p.add_run("\n".join(code_lines)); r.font.name="Consolas"; r.font.size=Pt(9)
+            i += 1; continue
+        p = doc.add_paragraph(); _docx_inline_runs(p, line); i += 1
+    footer = sec.footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.add_run("ARIA · Editable Word document")
+    buf = io.BytesIO(); doc.save(buf); data = buf.getvalue()
+    if len(data) > DOCX_MAX_BYTES: raise ValueError("Generated DOCX exceeds the 12 MB delivery limit.")
+    return data
+
+
+def _docx_filename(title):
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(title or "ARIA_Document")).strip("_-")[:70] or "ARIA_Document"
+    return stem + ".docx"
+
+
+def send_docx_bytes(to, data, filename, caption=""):
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        send_text(to, "WhatsApp document delivery is not configured."); return False
+    if not data or len(data) > DOCX_MAX_BYTES:
+        send_text(to, "The document is empty or exceeds the 12 MB delivery limit."); return False
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    try:
+        r = requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"),
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            data={"messaging_product":"whatsapp", "type":mime},
+            files={"file":(filename, data, mime)}, timeout=60)
+        r.raise_for_status(); mid = r.json().get("id")
+        if not mid: raise RuntimeError("WhatsApp media upload returned no ID")
+        r = requests.post(graph_url(f"{PHONE_NUMBER_ID}/messages"),
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type":"application/json"},
+            json={"messaging_product":"whatsapp", "to":to, "type":"document",
+                  "document":{"id":mid, "filename":filename, "caption":caption[:1024]}}, timeout=30)
+        r.raise_for_status()
+        for item in (r.json().get("messages") or []):
+            if item.get("id"):
+                record_message_context(item["id"], to, "outbound", "document", caption or filename, mid, mime)
+        return True
+    except Exception as e:
+        print("[DOCX DELIVERY ERROR]", type(e).__name__, str(e)[:500])
+        send_text(to, "The Word file was created, but WhatsApp could not deliver it. Check the Meta API response in the logs.")
+        return False
+
+
+def create_docx_for_user(user, request_text):
+    if not check_rate_limit(user, "docx"):
+        return send_text(user, "You've reached the hourly Word-document limit. Try again later.")
+    request_text = re.sub(r"\s+", " ", str(request_text or "")).strip()[:1200]
+    if not request_text:
+        return send_text(user, "Usage: `.docx <what to write>`\nExample: `.docx Create a study guide on pharmacology receptors with definitions, examples, a comparison table, and revision questions.`")
+    send_text(user, "📝 ARIA is preparing your editable Word document. This may take a moment.")
+    prompt = ("Create complete, useful content for a Microsoft Word document based on this request. "
+              "Return Markdown-like text only, with a clear title as the first # heading, sensible headings, concise paragraphs, bullet/numbered lists, and pipe tables when comparison data helps. "
+              "Use accurate details; do not invent citations, references, quotations, or data. If references are requested, cite only sources you can identify reliably; otherwise clearly flag what needs verification. "
+              "Include useful diagram descriptions or simple text flowcharts when appropriate, but do not claim an image is embedded. "
+              "Keep the document suitable for editing in Word and avoid LaTeX-heavy notation.\n\nUser request: " + request_text)
+    try:
+        content = ai_call(prompt, user, max_output_tokens=5000)
+        if not content or content.startswith(("AI request failed", "AI is not configured", "You've reached")):
+            return send_text(user, "I couldn't generate the document content because the AI provider is unavailable or rate-limited. No file was created.")
+        title_match = re.search(r"(?m)^#\s+(.+)$", content)
+        title = title_match.group(1).strip()[:180] if title_match else request_text[:100]
+        data = build_docx_bytes(title, content)
+        filename = _docx_filename(title)
+        if send_docx_bytes(user, data, filename, f"{title}\nEditable Microsoft Word document created by ARIA."):
+            send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting. Review facts/references before submitting or publishing.")
+            return True
+        return False
+    except Exception as e:
+        print("[DOCX GENERATION ERROR]", type(e).__name__, str(e)[:600])
+        send_text(user, "I couldn't finish the Word document. Check the server log for the DOCX generation error.")
+        return False
 
 # ============================================================
 # AI / MEMORY
@@ -753,11 +1060,11 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` and `.imagine <prompt>` generate a new image through the configured Pollinations endpoint. `.image` is NOT image generation.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` create a new image. ARIA routes anime, realistic, fantasy, poster and general requests to configurable image models; Pollinations API key enables the current authenticated endpoint, with a legacy endpoint fallback. Image generation may consume provider credits. `.image` is NOT image generation.",
         "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
-        "Documents: send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX, then ask questions about the latest document; `.doc <question>` is also available.",
+        "Documents: `.docx <request>` creates an editable Word file and sends it back in WhatsApp. DOCX generation supports headings, bullets, numbered lists, tables, quotes and code blocks. Send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX to ask questions about it; `.doc <question>` remains available.",
         "Live web information: `.search <question>`, `.news <topic>`, `.verify <claim>`, and automatic live search for recognized time-sensitive questions when configured. Live search uses Gemini with Google Search grounding and/or Exa search, depending on configuration, and may fail or hit quota; failure is flagged before an offline fallback.",
         "Reminders: `.remind me to <task> at <time>`, `.reminders`, and `.remind cancel <id>`.",
         "Guided workflows: `.task <goal>` creates a short plan; `.task next`, `.task done`, `.task status`, and `.task cancel` help the user progress through it. Workflow steps are guidance, not permission to perform arbitrary actions.",
@@ -776,6 +1083,7 @@ def build_tool_awareness_context():
         f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; model={GEMINI_MODEL}; Gemini-backed live search and vision fallback require this key.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa is a live-search provider, not an AI chat model.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
+        f"Image generation provider={IMAGE_PROVIDER}; Pollinations API key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}; Gemini image model={GEMINI_IMAGE_MODEL} ({'key present' if GEMINI_API_KEY else 'key missing'}); Pollinations style models anime={IMAGE_MODEL_ANIME}, realistic={IMAGE_MODEL_REALISTIC}, fantasy={IMAGE_MODEL_FANTASY}, poster={IMAGE_MODEL_POSTER}, general={IMAGE_MODEL_GENERAL}.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -864,32 +1172,32 @@ def _extract_gemini_text(data):
     return "\n".join(texts).strip()
 GEMINI_API_URL="https://generativelanguage.googleapis.com/v1beta/models/"
 
-def gemini_call(prompt,system=DEFAULT_SYSTEM_PROMPT,image_data=None,mime_type=None,timeout=45):
+def gemini_call(prompt,system=DEFAULT_SYSTEM_PROMPT,image_data=None,mime_type=None,timeout=45,max_output_tokens=1024):
     if not GEMINI_API_KEY:raise RuntimeError("GEMINI_API_KEY is missing")
     parts=[]
     if image_data:parts.append({"inline_data":{"mime_type":mime_type,"data":image_data}})
-    parts.append({"text":prompt}); payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":1024,"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
+    parts.append({"text":prompt}); payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":max(1,min(8192,int(max_output_tokens))),"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
     r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout); r.raise_for_status(); text=_extract_gemini_text(r.json())
     if not text:raise ValueError("Gemini returned an empty response")
     return text
 
-def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT):
+def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
-    c=client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=1024,top_p=.95,stream=False); text=_extract_groq_text(c)
+    c=client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=max(1,min(8192,int(max_tokens))),top_p=.95,stream=False); text=_extract_groq_text(c)
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
-def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT):
+def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
     if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
     ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
     # Make both chat providers aware of ARIA's real, existing capabilities.
     # This is descriptive context only; command execution stays in the Flask handlers.
     tool_aware_system = system + "\n\n" + build_tool_awareness_context()
     if client:
-        try:return groq_chat_call(full,tool_aware_system)
+        try:return groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
         except Exception as e:errors.append(f"Groq: {e}")
     if GEMINI_API_KEY:
-        try:return gemini_call(full,tool_aware_system)
+        try:return gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
         except Exception as e:errors.append(f"Gemini: {e}")
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors))); return "AI request failed.\n\nBoth configured AI providers failed. Use `.health` to see their status." if (client or GEMINI_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY or GEMINI_API_KEY to Render."
 
@@ -1259,7 +1567,8 @@ LIVE WEB (Gemini / Exa)
 • Time-sensitive questions may trigger automatic live search
 
 IMAGE TOOLS — CREATE A NEW IMAGE
-• .create <prompt>
+• .create <prompt> (auto-routes image style)
+• .create --style anime|realistic|fantasy|poster|general <prompt>
 • .imagine <prompt> (legacy alias)
 
 IMAGE TOOLS — FIND EXISTING IMAGES
@@ -1276,6 +1585,7 @@ IMAGE TOOLS — ANALYZE AN IMAGE
 • .verify (checks visible AI/editing indicators and may fact-check claims in the image)
 
 DOCUMENTS
+• .docx <request> (create an editable Word document)
 • Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX
 • Ask questions about the latest document
 • .doc <question>
@@ -1314,7 +1624,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -1768,6 +2078,12 @@ def get_diagnostics(user):
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
     checks.append(("Pinterest token",bool(PINTEREST_ACCESS_TOKEN)))
+    checks.append(("Pollinations image API key",bool(POLLINATIONS_API_KEY)))
+    try:
+        from docx import Document as _DocxDependencyCheck
+        checks.append(("DOCX generation dependency",True))
+    except Exception:
+        checks.append(("DOCX generation dependency",False))
     lines=["〔 *ARIA JARVIS DIAGNOSTICS* 〕",f"Version: {VERSION}",f"Runtime: {get_runtime()}",f"Jarvis routing: {'ENABLED' if JARVIS_ENABLED else 'DISABLED'}", "", "*Configuration checks*"]
     lines.extend([f"{'✓' if ok else '⚠'} {name}: {'configured' if ok else 'missing / disabled'}" for name,ok in checks])
     lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"Vision route: {'Groq primary + Gemini fallback when configured' if client or GEMINI_API_KEY else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
@@ -1778,7 +2094,7 @@ def get_diagnostics(user):
     lines.append("⚠ A configured key or model name is not proof that a provider endpoint works; use the live checks above.")
     return "\n".join(lines)
 
-_CONTROL_PREFIXES=(".pending",".deny",".access",".livetest",".allow",".unallow",".remind",".health",".status",".menu",".about",".help",".voice",".users",".ban",".unban",".image",".task",".diagnostics",".describe",".verify",".solve",".math",".read",".pint",".photo",".wallpaper",".anime",".comic",".edu",".pinterest",".play",".create",".imagine",".doc")
+_CONTROL_PREFIXES=(".pending",".deny",".access",".livetest",".allow",".unallow",".remind",".health",".status",".menu",".about",".help",".voice",".users",".ban",".unban",".image",".task",".diagnostics",".describe",".verify",".solve",".math",".read",".pint",".photo",".wallpaper",".anime",".comic",".edu",".pinterest",".play",".create",".imagine",".docx",".word",".doc")
 def _is_control_command(tl):return tl.startswith(_CONTROL_PREFIXES)
 
 def _send_vision_for_user(user,command):
@@ -2017,14 +2333,23 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>`.",".access":"Show your own access status.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>`.",".access":"Show your own access status.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
-            prompt=text.split(None,1)[1].strip()[:500]
+            args=text.split(None,1)[1].strip()[:1200]; explicit_style=None
+            style_match=re.match(r"^--style\s+(anime|realistic|fantasy|poster|general)\s+(.+)$",args,re.I)
+            if style_match: explicit_style=style_match.group(1).lower(); args=style_match.group(2).strip()
+            if not args:send_text(user,"Usage: `.create <prompt>` or `.create --style anime|realistic|fantasy|poster|general <prompt>`");return "OK",200
             if not check_rate_limit(user,"create"):send_text(user,"You've reached the hourly image limit. Try again later.");return "OK",200
-            imagine_generate(user,prompt);return "OK",200
-        if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>`\n\nExample: `.create cyberpunk city at night`");return "OK",200
+            imagine_generate(user,args,explicit_style);return "OK",200
+        if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>`\nOr choose a style: `.create --style anime|realistic|fantasy|poster|general <prompt>`");return "OK",200
+        if tl.startswith((".docx ",".word ")) or tl in {".docx",".word"}:
+            request_text=text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ""
+            create_docx_for_user(user,request_text);return "OK",200
+        if re.match(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b",tl):
+            request_text=re.sub(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b", "", text, count=1, flags=re.I).strip(" :,-")
+            create_docx_for_user(user,request_text or "Create a concise document based on my request.");return "OK",200
         if tl.startswith(".explain") or re.match(r"^explain\s+.+\s+[1-6]$",tl):
             ct=text[1:] if text.startswith(".") else text; sp=ct.split(None,1); args=sp[1].strip() if len(sp)>1 else ""
             mm=re.match(r"^(.+?)\s+([1-6])$",args)
@@ -2072,9 +2397,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
 
 
 
