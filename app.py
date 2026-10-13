@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.2.1 (v17.2 maintenance: model runtime identity, Exa-first search, deployment diagnostics)
+# VERSION 17.2.2 (approval menu, WhatsApp-friendly maths, persistent-by-default access)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.2.1"
+VERSION = "v17.2.2"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -88,7 +88,7 @@ PASSWORD = ARIA_PASSWORD or None
 if not PASSWORD: print("[WARNING] ARIA_PASSWORD is not set. Password login is disabled.")
 MAX_TRIES = 4
 auth_tries, voice_enabled_users, BANNED_USERS = {}, set(), set()
-try:ACCESS_DAYS=max(0,int((os.getenv("ACCESS_DAYS","30") or "30").strip()))   # default access length; 0 = never expires
+try:ACCESS_DAYS=max(0,int((os.getenv("ACCESS_DAYS","0") or "0").strip()))   # default access length; 0 = never expires
 except ValueError:ACCESS_DAYS=30
 try: MAX_PENDING_REQUESTS=max(1,int((os.getenv("MAX_PENDING_REQUESTS","50") or "50").strip()))
 except ValueError: MAX_PENDING_REQUESTS=50
@@ -186,6 +186,24 @@ def save_memory():
     if REMOTE_ENABLED:
         _dirty=True
         if sorted(BANNED_USERS)!=_last_banned: flush_remote(bans_only=True)
+
+def upstash_status_line():
+    """Verify the configured Upstash REST endpoint can write and read a temporary test value."""
+    if not REMOTE_ENABLED:
+        return "NOT CONFIGURED — local data may be lost on redeploy"
+    key=f"aria:healthcheck:{uuid.uuid4().hex}"
+    probe=uuid.uuid4().hex
+    try:
+        remote_cmd("SET",key,probe,"EX",30)
+        found=remote_cmd("GET",key)
+        try:remote_cmd("DEL",key)
+        except Exception:pass  # TTL also cleans up the probe if deletion fails.
+        if found==probe:
+            return "CONNECTED (temporary read/write test OK)"
+        return "CONNECTION REACHED, BUT READ/WRITE TEST FAILED — persistence is not confirmed"
+    except Exception as e:
+        print("[UPSTASH HEALTH ERROR]",type(e).__name__)
+        return f"CONNECTION FAILED ({type(e).__name__}) — persistence is not confirmed"
 
 def _remote_flusher():
     while True:
@@ -732,9 +750,42 @@ def vision_call(image_url,prompt,mime_type=None):
         except Exception as e:print("[VISION GEMINI ERROR]",repr(e))
     return "I couldn't process that image.\n\nBoth configured vision providers failed. Use `.health` to see their status."
 
+def format_math_for_whatsapp(text):
+    """Turn common model LaTeX output into readable WhatsApp plain text."""
+    t=str(text or "").strip()
+    # Remove display/inline math wrappers first.
+    t=re.sub(r"\\(?:\[|\])", "", t)
+    t=re.sub(r"\\\(|\\\)", "", t)
+    t=t.replace("$$", "").replace("$", "")
+    # LaTeX uses a double backslash for a line break; WhatsApp should get a real newline.
+    t=t.replace("\\\\", "\n")
+    # Strip layout-only LaTeX commands and normalize common operators.
+    t=re.sub(r"\\(?:begin|end)\\?\{[^{}]*\}", "", t)
+    t=re.sub(r"\\(?:left|right|displaystyle|textstyle|quad|qquad|,|;|!|:)", " ", t)
+    replacements={r"\times":"×",r"\cdot":"·",r"\div":"÷",r"\pm":"±",r"\neq":"≠",r"\leq":"≤",r"\le":"≤",r"\geq":"≥",r"\ge":"≥",r"\approx":"≈",r"\infty":"infinity",r"\pi":"pi",r"\rightarrow":"->",r"\to":"->",r"\therefore":"Therefore,",r"\because":"Because",r"\%":"%"}
+    for a,b in replacements.items():t=t.replace(a,b)
+    # Unwrap common one-level formatting commands.
+    for _ in range(3):
+        t=re.sub(r"\\(?:boxed|text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}",r"\1",t)
+        t=re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}",r"(\1)/(\2)",t)
+        t=re.sub(r"\\sqrt\{([^{}]*)\}",r"sqrt(\1)",t)
+    # Replace common Greek commands and remove remaining command slashes without deleting names.
+    greek={r"\alpha":"alpha",r"\beta":"beta",r"\theta":"theta",r"\pi":"pi",r"\lambda":"lambda",r"\mu":"mu",r"\sigma":"sigma",r"\Delta":"Delta",r"\delta":"delta",r"\omega":"omega"}
+    for a,b in greek.items():t=t.replace(a,b)
+    t=re.sub(r"\\([A-Za-z]+)",r"\1",t)
+    t=t.replace("{", "").replace("}", "")
+    t=re.sub(r"[ 	]+", " ", t)
+    t=re.sub(r" *\n *", "\n", t)
+    t=re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
 def solve_image_problem(image_url,mime_type=None,mode="universal"):
-    prompt="""You are ARIA's dedicated mathematics solver. Read the image carefully and solve the visible mathematical problem. Use 〔 SOLUTION 〕, Given/question, Method or formula, Key working steps, Final answer. If something is unreadable, say so instead of guessing.""" if mode=="math" else """You are ARIA's universal image-problem solver. Identify whether the image contains mathematics, physics, chemistry, biology, English, multiple choice, logic, a diagram or another academic/practical task, then solve it. Use 〔 SOLUTION 〕, Problem type, Question, Method/formula/rule, Important working, then 〔 ANSWER 〕. Do not invent unreadable text."""
-    return vision_call(image_url,prompt,mime_type)
+    if mode=="math":
+        prompt=r"""You are ARIA's careful mathematics tutor solving a problem from an image. First transcribe the question accurately; if any symbol or number is unreadable, explicitly say which part is unclear instead of guessing. Solve it step by step and verify the result. Format specifically for WhatsApp plain text: use short headings, numbered steps, and ordinary readable equations. Do NOT output LaTeX, Markdown math delimiters, dollar signs, \( \), \[ \], \frac, \boxed, HTML, tables, or programming notation. Write fractions as (numerator)/(denominator), powers with ^ (for example x^2), square roots as sqrt(...), multiplication as × or *, and division as ÷ or /. End with a clearly labelled FINAL ANSWER. Keep notation simple and readable on a phone."""
+    else:
+        prompt="""You are ARIA's universal image-problem tutor. Identify whether the image contains mathematics, physics, chemistry, biology, English, multiple choice, logic, a diagram or another academic task, then solve it accurately. Transcribe the question first; if anything is unreadable, say so instead of guessing. Use concise WhatsApp plain text, numbered steps and ordinary readable equations. Do NOT output LaTeX, math delimiters, dollar signs, HTML, or tables. Use 〔 SOLUTION 〕, Problem type, Question, Method/formula/rule, Important working, then 〔 ANSWER 〕."""
+    result=vision_call(image_url,prompt,mime_type)
+    return format_math_for_whatsapp(result) if mode=="math" else result
 
 def download_whatsapp_audio(media_id):
     if not WHATSAPP_TOKEN or not media_id:raise RuntimeError("WhatsApp audio credentials/media are missing")
@@ -1061,7 +1112,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* {'UPSTASH CONFIGURED (connection not live-verified)' if REMOTE_ENABLED else 'LOCAL ONLY — may be lost on redeploy'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)} ({'Upstash' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Fallback:* {'ENABLED' if GEMINI_API_KEY else 'DISABLED'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -1593,7 +1644,8 @@ def process_webhook(data):
                     if parts[2].isdigit() and int(parts[2])<=3650:days=int(parts[2])
                     else:send_text(user,"Days must be a number (0 = never expires).");return "OK",200
                 BANNED_USERS.discard(target);grant_access(target,days,by="owner");send_text(user,f"✅ Allowed: {target} ({_days_label(days)}).")
-                send_text(target,f"✅ Your access to ARIA has been approved ({_days_label(days)}). Send `.menu` to get started.")
+                send_text(target,f"✅ Your access to ARIA has been approved ({_days_label(days)}). Here is your command menu:")
+                send_text(target,get_menu())
             elif cmd==".deny":
                 if target==OWNER_NUMBER or target in ADMIN_NUMBERS or target in ALLOWED_USERS:
                     send_text(user,f"{target} has permanent owner/admin/allowed-list access. Use `.ban {target}` if you need to block that number.")
@@ -1672,7 +1724,7 @@ def process_webhook(data):
             r=handle_task_command(user,text);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
 
         if tl==".health":
-            health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory:* {'UPSTASH CONFIGURED (connection not live-verified)' if REMOTE_ENABLED else 'LOCAL ONLY - may be lost on redeploy'}\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
+            health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
 
         if tl.startswith(".verify "):
             claim=text[8:].strip()[:1000]
@@ -1797,6 +1849,8 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
 
 
 
