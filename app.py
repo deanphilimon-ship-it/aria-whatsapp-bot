@@ -1,3 +1,4 @@
+
 from flask import Flask, request
 import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile
 from collections import OrderedDict, defaultdict
@@ -10,7 +11,7 @@ from groq import Groq
 # VERSION 17.3.1 (Mistral chat option, per-user model choice, provider timing)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.4.0-security-candidate"
+VERSION = "v17.5.0-workflow-image-security-candidate"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -2368,6 +2369,74 @@ def _send_vision_for_user(user,command):
     else:r=vision_call(u,"Describe this image naturally for WhatsApp. Mention setting, objects, actions, colors, composition and readable text only when legible. Do not guess identities.",mime)
     add_to_memory(user,"assistant",r);send_text(user,r)
 
+# ============================================================
+# Natural-language routing and once-per-release announcement
+# ============================================================
+RELEASE_ANNOUNCEMENT_VERSION = os.getenv("RELEASE_ANNOUNCEMENT_VERSION", "v17.5.0")
+RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+def _send_release_announcement_once(user):
+    """Persist a per-user release marker through ARIA's existing profile/memory store."""
+    if not RELEASE_ANNOUNCEMENT_ENABLED or not user:
+        return
+    profile = user_profile.setdefault(str(user), {})
+    if not isinstance(profile, dict):
+        profile = {}; user_profile[str(user)] = profile
+    marker = profile.get("release_announcement_version")
+    if marker == RELEASE_ANNOUNCEMENT_VERSION:
+        return
+    message = (
+        f"✨ ARIA has been updated ({RELEASE_ANNOUNCEMENT_VERSION})!\n\n"
+        "You can now ask for supported tasks in normal language—such as creating an image, "
+        "doing quick research, or getting guided help—without memorizing commands. "
+        "Commands still work too.\n\n"
+        "Example: ‘Create an anime-style picture of a knight under a moonlit sky.’"
+    )
+    # Mark only after send_text returns without raising. WhatsApp's 24-hour service window
+    # still applies; this function is called only in response to an inbound user message.
+    try:
+        send_text(user, message)
+        profile["release_announcement_version"] = RELEASE_ANNOUNCEMENT_VERSION
+        save_memory()
+    except Exception as e:
+        print("[RELEASE ANNOUNCEMENT ERROR]", repr(e)[:200])
+
+def _natural_image_generation_prompt(text):
+    """Return a bounded image prompt only for clear create/generate/draw requests."""
+    t=(text or "").strip()
+    if not t or t.startswith(".") or len(t)>1200:
+        return None
+    low=t.lower()
+    # Require both a generation verb and an explicit visual-art noun to avoid confusing
+    # image questions or requests to fetch an existing image with generation.
+    if not re.search(r"\b(?:create|generate|draw|make|imagine|design)\b", low):
+        return None
+    if not re.search(r"\b(?:image|picture|photo|artwork|art|illustration|wallpaper|portrait|poster|drawing)\b", low):
+        return None
+    if re.search(r"\b(?:find|search for|look for|get me|show me|send me)\b", low):
+        return None
+    prompt=re.sub(r"^(?:hey\s+)?(?:aria[,! ]*)?(?:please\s+)?(?:can you\s+|could you\s+|would you\s+)?(?:please\s+)?(?:create|generate|draw|make|imagine|design)\s+(?:me\s+)?(?:an?\s+|some\s+)?", "", t, count=1, flags=re.I).strip(" .!?\n")
+    prompt=re.sub(r"^(?:an?\s+)?(?:image|picture|photo|artwork|art|illustration|wallpaper|portrait|poster|drawing)\s+(?:of|showing|depicting)\s+", "", prompt, count=1, flags=re.I).strip()
+    if len(prompt)<3:
+        return None
+    return prompt[:1000]
+
+def _natural_research_query(text):
+    """Recognize explicit research/lookup requests without hijacking ordinary questions."""
+    t=(text or "").strip()
+    if not t or t.startswith(".") or len(t)>700:
+        return None
+    low=t.lower()
+    patterns=(r"^(?:please\s+)?(?:do|conduct|carry out|run)\s+(?:a\s+)?(?:quick\s+)?research\s+(?:on|about|into)\s+",
+              r"^(?:please\s+)?research\s+(?:on|about|into)\s+",
+              r"^(?:please\s+)?(?:look up|find recent research on|search the web for|do a quick search on)\s+")
+    for pattern in patterns:
+        m=re.match(pattern,t,flags=re.I)
+        if m:
+            q=t[m.end():].strip(" .!?\n")
+            return q[:500] if len(q)>=3 else None
+    return None
+
 @app.route("/webhook",methods=["GET","POST"])
 def webhook():
     if request.method=="GET":
@@ -2411,6 +2480,7 @@ def process_webhook(data):
             if auth:send_text(user,auth)
             return "OK",200
         if auth:send_text(user,auth);send_text(user,get_menu());return "OK",200
+        _send_release_announcement_once(user)
         security_reply = owner_security_command(user, text)
         if security_reply is not None:
             send_text(user, security_reply)
@@ -2632,7 +2702,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>`.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model mistral`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model mistral`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -2670,6 +2740,25 @@ def process_webhook(data):
         if re.match(r"^\.(?:doc|document)(?:\s|$)",tl) or (get_document_context(user) and tl.startswith(("document ","ask document"))):
             q=re.sub(r"^\.?(?:ask\s+)?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
             r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+        # Natural-language image generation: users do not need to know .create/.imagine.
+        natural_image_prompt = _natural_image_generation_prompt(text)
+        if natural_image_prompt:
+            if not check_rate_limit(user,"create"):
+                send_text(user,"You've reached the hourly image limit. Try again later.");return "OK",200
+            imagine_generate(user,natural_image_prompt,None);return "OK",200
+        # Natural-language research: explicit requests use the existing live-search stack.
+        research_query = _natural_research_query(text)
+        if research_query:
+            if not LIVE_ENABLED:
+                send_text(user,"Live research isn't configured yet. The owner can enable EXA_API_KEY or GEMINI_API_KEY.");return "OK",200
+            if not check_rate_limit(user,"live"):
+                send_text(user,"You've reached the hourly research limit. Try again later.");return "OK",200
+            send_text(user,"🌐 I'll research that and summarize the useful findings...")
+            try:
+                result = smart_ask("Research this topic using current sources. Summarize the main findings in 4-6 concise bullets, include dates where relevant, distinguish evidence from uncertainty, and include source links when available. Topic: " + research_query,user,force=True,query=research_query)
+            except Exception as e:
+                print("[NATURAL RESEARCH ERROR]",repr(e)[:300]);result="I couldn't complete that research request just now. Please try again shortly or use `.search <question>`."
+            add_to_memory(user,"assistant",result);send_text(user,result);return "OK",200
         # Jarvis automatic routing: prefer an explicit request to fetch an image, then image Q&A.
         if jarvis_route_media(user,text):
             return "OK",200
@@ -2696,3 +2785,14 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
