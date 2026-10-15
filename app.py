@@ -11,7 +11,7 @@ from groq import Groq
 # VERSION 17.3.1 (Mistral chat option, per-user model choice, provider timing)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.5.0-quota-message-candidate"
+VERSION = "v17.5.0"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
