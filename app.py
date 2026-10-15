@@ -11,7 +11,7 @@ from groq import Groq
 # VERSION 17.3.1 (Mistral chat option, per-user model choice, provider timing)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.5.0-workflow-image-security-candidate"
+VERSION = "v17.5.0-quota-message-candidate"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -1425,34 +1425,80 @@ def model_command_reply(from_number, argument=""):
     save_memory()
     return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
 
+def _provider_quota_notice(provider, exc, fallback=None):
+    """Return a clear notice only when an exception looks like quota/rate limiting."""
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    body = getattr(response, "text", "") or ""
+    code = getattr(exc, "code", "") or ""
+    detail = f"{exc} {body} {code}".lower()
+    quota_markers = (
+        "insufficient_quota", "quota exceeded", "quota limit", "resource_exhausted",
+        "rate_limit_exceeded", "rate limit", "usage limit", "tokens per minute",
+        "requests per minute", "billing hard limit", "exceeded your current quota",
+    )
+    if not (status in (402, 429) or any(marker in detail for marker in quota_markers)):
+        return ""
+    target = f" I used {fallback} for this reply instead." if fallback else " No fallback provider could complete the request."
+    print(f"[AI QUOTA] provider={provider} status={status or 'unknown'} fallback={fallback or 'none'}")
+    return (f"⏳ {provider} has hit its API usage or rate limit.{target} "
+            "Please try again after the limit resets. If it keeps happening, check the provider's usage and billing settings.\n\n")
+
+
+def _fallback_notice(provider, exc, fallback):
+    quota_notice = _provider_quota_notice(provider, exc, fallback)
+    if quota_notice:
+        return quota_notice
+    return f"⚠️ {provider} is unavailable, so I answered using {fallback} instead.\n\n"
+
+
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
-    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
-    # Provider-specific selection affects normal text chat only. Existing command, vision,
-    # voice, live-search and image-generation handlers remain on their current paths.
+    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):
+        return "You've reached the hourly AI limit. Please try again in a while."
+    ctx=build_memory_context(from_number,prompt,skip_last_user=True)
+    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
+    errors=[]
+    failures=[]
     tool_aware_system = system + "\n\n" + build_tool_awareness_context()
     preference=get_user_chat_model(from_number)
+
     if preference=="mistral":
-        try:return mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-        except Exception as e:
-            errors.append(f"Mistral: {type(e).__name__}: {e}")
-            if client:
-                try:return "⚠️ Mistral is unavailable, so I answered using Groq instead.\n\n"+groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-                except Exception as ge:errors.append(f"Groq fallback: {type(ge).__name__}: {ge}")
-            if GEMINI_API_KEY:
-                try:return "⚠️ Mistral is unavailable, so I answered using Gemini instead.\n\n"+gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
-                except Exception as ge:errors.append(f"Gemini fallback: {type(ge).__name__}: {ge}")
+        providers=[("Mistral", lambda: mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens))]
+        if client: providers.append(("Groq", lambda: groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
+        if GEMINI_API_KEY: providers.append(("Gemini", lambda: gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)))
     else:
-        if client:
-            try:return groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-            except Exception as e:errors.append(f"Groq: {type(e).__name__}: {e}")
-        if GEMINI_API_KEY:
-            try:return gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
-            except Exception as e:errors.append(f"Gemini: {type(e).__name__}: {e}")
-        if MISTRAL_API_KEY:
-            try:return mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-            except Exception as e:errors.append(f"Mistral: {type(e).__name__}: {e}")
+        providers=[]
+        if client: providers.append(("Groq", lambda: groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
+        if GEMINI_API_KEY: providers.append(("Gemini", lambda: gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)))
+        if MISTRAL_API_KEY: providers.append(("Mistral", lambda: mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
+
+    for index,(provider,call_provider) in enumerate(providers):
+        try:
+            result=call_provider()
+            if failures:
+                # Always explain a Mistral-to-fallback switch; for other routes, surface
+                # quota exhaustion without adding noise for ordinary transient failures.
+                first_provider,first_error=failures[0]
+                if preference=="mistral" and first_provider=="Mistral":
+                    return _fallback_notice(first_provider,first_error,provider)+result
+                for failed_provider,failed_error in failures:
+                    notice=_provider_quota_notice(failed_provider,failed_error,provider)
+                    if notice:return notice+result
+            return result
+        except Exception as exc:
+            failures.append((provider,exc))
+            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            print(f"[AI PROVIDER ERROR] provider={provider} error_type={type(exc).__name__}")
+
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors)))
+    quota_providers=[]
+    for provider,exc in failures:
+        if _provider_quota_notice(provider,exc,None):
+            quota_providers.append(provider)
+    if quota_providers:
+        names=" and ".join(dict.fromkeys(quota_providers))
+        verb="has" if len(set(quota_providers))==1 else "have"
+        return f"⏳ {names} {verb} hit an API usage or rate limit. Please try again after the limit resets. If it keeps happening, check the provider usage and billing settings."
     return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.health` to check ARIA." if (client or GEMINI_API_KEY or MISTRAL_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY, MISTRAL_API_KEY or GEMINI_API_KEY to Render."
 
 # ============================================================
@@ -2785,6 +2831,9 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
 
 
 
