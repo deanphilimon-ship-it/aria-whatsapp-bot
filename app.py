@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.3.0 (DOCX generation, style-routed images, reply context, plain-text maths)
+# VERSION 17.3.1 (Mistral chat option, per-user model choice, provider timing)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.3.0"
+VERSION = "v17.4.0-security-candidate"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -63,6 +63,11 @@ VERIFY_TOKEN = _env("VERIFY_TOKEN")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_API_KEY = _env("GROQ_API_KEY")
+MISTRAL_API_KEY = _env("MISTRAL_API_KEY")
+MISTRAL_CHAT_MODEL = os.getenv("MISTRAL_CHAT_MODEL", "mistral-small-latest").strip() or "mistral-small-latest"
+MISTRAL_API_URL = os.getenv("MISTRAL_API_URL", "https://api.mistral.ai/v1/chat/completions").strip()
+try: MISTRAL_TIMEOUT = max(8, min(60, int(os.getenv("MISTRAL_TIMEOUT", "35"))))
+except (TypeError, ValueError): MISTRAL_TIMEOUT = 35
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
@@ -125,6 +130,51 @@ api_requests = defaultdict(list)
 _rate_lock = threading.Lock()
 LIMITS = {"pint1":20,"pint2":100,"pint4":20,"pint5":50,"pinterest":20,"create":int(os.getenv("CREATE_LIMIT_PER_HOUR","15")),"docx":int(os.getenv("DOCX_LIMIT_PER_HOUR","5")),"live":int(os.getenv("LIVE_LIMIT_PER_HOUR","20")),"ai":int(os.getenv("AI_LIMIT_PER_HOUR","40")),"vision":int(os.getenv("VISION_LIMIT_PER_HOUR","30"))}
 
+# v17.4 security layer: Redis-backed lock and atomic quotas. These limits are
+# deliberately separate from legacy command-specific LIMITS so existing rules remain.
+def _security_int_env(name, default, minimum=1, maximum=1000000):
+    try:
+        return max(minimum, min(maximum, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+SECURITY_USER_HOURLY_LIMIT = _security_int_env("SECURITY_USER_HOURLY_LIMIT", 100)
+SECURITY_USER_DAILY_LIMIT = _security_int_env("SECURITY_USER_DAILY_LIMIT", 300)
+SECURITY_GLOBAL_HOURLY_LIMIT = _security_int_env("SECURITY_GLOBAL_HOURLY_LIMIT", 200)
+SECURITY_GLOBAL_DAILY_LIMIT = _security_int_env("SECURITY_GLOBAL_DAILY_LIMIT", 1500)
+SECURITY_CATEGORY_LIMITS = {
+    "ai": _security_int_env("SECURITY_AI_LIMIT_PER_HOUR", 40),
+    "vision": _security_int_env("SECURITY_VISION_LIMIT_PER_HOUR", 10),
+    "create": _security_int_env("SECURITY_CREATE_LIMIT_PER_HOUR", 5),
+    "docx": _security_int_env("SECURITY_DOCX_LIMIT_PER_HOUR", 5),
+    "live": _security_int_env("SECURITY_LIVE_LIMIT_PER_HOUR", 10),
+    "fetch": _security_int_env("SECURITY_FETCH_LIMIT_PER_HOUR", 20),
+}
+SECURITY_LOCK_KEY = "aria:security:lock"
+SECURITY_COUNTER_PREFIX = "aria:security:quota"
+SECURITY_QUOTA_LUA = r'''local function bump(key, ttl)
+  local n = redis.call('INCR', key)
+  if n == 1 then redis.call('EXPIRE', key, ttl) end
+  return n
+end
+local owner_bypass = ARGV[1] == '1'
+local uh, ud, uc = 0, 0, 0
+if not owner_bypass then
+  uh = bump(KEYS[1], tonumber(ARGV[7]))
+  ud = bump(KEYS[2], tonumber(ARGV[8]))
+  uc = bump(KEYS[3], tonumber(ARGV[7]))
+  if uh > tonumber(ARGV[2]) or ud > tonumber(ARGV[3]) or uc > tonumber(ARGV[4]) then
+    return {0, 'USER_LIMIT', uh, ud, uc, 0, 0}
+  end
+end
+local gh = bump(KEYS[4], tonumber(ARGV[7]))
+local gd = bump(KEYS[5], tonumber(ARGV[8]))
+if gh > tonumber(ARGV[5]) or gd > tonumber(ARGV[6]) then
+  return {0, 'GLOBAL_LIMIT', uh, ud, uc, gh, gd}
+end
+return {1, 'OK', uh, ud, uc, gh, gd}
+''' 
+
 def check_rate_limit(number, api_name):
     now=time.time(); key=f"{number}_{api_name}"
     with _rate_lock:
@@ -144,6 +194,146 @@ _memory_lock=threading.Lock(); _remote_lock=threading.Lock(); _dirty=False; _las
 
 def remote_cmd(*args):
     r=requests.post(UPSTASH_URL,headers={"Authorization":f"Bearer {UPSTASH_TOKEN}"},json=list(args),timeout=5); r.raise_for_status(); return r.json().get("result")
+
+
+def read_security_lock():
+    """Read the persistent global lock. Unknown/unavailable state is treated as locked."""
+    if not REMOTE_ENABLED:
+        return {"ok": False, "locked": True, "reason": "Upstash is not configured"}
+    try:
+        value = remote_cmd("GET", SECURITY_LOCK_KEY)
+        if value is None or value == "UNLOCKED":
+            return {"ok": True, "locked": False, "reason": ""}
+        if value == "LOCKED":
+            return {"ok": True, "locked": True, "reason": "owner lock"}
+        # Any unrecognized persisted value fails closed rather than opening access.
+        return {"ok": False, "locked": True, "reason": "unrecognized lock state"}
+    except Exception as exc:
+        print("[SECURITY STATE ERROR]", type(exc).__name__)
+        return {"ok": False, "locked": True, "reason": "Upstash security state unavailable"}
+
+
+def set_security_lock(locked):
+    """Persist the owner lock without a TTL so restarts cannot silently unlock ARIA."""
+    if not REMOTE_ENABLED:
+        return False, "Upstash Redis is not configured. Security lock was not changed."
+    try:
+        remote_cmd("SET", SECURITY_LOCK_KEY, "LOCKED" if locked else "UNLOCKED")
+        # Verify the write rather than claiming success on an unconfirmed update.
+        check = remote_cmd("GET", SECURITY_LOCK_KEY)
+        expected = "LOCKED" if locked else "UNLOCKED"
+        if check != expected:
+            return False, "Redis did not confirm the new lock state. No success was reported."
+        return True, ""
+    except Exception as exc:
+        print("[SECURITY LOCK WRITE ERROR]", type(exc).__name__)
+        return False, "Could not verify the lock change because Upstash is unavailable. Try again after restoring Redis."
+
+
+def security_quota_check(number, category):
+    """Atomically enforce per-user and global hourly/daily quotas using Upstash EVAL."""
+    if category not in SECURITY_CATEGORY_LIMITS:
+        return True, "OK"
+    if not REMOTE_ENABLED:
+        return False, "SECURITY_STORAGE_UNAVAILABLE"
+    now = int(time.time())
+    hour_bucket, day_bucket = now // 3600, now // 86400
+    safe_user = re.sub(r"\D", "", str(number)) or "unknown"
+    user_hour = f"{SECURITY_COUNTER_PREFIX}:user:{safe_user}:hour:{hour_bucket}"
+    user_day = f"{SECURITY_COUNTER_PREFIX}:user:{safe_user}:day:{day_bucket}"
+    user_category = f"{SECURITY_COUNTER_PREFIX}:user:{safe_user}:category:{category}:hour:{hour_bucket}"
+    global_hour = f"{SECURITY_COUNTER_PREFIX}:global:hour:{hour_bucket}"
+    global_day = f"{SECURITY_COUNTER_PREFIX}:global:day:{day_bucket}"
+    is_owner = bool(OWNER_NUMBER and safe_user == OWNER_NUMBER)
+    try:
+        result = remote_cmd(
+            "EVAL", SECURITY_QUOTA_LUA, 5,
+            user_hour, user_day, user_category, global_hour, global_day,
+            "1" if is_owner else "0",
+            SECURITY_USER_HOURLY_LIMIT, SECURITY_USER_DAILY_LIMIT,
+            SECURITY_CATEGORY_LIMITS[category], SECURITY_GLOBAL_HOURLY_LIMIT,
+            SECURITY_GLOBAL_DAILY_LIMIT, 7200, 172800,
+        )
+        if not isinstance(result, (list, tuple)) or len(result) < 2:
+            return False, "SECURITY_STORAGE_UNAVAILABLE"
+        if int(result[0]) == 1:
+            return True, "OK"
+        return False, str(result[1])
+    except Exception as exc:
+        print("[SECURITY QUOTA ERROR]", type(exc).__name__)
+        return False, "SECURITY_STORAGE_UNAVAILABLE"
+
+
+def classify_security_category(text, msg, user):
+    """Classify provider-consuming work before dispatch; control/help commands are not charged."""
+    tl = (text or "").strip().lower()
+    if not tl:
+        if (msg or {}).get("type") == "audio":
+            return "ai"
+        return None
+    if (msg or {}).get("type") in {"image", "sticker", "reaction", "location", "contacts", "unsupported"}:
+        return None
+    if (msg or {}).get("type") == "audio":
+        return "ai"
+    if tl in {".lock", ".unlock", ".security", ".menu", ".about", ".status", ".access", ".users", ".pending", ".diagnostics", ".help", ".model", ".voice on", ".voice off", ".reminders", ".remind", ".remind list"}:
+        return None
+    if tl.startswith((".lock ", ".unlock ", ".security ", ".help ", ".model ", ".ban ", ".unban ", ".allow ", ".deny ", ".unallow ")):
+        return None
+    if tl.startswith((".create ", ".imagine ")):
+        return "create"
+    if tl.startswith((".docx ", ".word ")) or re.match(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b", tl):
+        return "docx"
+    if tl.startswith((".image ", ".describe ask ")) or tl in {".describe", ".describe detailed", ".read", ".solve", ".math", ".verify"} or tl.startswith((".read ", ".solve ", ".math ", ".verify ")):
+        return "vision" if tl != ".verify" or user_waiting_image.get(user) else "live"
+    if tl.startswith((".search ", ".news ")) or tl.startswith(".livetest"):
+        return "live"
+    if tl.startswith((".photo ", ".wallpaper ", ".anime ", ".comic ", ".edu ", ".pinterest ", ".pint1 ", ".pint2 ", ".pint3 ", ".pint4 ", ".pint5 ", ".pint6 ")):
+        return "fetch"
+    if re.search(r"\b(?:find|get|show|fetch|look\s+for)\b", tl) and re.search(r"\b(?:image|images|picture|pictures|photo|photos|wallpaper|anime|comic|diagram)\b", tl):
+        return "fetch"
+    # Plain-language questions about a recent image are provider-consuming vision work.
+    if user_waiting_image.get(user) and _image_is_fresh(user, NL_VISION_WINDOW) and _looks_like_image_question(text) and not needs_live(text):
+        return "vision"
+    # Other natural-language questions and AI commands go through chat providers.
+    if tl.startswith(".task "):
+        return "ai"
+    if tl.startswith((".remind", ".reminders", ".cancelreminder")) or re.match(r"^(?:please\s+)?remind me\b", tl):
+        return None
+    if tl.startswith((".ban", ".unban", ".allow", ".deny", ".unallow", ".pending", ".users", ".access", ".status", ".menu", ".about", ".voice")):
+        return None
+    return "ai"
+
+
+def owner_security_command(user, text):
+    """Return a reply for owner security commands, or None when not a security command."""
+    tl = (text or "").strip().lower()
+    if tl not in {".lock", ".unlock", ".security"}:
+        return None
+    if not OWNER_NUMBER or user != OWNER_NUMBER:
+        return "Owner only command."
+    if tl == ".lock":
+        ok, error = set_security_lock(True)
+        return "🔒 ARIA is now LOCKED. Only the owner can use it until you send `.unlock`." if ok else "⚠️ " + error
+    if tl == ".unlock":
+        ok, error = set_security_lock(False)
+        return "🔓 ARIA is now UNLOCKED. The allowlist, authentication, bans and usage limits still apply." if ok else "⚠️ " + error
+    state = read_security_lock()
+    if not state["ok"]:
+        lock_line = "LOCKED / security state unavailable (fail-closed)"
+    else:
+        lock_line = "LOCKED" if state["locked"] else "UNLOCKED"
+    if not REMOTE_ENABLED:
+        redis_line = "NOT CONFIGURED — ordinary users are blocked by fail-closed security"
+    else:
+        redis_line = "configured; lock and quota state must be reachable"
+    return ("〔 ARIA SECURITY STATUS 〕\n\n"
+            f"*Emergency lock:* {lock_line}\n"
+            f"*Upstash:* {redis_line}\n"
+            f"*Per-user:* {SECURITY_USER_HOURLY_LIMIT}/hour, {SECURITY_USER_DAILY_LIMIT}/day\n"
+            f"*Category limits/hour:* AI {SECURITY_CATEGORY_LIMITS['ai']}, vision {SECURITY_CATEGORY_LIMITS['vision']}, "
+            f"image generation {SECURITY_CATEGORY_LIMITS['create']}, documents {SECURITY_CATEGORY_LIMITS['docx']}, "
+            f"live search {SECURITY_CATEGORY_LIMITS['live']}, image fetching {SECURITY_CATEGORY_LIMITS['fetch']}\n"
+            f"*Global cutoff:* {SECURITY_GLOBAL_HOURLY_LIMIT}/hour, {SECURITY_GLOBAL_DAILY_LIMIT}/day")
 
 
 def _prune_reply_context_locked(now=None):
@@ -439,8 +629,12 @@ def check_auth(from_number,text):
         recent=[x for x in pw_fail.get(from_number,[]) if now-x<3600]
         if len(recent)<PASSWORD_MAX_FAILS:
             if hmac.compare_digest(t.encode(),PASSWORD.encode()):
-                pw_fail.pop(from_number,None); grant_access(from_number,by="password"); return True,"Access Granted.\n\nWelcome to ARIA."
-            recent.append(now)
+                # Strict private mode: a shared password never replaces owner approval.
+                # The existing password field remains supported, but a new number must
+                # still be approved through .allow or included in the explicit allowlists.
+                pw_fail.pop(from_number,None)
+            else:
+                recent.append(now)
         pw_fail[from_number]=recent
     # owner-approval request flow
     _pending_cleanup()
@@ -1174,32 +1368,91 @@ GEMINI_API_URL="https://generativelanguage.googleapis.com/v1beta/models/"
 
 def gemini_call(prompt,system=DEFAULT_SYSTEM_PROMPT,image_data=None,mime_type=None,timeout=45,max_output_tokens=1024):
     if not GEMINI_API_KEY:raise RuntimeError("GEMINI_API_KEY is missing")
+    started=time.perf_counter()
     parts=[]
     if image_data:parts.append({"inline_data":{"mime_type":mime_type,"data":image_data}})
     parts.append({"text":prompt}); payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":max(1,min(8192,int(max_output_tokens))),"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
     r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout); r.raise_for_status(); text=_extract_gemini_text(r.json())
+    print(f"[AI LATENCY] provider=gemini model={GEMINI_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
     if not text:raise ValueError("Gemini returned an empty response")
     return text
 
 def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
+    started=time.perf_counter()
     c=client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=max(1,min(8192,int(max_tokens))),top_p=.95,stream=False); text=_extract_groq_text(c)
+    print(f"[AI LATENCY] provider=groq seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
     if not text:raise ValueError("Groq returned an empty response")
     return text
+
+def mistral_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
+    if not MISTRAL_API_KEY:raise RuntimeError("MISTRAL_API_KEY is missing")
+    started=time.perf_counter()
+    payload={"model":MISTRAL_CHAT_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.6,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
+    r=requests.post(MISTRAL_API_URL,headers={"Authorization":f"Bearer {MISTRAL_API_KEY}","Content-Type":"application/json"},json=payload,timeout=MISTRAL_TIMEOUT)
+    r.raise_for_status(); data=r.json(); choices=data.get("choices") or []; message=(choices[0].get("message") or {}) if choices else {}; content=message.get("content")
+    if isinstance(content,list):content="\n".join(str(x.get("text", "")) for x in content if isinstance(x,dict))
+    text=str(content or "").strip()
+    print(f"[AI LATENCY] provider=mistral model={MISTRAL_CHAT_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
+    if not text:raise ValueError("Mistral returned an empty response")
+    return text
+
+def get_user_chat_model(from_number):
+    choice=str(user_profile.get(from_number,{}).get("chat_model","groq")).strip().lower()
+    return choice if choice in {"groq","mistral","auto"} else "groq"
+
+def model_command_reply(from_number, argument=""):
+    choice=argument.strip().lower()
+    if not choice:
+        current=get_user_chat_model(from_number)
+        availability=f"Groq: {'ready' if client else 'not configured'}\nMistral: {'ready' if MISTRAL_API_KEY else 'not configured (needs MISTRAL_API_KEY)'}\nGemini fallback: {'ready' if GEMINI_API_KEY else 'not configured'}"
+        return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current.title()}*\n\n"
+                "Choose one with `.model groq`, `.model mistral`, or `.model auto`.\n"
+                "• Groq — current default, fast responses.\n"
+                "• Mistral — alternative for casual conversation.\n"
+                "• Auto — ARIA tries its configured providers in order.\n\n"
+                f"Provider status:\n{availability}\n\n"
+                "Note: Mistral API free usage depends on your Mistral Studio account's Free mode, available models and limits. Check billing/usage settings before using it.")
+    aliases={"default":"groq","openai":"groq","mistral-small":"mistral","automatic":"auto"}
+    choice=aliases.get(choice,choice)
+    if choice not in {"groq","mistral","auto"}:
+        return "Usage: `.model` · `.model groq` · `.model mistral` · `.model auto`"
+    if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
+    if choice=="mistral" and not MISTRAL_API_KEY:return "Mistral isn't configured yet. Add MISTRAL_API_KEY in Render, redeploy, then use `.model mistral`. Your current preference hasn't changed."
+    if choice=="auto" and not (client or MISTRAL_API_KEY or GEMINI_API_KEY):return "No chat providers are configured yet."
+    user_profile.setdefault(from_number,{})["chat_model"]=choice
+    save_memory()
+    return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
 
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
     if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
     ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
-    # Make both chat providers aware of ARIA's real, existing capabilities.
-    # This is descriptive context only; command execution stays in the Flask handlers.
+    # Provider-specific selection affects normal text chat only. Existing command, vision,
+    # voice, live-search and image-generation handlers remain on their current paths.
     tool_aware_system = system + "\n\n" + build_tool_awareness_context()
-    if client:
-        try:return groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-        except Exception as e:errors.append(f"Groq: {e}")
-    if GEMINI_API_KEY:
-        try:return gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
-        except Exception as e:errors.append(f"Gemini: {e}")
-    print("[AI ERROR SUMMARY]"," | ".join(map(str,errors))); return "AI request failed.\n\nBoth configured AI providers failed. Use `.health` to see their status." if (client or GEMINI_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY or GEMINI_API_KEY to Render."
+    preference=get_user_chat_model(from_number)
+    if preference=="mistral":
+        try:return mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
+        except Exception as e:
+            errors.append(f"Mistral: {type(e).__name__}: {e}")
+            if client:
+                try:return "⚠️ Mistral is unavailable, so I answered using Groq instead.\n\n"+groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
+                except Exception as ge:errors.append(f"Groq fallback: {type(ge).__name__}: {ge}")
+            if GEMINI_API_KEY:
+                try:return "⚠️ Mistral is unavailable, so I answered using Gemini instead.\n\n"+gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
+                except Exception as ge:errors.append(f"Gemini fallback: {type(ge).__name__}: {ge}")
+    else:
+        if client:
+            try:return groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
+            except Exception as e:errors.append(f"Groq: {type(e).__name__}: {e}")
+        if GEMINI_API_KEY:
+            try:return gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
+            except Exception as e:errors.append(f"Gemini: {type(e).__name__}: {e}")
+        if MISTRAL_API_KEY:
+            try:return mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
+            except Exception as e:errors.append(f"Mistral: {type(e).__name__}: {e}")
+    print("[AI ERROR SUMMARY]"," | ".join(map(str,errors)))
+    return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.health` to check ARIA." if (client or GEMINI_API_KEY or MISTRAL_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY, MISTRAL_API_KEY or GEMINI_API_KEY to Render."
 
 # ============================================================
 # VISION / VOICE
@@ -1549,6 +1802,8 @@ def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Respon
 def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
+• .model — choose Groq, Mistral, or Auto for normal conversation
+• .model groq | .model mistral | .model auto
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -1620,11 +1875,13 @@ OWNER
 • .livetest
 • .ban <number>
 • .unban <number>
+• .lock / .unlock (owner-only emergency lock)
+• .security (owner-only security and quota status)
 
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Mistral Chat:* {MISTRAL_CHAT_MODEL} ({'CONFIGURED' if MISTRAL_API_KEY else 'NOT CONFIGURED'})\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -2074,6 +2331,7 @@ def get_diagnostics(user):
     checks.append(("Webhook verify token",bool(VERIFY_TOKEN)))
     checks.append(("Owner number",bool(OWNER_NUMBER)))
     checks.append(("Groq chat/vision key",bool(GROQ_API_KEY)))
+    checks.append(("Mistral optional chat key",bool(MISTRAL_API_KEY)))
     checks.append(("Gemini key",bool(GEMINI_API_KEY)))
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
@@ -2133,13 +2391,51 @@ def process_webhook(data):
         if not msg:return "OK",200
         user=msg.get("from");
         if not user or is_duplicate(msg.get("id")):return "OK",200
+        user = re.sub(r"\D", "", str(user))
         text=(msg.get("text") or {}).get("body","").strip(); tl=text.lower()
+        # Read persistent lock before access-request/authentication handling. If Redis
+        # cannot confirm the state, non-owner requests fail closed and cannot call providers.
+        lock_state = read_security_lock()
+        if not OWNER_NUMBER:
+            print("[SECURITY] Denying request: OWNER_NUMBER is not configured")
+            return "OK",200
+        if user != OWNER_NUMBER:
+            if not lock_state.get("ok"):
+                print("[SECURITY] Denying non-owner request: security state unavailable")
+                return "OK",200
+            if lock_state.get("locked"):
+                send_text(user, "🔒 ARIA is temporarily locked by its owner. Please try again later.")
+                return "OK",200
         ok,auth=check_auth(user,text)
         if not ok:
             if auth:send_text(user,auth)
             return "OK",200
         if auth:send_text(user,auth);send_text(user,get_menu());return "OK",200
+        security_reply = owner_security_command(user, text)
+        if security_reply is not None:
+            send_text(user, security_reply)
+            return "OK",200
         _authed=user
+        # Recheck immediately before dispatch. An operation already in flight when the
+        # owner locks ARIA may finish, but subsequent work is stopped as soon as observed.
+        if user != OWNER_NUMBER:
+            dispatch_lock = read_security_lock()
+            if not dispatch_lock.get("ok") or dispatch_lock.get("locked"):
+                send_text(user, "🔒 ARIA is temporarily unavailable while its security lock is active or cannot be verified.")
+                return "OK",200
+        # Enforce atomic Redis-backed per-user and global quotas before any provider-consuming route.
+        quota_category = classify_security_category(text, msg, user)
+        if quota_category:
+            quota_ok, quota_reason = security_quota_check(user, quota_category)
+            if not quota_ok:
+                if quota_reason == "USER_LIMIT":
+                    message = f"⏳ You've reached your {quota_category} usage limit. Please wait for the hourly/daily window to reset."
+                elif quota_reason == "GLOBAL_LIMIT":
+                    message = "⚠️ ARIA has reached its shared usage ceiling. New AI operations are paused until the quota window resets."
+                else:
+                    message = "🔒 ARIA's security counter is unavailable, so this operation is paused. Please try again later."
+                send_text(user, message)
+                return "OK",200
         # Resolve WhatsApp's native reply metadata before indexing the current message.
         _reply_context_local.prompt = ""
         reply_id=(msg.get("context") or {}).get("id") or (msg.get("context") or {}).get("message_id")
@@ -2329,11 +2625,14 @@ def process_webhook(data):
         for i,handler in enumerate([pint1_unsplash,pint2_pexels,pint3_anime,pint4_comics,pint5_education,pint_pinterest],1):
             if tl.startswith(f".pint{i} "):handler(user,text[len(f".pint{i}"):].strip());return "OK",200
 
+        if tl==".model" or tl.startswith(".model "):
+            arg=text.split(None,1)[1] if len(text.split(None,1))>1 else ""
+            send_text(user,model_command_reply(user,arg));return "OK",200
         if tl==".menu":send_text(user,get_menu());return "OK",200
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>`.",".access":"Show your own access status.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>`.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model mistral`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -2397,14 +2696,3 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
