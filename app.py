@@ -1,4 +1,3 @@
-
 from flask import Flask, request
 import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile
 from collections import OrderedDict, defaultdict
@@ -8,7 +7,7 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.5.1 (Gemini chat replacement for Mistral; voice reply diagnostics retained)
+# VERSION 17.5.1 (Gemini dual-model chat and voice reply fixes)
 # ============================================================
 app = Flask(__name__)
 VERSION = "v17.5.1"
@@ -1385,6 +1384,7 @@ def get_user_chat_model(from_number):
     choice=str(user_profile.get(from_number,{}).get("chat_model","groq")).strip().lower()
     return choice if choice in {"groq","gemini","auto"} else "groq"
 
+
 def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
@@ -1408,37 +1408,77 @@ def model_command_reply(from_number, argument=""):
     save_memory()
     return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
 
+
+
+def _provider_quota_notice(provider, exc, fallback=None):
+    """Return a clear notice only when an exception looks like quota/rate limiting."""
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    body = getattr(response, "text", "") or ""
+    code = getattr(exc, "code", "") or ""
+    detail = f"{exc} {body} {code}".lower()
+    quota_markers = (
+        "insufficient_quota", "quota exceeded", "quota limit", "resource_exhausted",
+        "rate_limit_exceeded", "rate limit", "usage limit", "tokens per minute",
+        "requests per minute", "billing hard limit", "exceeded your current quota",
+    )
+    if not (status in (402, 429) or any(marker in detail for marker in quota_markers)):
+        return ""
+    target = f" I used {fallback} for this reply instead." if fallback else " No fallback provider could complete the request."
+    print(f"[AI QUOTA] provider={provider} status={status or 'unknown'} fallback={fallback or 'none'}")
+    return (f"⏳ {provider} has hit its API usage or rate limit.{target} "
+            "Please try again after the limit resets. If it keeps happening, check the provider's usage and billing settings.\n\n")
+
+
+def _fallback_notice(provider, exc, fallback):
+    quota_notice = _provider_quota_notice(provider, exc, fallback)
+    if quota_notice:
+        return quota_notice
+    return f"⚠️ {provider} is unavailable, so I answered using {fallback} instead.\n\n"
+
+
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
-    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
-    # Provider selection affects normal text chat only. Existing command, vision,
-    # voice, live-search and image-generation handlers keep their dedicated routes.
-    tool_aware_system = system + "\n\n" + build_tool_awareness_context()
+    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):
+        return "You've reached the hourly AI limit. Please try again in a while."
+    ctx=build_memory_context(from_number,prompt,skip_last_user=True)
+    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
+    errors=[]; failures=[]
+    tool_aware_system=system+"\n\n"+build_tool_awareness_context()
     preference=get_user_chat_model(from_number)
-    providers = ["gemini", "groq"] if preference == "gemini" else (["groq", "gemini"] if preference == "auto" else ["groq", "gemini"])
-    for provider in providers:
+    if preference=="gemini":
+        providers=[("Gemini",lambda:gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)),
+                  ("Groq",lambda:groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens))]
+    else:  # groq is the default; auto also tries Groq then Gemini
+        providers=[("Groq",lambda:groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)),
+                  ("Gemini",lambda:gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens))]
+    configured=[]
+    for provider,call_provider in providers:
+        if provider=="Groq" and not client:
+            errors.append("Groq: not configured"); continue
+        if provider=="Gemini" and not GEMINI_API_KEY:
+            errors.append("Gemini: not configured"); continue
+        configured.append(provider)
         try:
-            if provider == "groq":
-                if not client:
-                    errors.append("Groq: not configured")
-                    continue
-                result=groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
-                if errors:
-                    return "⚠️ The preferred provider was unavailable; I answered using Groq instead.\n\n"+result
-                return result
-            if provider == "gemini":
-                if not GEMINI_API_KEY:
-                    errors.append("Gemini: not configured")
-                    continue
-                result=gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
-                if errors:
-                    return "⚠️ The preferred provider was unavailable; I answered using Gemini instead.\n\n"+result
-                return result
-        except Exception as e:
-            errors.append(f"{provider.title()}: {type(e).__name__}: {str(e)[:300]}")
-            print(f"[AI PROVIDER ERROR] provider={provider} type={type(e).__name__} detail={str(e)[:300]}")
+            result=call_provider()
+            if failures:
+                first_provider,first_error=failures[0]
+                notice=_fallback_notice(first_provider,first_error,provider)
+                return notice+result
+            return result
+        except Exception as exc:
+            failures.append((provider,exc))
+            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            print(f"[AI PROVIDER ERROR] provider={provider} error_type={type(exc).__name__} detail={str(exc)[:400]}")
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors)))
-    return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.diagnostics` to check ARIA." if (client or GEMINI_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY and/or GEMINI_API_KEY to Render."
+    quota_providers=[]
+    for provider,exc in failures:
+        if _provider_quota_notice(provider,exc,None): quota_providers.append(provider)
+    if quota_providers:
+        names=" and ".join(dict.fromkeys(quota_providers)); verb="has" if len(set(quota_providers))==1 else "have"
+        return f"⏳ {names} {verb} hit an API usage or rate limit. Please try again after the limit resets. If it keeps happening, check the provider usage and billing settings."
+    if not configured:
+        return "AI is not configured.\n\nAdd GROQ_API_KEY and/or GEMINI_API_KEY to Render."
+    return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.health` to check ARIA."
 
 # ============================================================
 # VISION / VOICE
@@ -1542,11 +1582,13 @@ def transcribe_audio(audio_bytes,mime_type="audio/ogg"):
 def generate_tts_audio(text):
     if not GROQ_API_KEY:raise RuntimeError("GROQ_API_KEY is missing")
     clean=re.sub(r"[*_`#]","",text or "").strip(); clean=re.sub(r"\s+"," ",clean)[:3500]
-    r=requests.post("https://api.groq.com/openai/v1/audio/speech",headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},json={"model":TTS_MODEL,"voice":TTS_VOICE,"input":clean,"response_format":"ogg","speed":1.0},timeout=60); r.raise_for_status(); return r.content
+    r=requests.post("https://api.groq.com/openai/v1/audio/speech",headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},json={"model":TTS_MODEL,"voice":TTS_VOICE,"input":clean,"response_format":"mp3","speed":1.0},timeout=60); r.raise_for_status();
+    if not r.content: raise ValueError("Groq TTS returned empty audio")
+    return r.content
 
 def send_audio_bytes(to,audio_bytes,mime_type="audio/ogg",context_text=""):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:return False
-    r=requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},data={"messaging_product":"whatsapp","type":mime_type},files={"file":("aria_voice.ogg",audio_bytes,mime_type)},timeout=45)
+    r=requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},data={"messaging_product":"whatsapp","type":mime_type},files={"file":("aria_voice.mp3" if mime_type == "audio/mpeg" else "aria_voice.ogg",audio_bytes,mime_type)},timeout=45)
     if not r.ok:
         print("[VOICE MEDIA UPLOAD ERROR]",r.status_code,(r.text or "")[:500])
         return False
@@ -1574,7 +1616,7 @@ def send_voice_reply(to,text):
         if not audio:
             print("[VOICE REPLY ERROR] TTS provider returned empty audio")
             return False
-        return send_audio_bytes(to,audio,context_text=readable)
+        return send_audio_bytes(to,audio,mime_type="audio/mpeg",context_text=readable)
     except Exception as e:
         print("[VOICE REPLY ERROR]",type(e).__name__,str(e)[:700])
         return False
@@ -2340,6 +2382,7 @@ def get_diagnostics(user):
     checks.append(("Webhook verify token",bool(VERIFY_TOKEN)))
     checks.append(("Owner number",bool(OWNER_NUMBER)))
     checks.append(("Groq chat/vision key",bool(GROQ_API_KEY)))
+    checks.append(("Gemini chat key",bool(GEMINI_API_KEY)))
     checks.append(("Gemini key",bool(GEMINI_API_KEY)))
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
@@ -2674,7 +2717,7 @@ def process_webhook(data):
         if tl.startswith(".image "):
             question=text.split(None,1)[1].strip()[:1200]
             r=jarvis_vision_question(user,question)
-            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl==".image":
             send_text(user,"〔 IMAGE / VISION HELP 〕\n\nTo ask about an image: send the image first, then use `.image <your question>` or ask a question naturally.\n\n`.describe` gives a general description; `.read` extracts text; `.solve`/`.math` solve visible problems; `.verify` checks visible credibility indicators and may fact-check claims.\n\nTo generate a NEW image, use `.create <prompt>` or `.imagine <prompt>`.")
             return "OK",200
