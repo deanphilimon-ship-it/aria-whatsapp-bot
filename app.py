@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.6.2 (Provider-specific conversational personalities)
+# VERSION 17.6.3 (Provider-specific greeting behavior)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.6.2"
+VERSION = "v17.6.3"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -1905,12 +1905,18 @@ def get_youtube_link(query):return f"*{query.title()}*\n\n▶️ Tap to search: 
 def get_runtime():
     s=int(time.time()-start_time);return f"{s//3600}h {(s%3600)//60}m {s%60}s"
 EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bsex video\b",r"\bsex tape\b",r"\bexplicit sex\b",r"\bsexual intercourse\b",r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",r"\bnaked\s+(?:photo|picture|image|pic)s?\b"]
-def _natural_greeting_reply(text):
-    """Return a short, human-sounding reply for a standalone greeting; otherwise None."""
+def _natural_greeting_reply(text, from_number=None):
+    """Return a provider-preference-specific reply for a standalone greeting.
+
+    Greetings are handled locally before the AI provider is called, so they must
+    respect the user's selected personality explicitly rather than always using
+    the former Gemini-style canned greeting.
+    """
     greeting = re.sub(r"[.!?,]+", "", (text or "").strip().lower())
     greeting = re.sub(r"\s+", " ", greeting)
     greeting = re.sub(r"\s+aria$", "", greeting).strip()
-    replies = {
+    choice = get_user_chat_model(from_number) if from_number else "groq"
+    gemini_replies = {
         "hi": "Hey 🙂 What's up?",
         "hello": "Hey 🙂 What's on your mind?",
         "hey": "Hey 🙂 What's happening?",
@@ -1922,6 +1928,19 @@ def _natural_greeting_reply(text):
         "how are you": "I'm good—ready to think things through with you. How are you?",
         "how are you doing": "Doing well 🙂 How's your day going?",
     }
+    groq_replies = {
+        "hi": "Hi, how can I help you?",
+        "hello": "Hello, how can I help you?",
+        "hey": "Hey, how can I help you?",
+        "yo": "Yo, what's up?",
+        "sup": "Hey, what's up?",
+        "good morning": "Good morning, how can I help you?",
+        "good afternoon": "Good afternoon, how can I help you?",
+        "good evening": "Good evening, how can I help you?",
+        "how are you": "I'm doing well, thanks for asking. How can I help you?",
+        "how are you doing": "I'm doing well, thanks for asking. How can I help you?",
+    }
+    replies = gemini_replies if choice == "gemini" else groq_replies
     return replies.get(greeting)
 
 def is_explicit_request(text):return bool(text) and any(re.search(p,re.sub(r"\s+"," ",str(text).lower()).strip(),re.I) for p in EXPLICIT_PATTERNS)
@@ -3020,7 +3039,7 @@ def process_webhook(data):
         if get_document_context(user) and not needs_live(text) and tl.startswith(("what ","who ","when ","where ","why ","how ","summarize", "explain")):
             # Only use document context when it is clearly the active context.
             r=ask_about_document(user,text);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
-        greeting_reply = _natural_greeting_reply(text)
+        greeting_reply = _natural_greeting_reply(text, user)
         if greeting_reply:
             add_to_memory(user,"assistant",greeting_reply);send_ai_reply(user,greeting_reply);return "OK",200
         if not text:send_text(user,"Send me a message.");return "OK",200
@@ -3040,33 +3059,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
