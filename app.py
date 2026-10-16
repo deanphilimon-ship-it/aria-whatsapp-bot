@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.6 (Natural-language task routing, Gemini 3.6 Flash, natural release notes)
+# VERSION 17.6.2 (Provider-specific conversational personalities)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.6.1"
+VERSION = "v17.6.2"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -1197,13 +1197,10 @@ IDENTITY
 - Be intelligent, practical, direct and conversational.
 - Do not pretend to be human or claim access you do not have.
 RESPONSE STYLE
-- Respond naturally for WhatsApp. Keep normal answers concise, warm, and helpful.
-- Answer the user's actual question directly first; do not lead with filler or a generic acknowledgement.
-- For ordinary conversational replies, add at most one short, relevant follow-up question or natural reaction to keep the conversation flowing. Do not force a follow-up when it would feel awkward, repetitive, insensitive, or unnecessary.
-- Do not add a conversational follow-up to a command/tool result. Existing command handlers must execute exactly as before; do not reinterpret, rerun, weaken, or decorate command execution in a way that changes its output or effects. Friendly tone applies to normal AI-generated wording only, never to security checks, authorization decisions, or tool results that must remain exact.
+- Respond naturally for WhatsApp. Keep normal answers concise.
 - Use short paragraphs and bullets. No markdown tables or ### headings.
 - Do not add filler or unnecessarily repeat the question.
-- If the user only greets you, reply like a natural, familiar chat partner: brief, warm, and varied. Never use the canned line “What can I do for you today?” or a customer-service opening.
+- If you only receive a greeting, reply briefly, warmly, and naturally. Avoid the canned line “What can I do for you today?” or a customer-service opening.
 - MATH AND EQUATIONS: When solving or explaining maths, write phone-friendly plain text, not LaTeX. Avoid LaTeX delimiters, dollar-wrapped equations, fraction/boxed commands, long symbolic notation, and decorative Unicode. Use examples like 3/4, x^2, sqrt(9), 2*x, and <= or >=. Show numbered steps and a clearly labelled final answer. Apply this to every chat answer, not only image-solving commands.
 ACCURACY
 - If uncertain, say so. Never invent sources, facts, API results, files, events or memories.
@@ -1212,6 +1209,15 @@ MEMORY
 - Use supplied memory when relevant. Do not claim to remember absent information.
 SAFETY
 - Do not generate explicit sexual content. Educational, medical, anatomical, safety and non-explicit discussions may be handled clinically.
+"""
+
+# This layer is added only when Gemini is the chat provider. Groq retains the
+# established default response style above.
+GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
+- Answer the user's actual question directly first.
+- For ordinary conversation, add at most one short, relevant follow-up question or natural reaction to keep the conversation flowing. Do not force one when awkward, repetitive, insensitive, or unnecessary.
+- If the message is an existing command or tool result, do not add a follow-up or change its behavior. Existing command handlers, tool outputs, security checks, authorization decisions, and memory rules take precedence and must remain intact.
+- Be warm, concise, and familiar without sounding robotic or pretending to be human.
 """
 
 # Tool awareness only: this describes existing ARIA capabilities to the chat model.
@@ -1437,14 +1443,18 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
     ctx=build_memory_context(from_number,prompt,skip_last_user=True)
     full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
     errors=[]; failures=[]
-    tool_aware_system=system+"\n\n"+build_tool_awareness_context()
+    tool_context=build_tool_awareness_context()
+    # Keep Groq's original prompt and response pattern. Add the new conversational
+    # behavior only to Gemini's chat request, including when Gemini is a fallback.
+    groq_system=system+"\n\n"+tool_context
+    gemini_system=system+"\n\n"+GEMINI_CONVERSATIONAL_STYLE_LAYER+"\n\n"+tool_context
     preference=get_user_chat_model(from_number)
     if preference=="gemini":
-        providers=[("Gemini",lambda:gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)),
-                  ("Groq",lambda:groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens))]
-    else:  # groq is the default; auto also tries Groq then Gemini
-        providers=[("Groq",lambda:groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)),
-                  ("Gemini",lambda:gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens))]
+        providers=[("Gemini",lambda:gemini_call(full,gemini_system,max_output_tokens=max_output_tokens)),
+                  ("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens))]
+    else:  # groq is the default; auto also tries Groq first, then Gemini
+        providers=[("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens)),
+                  ("Gemini",lambda:gemini_call(full,gemini_system,max_output_tokens=max_output_tokens))]
     configured=[]
     for provider,call_provider in providers:
         if provider=="Groq" and not client:
@@ -3030,3 +3040,52 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
