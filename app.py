@@ -8,10 +8,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.3.1 (Mistral chat option, per-user model choice, provider timing)
+# VERSION 17.5.1 (Gemini chat replacement for Mistral; voice reply diagnostics retained)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.5.0"
+VERSION = "v17.5.1"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -64,11 +64,6 @@ VERIFY_TOKEN = _env("VERIFY_TOKEN")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_API_KEY = _env("GROQ_API_KEY")
-MISTRAL_API_KEY = _env("MISTRAL_API_KEY")
-MISTRAL_CHAT_MODEL = os.getenv("MISTRAL_CHAT_MODEL", "mistral-small-latest").strip() or "mistral-small-latest"
-MISTRAL_API_URL = os.getenv("MISTRAL_API_URL", "https://api.mistral.ai/v1/chat/completions").strip()
-try: MISTRAL_TIMEOUT = max(8, min(60, int(os.getenv("MISTRAL_TIMEOUT", "35"))))
-except (TypeError, ValueError): MISTRAL_TIMEOUT = 35
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
@@ -1386,120 +1381,64 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
-def mistral_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    if not MISTRAL_API_KEY:raise RuntimeError("MISTRAL_API_KEY is missing")
-    started=time.perf_counter()
-    payload={"model":MISTRAL_CHAT_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.6,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
-    r=requests.post(MISTRAL_API_URL,headers={"Authorization":f"Bearer {MISTRAL_API_KEY}","Content-Type":"application/json"},json=payload,timeout=MISTRAL_TIMEOUT)
-    r.raise_for_status(); data=r.json(); choices=data.get("choices") or []; message=(choices[0].get("message") or {}) if choices else {}; content=message.get("content")
-    if isinstance(content,list):content="\n".join(str(x.get("text", "")) for x in content if isinstance(x,dict))
-    text=str(content or "").strip()
-    print(f"[AI LATENCY] provider=mistral model={MISTRAL_CHAT_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
-    if not text:raise ValueError("Mistral returned an empty response")
-    return text
-
 def get_user_chat_model(from_number):
     choice=str(user_profile.get(from_number,{}).get("chat_model","groq")).strip().lower()
-    return choice if choice in {"groq","mistral","auto"} else "groq"
+    return choice if choice in {"groq","gemini","auto"} else "groq"
 
 def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        availability=f"Groq: {'ready' if client else 'not configured'}\nMistral: {'ready' if MISTRAL_API_KEY else 'not configured (needs MISTRAL_API_KEY)'}\nGemini fallback: {'ready' if GEMINI_API_KEY else 'not configured'}"
+        availability=f"Groq: {'ready' if client else 'not configured'}\nGemini: {'ready' if GEMINI_API_KEY else 'not configured (needs GEMINI_API_KEY)'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current.title()}*\n\n"
-                "Choose one with `.model groq`, `.model mistral`, or `.model auto`.\n"
+                "Choose one with `.model groq`, `.model gemini`, or `.model auto`.\n"
                 "• Groq — current default, fast responses.\n"
-                "• Mistral — alternative for casual conversation.\n"
-                "• Auto — ARIA tries its configured providers in order.\n\n"
+                f"• Gemini — Google Gemini API ({GEMINI_MODEL}).\n"
+                "• Auto — ARIA tries Groq first, then Gemini when available.\n\n"
                 f"Provider status:\n{availability}\n\n"
-                "Note: Mistral API free usage depends on your Mistral Studio account's Free mode, available models and limits. Check billing/usage settings before using it.")
-    aliases={"default":"groq","openai":"groq","mistral-small":"mistral","automatic":"auto"}
+                "A configured key does not guarantee quota or model access; use `.diagnostics` to test provider connectivity.")
+    aliases={"default":"groq","openai":"groq","google":"gemini","automatic":"auto"}
     choice=aliases.get(choice,choice)
-    if choice not in {"groq","mistral","auto"}:
-        return "Usage: `.model` · `.model groq` · `.model mistral` · `.model auto`"
+    if choice not in {"groq","gemini","auto"}:
+        return "Usage: `.model` · `.model groq` · `.model gemini` · `.model auto`"
     if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
-    if choice=="mistral" and not MISTRAL_API_KEY:return "Mistral isn't configured yet. Add MISTRAL_API_KEY in Render, redeploy, then use `.model mistral`. Your current preference hasn't changed."
-    if choice=="auto" and not (client or MISTRAL_API_KEY or GEMINI_API_KEY):return "No chat providers are configured yet."
+    if choice=="gemini" and not GEMINI_API_KEY:return "Gemini isn't configured yet. Add GEMINI_API_KEY in Render, redeploy, then use `.model gemini`. Your current preference hasn't changed."
+    if choice=="auto" and not (client or GEMINI_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or GEMINI_API_KEY."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
     return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
 
-def _provider_quota_notice(provider, exc, fallback=None):
-    """Return a clear notice only when an exception looks like quota/rate limiting."""
-    response = getattr(exc, "response", None)
-    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
-    body = getattr(response, "text", "") or ""
-    code = getattr(exc, "code", "") or ""
-    detail = f"{exc} {body} {code}".lower()
-    quota_markers = (
-        "insufficient_quota", "quota exceeded", "quota limit", "resource_exhausted",
-        "rate_limit_exceeded", "rate limit", "usage limit", "tokens per minute",
-        "requests per minute", "billing hard limit", "exceeded your current quota",
-    )
-    if not (status in (402, 429) or any(marker in detail for marker in quota_markers)):
-        return ""
-    target = f" I used {fallback} for this reply instead." if fallback else " No fallback provider could complete the request."
-    print(f"[AI QUOTA] provider={provider} status={status or 'unknown'} fallback={fallback or 'none'}")
-    return (f"⏳ {provider} has hit its API usage or rate limit.{target} "
-            "Please try again after the limit resets. If it keeps happening, check the provider's usage and billing settings.\n\n")
-
-
-def _fallback_notice(provider, exc, fallback):
-    quota_notice = _provider_quota_notice(provider, exc, fallback)
-    if quota_notice:
-        return quota_notice
-    return f"⚠️ {provider} is unavailable, so I answered using {fallback} instead.\n\n"
-
-
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
-    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):
-        return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt,skip_last_user=True)
-    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
-    errors=[]
-    failures=[]
+    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):return "You've reached the hourly AI limit. Please try again in a while."
+    ctx=build_memory_context(from_number,prompt,skip_last_user=True); full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"; errors=[]
+    # Provider selection affects normal text chat only. Existing command, vision,
+    # voice, live-search and image-generation handlers keep their dedicated routes.
     tool_aware_system = system + "\n\n" + build_tool_awareness_context()
     preference=get_user_chat_model(from_number)
-
-    if preference=="mistral":
-        providers=[("Mistral", lambda: mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens))]
-        if client: providers.append(("Groq", lambda: groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
-        if GEMINI_API_KEY: providers.append(("Gemini", lambda: gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)))
-    else:
-        providers=[]
-        if client: providers.append(("Groq", lambda: groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
-        if GEMINI_API_KEY: providers.append(("Gemini", lambda: gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)))
-        if MISTRAL_API_KEY: providers.append(("Mistral", lambda: mistral_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)))
-
-    for index,(provider,call_provider) in enumerate(providers):
+    providers = ["gemini", "groq"] if preference == "gemini" else (["groq", "gemini"] if preference == "auto" else ["groq", "gemini"])
+    for provider in providers:
         try:
-            result=call_provider()
-            if failures:
-                # Always explain a Mistral-to-fallback switch; for other routes, surface
-                # quota exhaustion without adding noise for ordinary transient failures.
-                first_provider,first_error=failures[0]
-                if preference=="mistral" and first_provider=="Mistral":
-                    return _fallback_notice(first_provider,first_error,provider)+result
-                for failed_provider,failed_error in failures:
-                    notice=_provider_quota_notice(failed_provider,failed_error,provider)
-                    if notice:return notice+result
-            return result
-        except Exception as exc:
-            failures.append((provider,exc))
-            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
-            print(f"[AI PROVIDER ERROR] provider={provider} error_type={type(exc).__name__}")
-
+            if provider == "groq":
+                if not client:
+                    errors.append("Groq: not configured")
+                    continue
+                result=groq_chat_call(full,tool_aware_system,max_tokens=max_output_tokens)
+                if errors:
+                    return "⚠️ The preferred provider was unavailable; I answered using Groq instead.\n\n"+result
+                return result
+            if provider == "gemini":
+                if not GEMINI_API_KEY:
+                    errors.append("Gemini: not configured")
+                    continue
+                result=gemini_call(full,tool_aware_system,max_output_tokens=max_output_tokens)
+                if errors:
+                    return "⚠️ The preferred provider was unavailable; I answered using Gemini instead.\n\n"+result
+                return result
+        except Exception as e:
+            errors.append(f"{provider.title()}: {type(e).__name__}: {str(e)[:300]}")
+            print(f"[AI PROVIDER ERROR] provider={provider} type={type(e).__name__} detail={str(e)[:300]}")
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors)))
-    quota_providers=[]
-    for provider,exc in failures:
-        if _provider_quota_notice(provider,exc,None):
-            quota_providers.append(provider)
-    if quota_providers:
-        names=" and ".join(dict.fromkeys(quota_providers))
-        verb="has" if len(set(quota_providers))==1 else "have"
-        return f"⏳ {names} {verb} hit an API usage or rate limit. Please try again after the limit resets. If it keeps happening, check the provider usage and billing settings."
-    return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.health` to check ARIA." if (client or GEMINI_API_KEY or MISTRAL_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY, MISTRAL_API_KEY or GEMINI_API_KEY to Render."
+    return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.diagnostics` to check ARIA." if (client or GEMINI_API_KEY) else "AI is not configured.\n\nAdd GROQ_API_KEY and/or GEMINI_API_KEY to Render."
 
 # ============================================================
 # VISION / VOICE
@@ -1608,10 +1547,15 @@ def generate_tts_audio(text):
 def send_audio_bytes(to,audio_bytes,mime_type="audio/ogg",context_text=""):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:return False
     r=requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},data={"messaging_product":"whatsapp","type":mime_type},files={"file":("aria_voice.ogg",audio_bytes,mime_type)},timeout=45)
-    if not r.ok:return False
-    mid=r.json().get("id");
-    if not mid:return False
+    if not r.ok:
+        print("[VOICE MEDIA UPLOAD ERROR]",r.status_code,(r.text or "")[:500])
+        return False
+    mid=r.json().get("id")
+    if not mid:
+        print("[VOICE MEDIA UPLOAD ERROR] Meta response contained no media id")
+        return False
     s=requests.post(graph_url(f"{PHONE_NUMBER_ID}/messages"),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}","Content-Type":"application/json"},json={"messaging_product":"whatsapp","to":to,"type":"audio","audio":{"id":mid}},timeout=30)
+    if not s.ok: print("[VOICE WHATSAPP SEND ERROR]",s.status_code,(s.text or "")[:500])
     if s.ok:
         try:
             for item in (s.json().get("messages") or []):
@@ -1620,10 +1564,28 @@ def send_audio_bytes(to,audio_bytes,mime_type="audio/ogg",context_text=""):
     return s.ok
 
 def send_voice_reply(to,text):
+    """Generate and send a WhatsApp audio reply; log provider/transport errors for diagnosis."""
     try:
         readable=clean_ui(format_response_for_whatsapp(text))
-        return send_audio_bytes(to,generate_tts_audio(readable),context_text=readable)
-    except Exception as e:print("[VOICE REPLY ERROR]",repr(e)); return False
+        if not readable:
+            print("[VOICE REPLY ERROR] empty text after formatting")
+            return False
+        audio=generate_tts_audio(readable)
+        if not audio:
+            print("[VOICE REPLY ERROR] TTS provider returned empty audio")
+            return False
+        return send_audio_bytes(to,audio,context_text=readable)
+    except Exception as e:
+        print("[VOICE REPLY ERROR]",type(e).__name__,str(e)[:700])
+        return False
+
+def send_ai_reply(to,text):
+    """Send spoken AI replies when voice mode is enabled; preserve text fallback."""
+    if VOICE_MODE in {"voice","audio","on"} or to in voice_enabled_users:
+        if send_voice_reply(to,text):
+            return True
+        print("[VOICE REPLY FALLBACK] sending text instead")
+    return send_text(to,text)
 
 # ============================================================
 # DOCUMENT READER
@@ -1849,8 +1811,8 @@ def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Respon
 def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
-• .model — choose Groq, Mistral, or Auto for normal conversation
-• .model groq | .model mistral | .model auto
+• .model — choose Groq, Gemini, or Auto for normal conversation
+• .model groq | .model gemini | .model auto
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -1928,7 +1890,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Mistral Chat:* {MISTRAL_CHAT_MODEL} ({'CONFIGURED' if MISTRAL_API_KEY else 'NOT CONFIGURED'})\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
@@ -2378,7 +2340,6 @@ def get_diagnostics(user):
     checks.append(("Webhook verify token",bool(VERIFY_TOKEN)))
     checks.append(("Owner number",bool(OWNER_NUMBER)))
     checks.append(("Groq chat/vision key",bool(GROQ_API_KEY)))
-    checks.append(("Mistral optional chat key",bool(MISTRAL_API_KEY)))
     checks.append(("Gemini key",bool(GEMINI_API_KEY)))
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
@@ -2413,12 +2374,12 @@ def _send_vision_for_user(user,command):
     elif command==".read":r=vision_call(u,"Extract readable text only. Preserve useful line breaks and mark unclear text as [unclear].",mime)
     elif command==".verify":r=vision_call(u,"Analyze visible indicators of AI generation, manipulation, editing or misleading presentation. State evidence and limitations; do not claim forensic certainty.",mime); r+=_verify_claims(user,u,mime)
     else:r=vision_call(u,"Describe this image naturally for WhatsApp. Mention setting, objects, actions, colors, composition and readable text only when legible. Do not guess identities.",mime)
-    add_to_memory(user,"assistant",r);send_text(user,r)
+    add_to_memory(user,"assistant",r);send_ai_reply(user,r)
 
 # ============================================================
 # Natural-language routing and once-per-release announcement
 # ============================================================
-RELEASE_ANNOUNCEMENT_VERSION = os.getenv("RELEASE_ANNOUNCEMENT_VERSION", "v17.5.0")
+RELEASE_ANNOUNCEMENT_VERSION = os.getenv("RELEASE_ANNOUNCEMENT_VERSION", "v17.5.1")
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 def _send_release_announcement_once(user):
@@ -2672,7 +2633,7 @@ def process_webhook(data):
         if tl==".diagnostics":
             send_text(user,get_diagnostics(user));return "OK",200
         if tl==".task" or tl.startswith(".task "):
-            r=handle_task_command(user,text);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r=handle_task_command(user,text);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
         if tl==".health":
             health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
@@ -2685,7 +2646,7 @@ def process_webhook(data):
                 send_text(user,"🌐 Checking live sources...")
                 try:r="〔 *LIVE VERIFY* 〕\n\n"+live_answer(f"Fact-check this claim using current reliable sources. Start with a verdict (Supported / Disputed / False / Unverified), then give 2-4 short reasons with dates. Do not guess.\n\nClaim: {claim}",claim[:300])
                 except Exception as e:print("[VERIFY ERROR]",repr(e));r=_live_fail_msg(user,e)
-            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl==".livetest":
             if user!=OWNER_NUMBER and user not in ADMIN_NUMBERS:return send_text(user,"Owner/admin only command.") or "OK"
             if not (GEMINI_API_KEY or EXA_API_KEY):send_text(user,"No live search provider configured. Add EXA_API_KEY and/or GEMINI_API_KEY on Render.");return "OK",200
@@ -2708,7 +2669,7 @@ def process_webhook(data):
             if not LIVE_ENABLED:send_text(user,"Live search isn't configured. Add EXA_API_KEY or GEMINI_API_KEY.");return "OK",200
             send_text(user,"🌐 Searching...")
             r=smart_ask(f"What is the latest news on: {q}? Give 3-5 short bullet points, each with its date." if cmd.lower()==".news" else q,user,force=True,query=q)
-            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
         if tl.startswith(".image "):
             question=text.split(None,1)[1].strip()[:1200]
@@ -2721,7 +2682,7 @@ def process_webhook(data):
             saved=user_waiting_image.get(user)
             if not saved:return send_text(user,"No recent image is waiting. Send an image first.") or "OK"
             if not _vision_allowed(user):send_text(user,VISION_LIMIT_MSG);return "OK",200
-            q=text[len(".describe ask "):].strip();r=vision_call(saved["media_id"],f"Answer this follow-up question about the image. Do not invent details.\n\nQuestion: {q}",saved.get("mime_type"));add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            q=text[len(".describe ask "):].strip();r=vision_call(saved["media_id"],f"Answer this follow-up question about the image. Do not invent details.\n\nQuestion: {q}",saved.get("mime_type"));add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl in {".describe",".describe detailed",".verify",".solve",".math",".read"}:
             saved=user_waiting_image.get(user)
             if saved and time.time()-saved.get("saved_at",0)>IMAGE_WAIT_TIMEOUT:user_waiting_image.pop(user,None);saved=None
@@ -2731,7 +2692,7 @@ def process_webhook(data):
             if cmd==".describe detailed":r=vision_call(saved["media_id"],"Describe this image in detail, including composition, setting, colors, objects, actions, style and readable text. Do not guess.",saved.get("mime_type"))
             else:
                 _send_vision_for_user(user,cmd);return "OK",200
-            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
         for command,handler in [(".photo",pint1_unsplash),(".wallpaper",pint2_pexels),(".anime",pint3_anime),(".comic",pint4_comics),(".edu",pint5_education),(".pinterest",pint_pinterest)]:
             if tl.startswith(command+" "):handler(user,text[len(command):].strip());return "OK",200
@@ -2748,7 +2709,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model mistral`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model gemini`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -2769,23 +2730,23 @@ def process_webhook(data):
             ct=text[1:] if text.startswith(".") else text; sp=ct.split(None,1); args=sp[1].strip() if len(sp)>1 else ""
             mm=re.match(r"^(.+?)\s+([1-6])$",args)
             topic,field=(mm.group(1).strip(),mm.group(2)) if mm else (args,"all")
-            r="Usage: `.explain <topic>`" if not topic else ai_explain(topic,field,user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r="Usage: `.explain <topic>`" if not topic else ai_explain(topic,field,user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl.startswith(".ask "):
-            r=smart_ask(text[5:].strip(),user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r=smart_ask(text[5:].strip(),user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl==".ask":send_text(user,"Usage: `.ask <question>`");return "OK",200
-        if tl.startswith(".summarize "):r=ai_call(f"Summarize this clearly and briefly:\n\n{text[11:].strip()}",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+        if tl.startswith(".summarize "):r=ai_call(f"Summarize this clearly and briefly:\n\n{text[11:].strip()}",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl==".summarize":send_text(user,"Usage: `.summarize <text>`");return "OK",200
         if tl.startswith(".translate "):
             p=text.split(" ",2)
             if len(p)<3:send_text(user,"Usage: `.translate <language> <text>`")
-            else:r=ai_call(f"Translate into {p[1]}. Return only the natural translation.\n\n{p[2]}",user);add_to_memory(user,"assistant",r);send_text(user,r)
+            else:r=ai_call(f"Translate into {p[1]}. Return only the natural translation.\n\n{p[2]}",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r)
             return "OK",200
-        if tl.startswith(".define "):r=ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
-        if tl.startswith(".study "):r=ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
-        if tl.startswith(".quiz "):r=ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.",user);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+        if tl.startswith(".define "):r=ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
+        if tl.startswith(".study "):r=ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
+        if tl.startswith(".quiz "):r=ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if re.match(r"^\.(?:doc|document)(?:\s|$)",tl) or (get_document_context(user) and tl.startswith(("document ","ask document"))):
             q=re.sub(r"^\.?(?:ask\s+)?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
-            r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         # Natural-language image generation: users do not need to know .create/.imagine.
         natural_image_prompt = _natural_image_generation_prompt(text)
         if natural_image_prompt:
@@ -2804,18 +2765,18 @@ def process_webhook(data):
                 result = smart_ask("Research this topic using current sources. Summarize the main findings in 4-6 concise bullets, include dates where relevant, distinguish evidence from uncertainty, and include source links when available. Topic: " + research_query,user,force=True,query=research_query)
             except Exception as e:
                 print("[NATURAL RESEARCH ERROR]",repr(e)[:300]);result="I couldn't complete that research request just now. Please try again shortly or use `.search <question>`."
-            add_to_memory(user,"assistant",result);send_text(user,result);return "OK",200
+            add_to_memory(user,"assistant",result);send_ai_reply(user,result);return "OK",200
         # Jarvis automatic routing: prefer an explicit request to fetch an image, then image Q&A.
         if jarvis_route_media(user,text):
             return "OK",200
         if JARVIS_ENABLED and _image_is_fresh(user,NL_VISION_WINDOW) and _looks_like_image_question(text) and not needs_live(text):
             r=jarvis_vision_question(user,text)
-            add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if get_document_context(user) and not needs_live(text) and tl.startswith(("what ","who ","when ","where ","why ","how ","summarize", "explain")):
             # Only use document context when it is clearly the active context.
-            r=ask_about_document(user,text);add_to_memory(user,"assistant",r);send_text(user,r);return "OK",200
+            r=ask_about_document(user,text);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if not text:send_text(user,"Send me a message.");return "OK",200
-        r=smart_ask(text,user);add_to_memory(user,"assistant",r);send_text(user,r)
+        r=smart_ask(text,user);add_to_memory(user,"assistant",r);send_ai_reply(user,r)
     except Exception as e:
         print("[WEBHOOK ERROR]",repr(e)[:400])
         try:
@@ -2831,6 +2792,22 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
