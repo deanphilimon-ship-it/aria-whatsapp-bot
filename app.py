@@ -1,5 +1,5 @@
 from flask import Flask, request
-import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile
+import requests, os, base64, json, re, hashlib, hmac, atexit, threading, time, io, csv, uuid, tempfile, subprocess, shutil
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 import pytz
@@ -7,7 +7,7 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.5.1 (Gemini dual-model chat and voice reply fixes)
+# VERSION 17.5.1 (Gemini retry, Groq voice and image-provider fixes)
 # ============================================================
 app = Flask(__name__)
 VERSION = "v17.5.1"
@@ -76,9 +76,8 @@ PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_K
 # Legacy Pollinations alias remains configurable; generation now selects a model by style.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "zimage").strip() or "zimage"
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
-IMAGE_PROVIDER = os.getenv("IMAGE_PROVIDER", "pollinations").strip().lower()
-if IMAGE_PROVIDER not in {"pollinations", "gemini"}: IMAGE_PROVIDER = "pollinations"
-GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image").strip() or "gemini-3.1-flash-image"
+# Gemini is deliberately not used for image generation; image generation routes through Pollinations only.
+IMAGE_PROVIDER = "pollinations"
 POLLINATIONS_IMAGE_BASE = os.getenv("POLLINATIONS_IMAGE_BASE", "https://gen.pollinations.ai").strip().rstrip("/")
 IMAGE_MODEL_ANIME = os.getenv("IMAGE_MODEL_ANIME", "seedream5").strip() or "seedream5"
 IMAGE_MODEL_REALISTIC = os.getenv("IMAGE_MODEL_REALISTIC", "gptimage").strip() or "gptimage"
@@ -91,7 +90,7 @@ IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
 CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 ARIA_TIMEZONE = os.getenv("ARIA_TIMEZONE", "Africa/Lagos")
 DEPLOY_COMMIT = _env("RENDER_GIT_COMMIT") or _env("GIT_COMMIT") or _env("SOURCE_VERSION")
@@ -997,48 +996,15 @@ def _pollinations_image_bytes(prompt, model, seed):
     return r.content, ctype
 
 
-def _gemini_image_bytes(prompt):
-    """Generate one image through the explicitly configured Gemini image model."""
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is missing; configure it or set IMAGE_PROVIDER=pollinations")
-    payload = {
-        "contents": [{"role":"user", "parts":[{"text":prompt}]}],
-        "generationConfig": {"responseModalities":["TEXT", "IMAGE"]},
-    }
-    r = requests.post(f"{GEMINI_API_URL}{GEMINI_IMAGE_MODEL}:generateContent",
-        headers={"Content-Type":"application/json", "x-goog-api-key":GEMINI_API_KEY},
-        json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    for part in ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []:
-        inline = part.get("inlineData") or part.get("inline_data") or {}
-        encoded = inline.get("data")
-        mime = (inline.get("mimeType") or inline.get("mime_type") or "image/png").split(";",1)[0].lower()
-        if encoded and mime in {"image/jpeg", "image/png"}:
-            raw = base64.b64decode(encoded, validate=True)
-            if not raw: raise ValueError("Gemini returned empty image bytes")
-            if len(raw) > 5 * 1024 * 1024: raise ValueError("Gemini image exceeds WhatsApp's 5 MB image limit")
-            return raw, mime
-    raise ValueError("Gemini returned no supported image data")
-
-
 def imagine_generate(sender, prompt, explicit_style=None):
     style = detect_image_style(prompt, explicit_style)
     model = image_model_for_style(style)
     enhanced = enhance_image_prompt(prompt, style)
     seed = uuid.uuid4().int % 100000
     send_text(sender, f"🎨 ARIA is creating your {style} image.\nModel route: {model}\n\n{prompt[:500]}")
-    # Provider choice is explicit. Gemini image generation is optional and may be billable;
-    # Pollinations remains the default because the user prefers a low-cost route.
-    if IMAGE_PROVIDER == "gemini":
-        try:
-            raw, mime = _gemini_image_bytes(enhanced)
-            return _send_image_bytes(sender, raw, mime, f"ARIA image · {style} · Gemini {GEMINI_IMAGE_MODEL}\n{prompt[:700]}")
-        except Exception as e:
-            print("[GEMINI IMAGE ERROR]", type(e).__name__, str(e)[:500])
-            send_text(sender, "Gemini image generation failed. Check GEMINI_API_KEY, GEMINI_IMAGE_MODEL, quota and billing; ARIA did not silently switch providers.")
-            return False
-    # New Pollinations endpoint supports authenticated model routing. A configured key can
+    # Image generation is Pollinations-only. Gemini remains available for chat/live-search/vision fallback,
+    # but is deliberately excluded from image generation because it has been unreliable for this deployment.
+    # The authenticated Pollinations endpoint supports style/model routing. A configured key can
     # consume Pollen credits; this code never buys credits or changes billing settings.
     if POLLINATIONS_API_KEY:
         try:
@@ -1272,7 +1238,7 @@ def build_tool_awareness_context():
         f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; model={GEMINI_MODEL}; Gemini-backed live search and vision fallback require this key.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa is a live-search provider, not an AI chat model.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation provider={IMAGE_PROVIDER}; Pollinations API key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}; Gemini image model={GEMINI_IMAGE_MODEL} ({'key present' if GEMINI_API_KEY else 'key missing'}); Pollinations style models anime={IMAGE_MODEL_ANIME}, realistic={IMAGE_MODEL_REALISTIC}, fantasy={IMAGE_MODEL_FANTASY}, poster={IMAGE_MODEL_POSTER}, general={IMAGE_MODEL_GENERAL}.",
+        f"Image generation provider=Pollinations only; Pollinations API key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}; Pollinations style models anime={IMAGE_MODEL_ANIME}, realistic={IMAGE_MODEL_REALISTIC}, fantasy={IMAGE_MODEL_FANTASY}, poster={IMAGE_MODEL_POSTER}, general={IMAGE_MODEL_GENERAL}.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -1362,14 +1328,37 @@ def _extract_gemini_text(data):
 GEMINI_API_URL="https://generativelanguage.googleapis.com/v1beta/models/"
 
 def gemini_call(prompt,system=DEFAULT_SYSTEM_PROMPT,image_data=None,mime_type=None,timeout=45,max_output_tokens=1024):
-    if not GEMINI_API_KEY:raise RuntimeError("GEMINI_API_KEY is missing")
+    """Call the configured Gemini model with bounded retries for transient Google API failures."""
+    if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY is missing")
     started=time.perf_counter()
     parts=[]
-    if image_data:parts.append({"inline_data":{"mime_type":mime_type,"data":image_data}})
-    parts.append({"text":prompt}); payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":max(1,min(8192,int(max_output_tokens))),"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
-    r=requests.post(f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout); r.raise_for_status(); text=_extract_gemini_text(r.json())
+    if image_data: parts.append({"inline_data":{"mime_type":mime_type,"data":image_data}})
+    parts.append({"text":prompt})
+    payload={"system_instruction":{"parts":[{"text":system}]},"contents":[{"role":"user","parts":parts}],"generationConfig":{"maxOutputTokens":max(1,min(8192,int(max_output_tokens))),"thinkingConfig":{"thinkingLevel":GEMINI_THINKING_LEVEL}}}
+    url=f"{GEMINI_API_URL}{GEMINI_MODEL}:generateContent"
+    response=None
+    for attempt in range(3):
+        try:
+            response=requests.post(url,headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=timeout)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt < 2:
+                delay=1.0*(attempt+1)
+                print(f"[GEMINI RETRY] model={GEMINI_MODEL} reason=network attempt={attempt+1}/3 delay={delay:.1f}s")
+                time.sleep(delay)
+                continue
+            raise
+        if response.status_code in {500,502,503,504} and attempt < 2:
+            delay=1.0*(attempt+1)
+            print(f"[GEMINI RETRY] model={GEMINI_MODEL} status={response.status_code} attempt={attempt+1}/3 delay={delay:.1f}s body={(response.text or '')[:180]}")
+            time.sleep(delay)
+            continue
+        if not response.ok:
+            raise requests.HTTPError(f"Gemini HTTP {response.status_code}: {(response.text or '')[:500]}", response=response)
+        break
+    data=response.json()
+    text=_extract_gemini_text(data)
     print(f"[AI LATENCY] provider=gemini model={GEMINI_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
-    if not text:raise ValueError("Gemini returned an empty response")
+    if not text: raise ValueError(f"Gemini model {GEMINI_MODEL} returned an empty response")
     return text
 
 def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
@@ -1579,12 +1568,66 @@ def transcribe_audio(audio_bytes,mime_type="audio/ogg"):
     ext=".ogg" if "ogg" in mime_type else ".mp3" if "mpeg" in mime_type or "mp3" in mime_type else ".wav" if "wav" in mime_type else ".m4a" if "mp4" in mime_type or "m4a" in mime_type else ".webm"
     x=client.audio.transcriptions.create(file=(f"aria_voice{ext}",audio_bytes,mime_type),model=STT_MODEL,language=TTS_LANGUAGE or None,response_format="json",temperature=0.0); return (getattr(x,"text","") or "").strip()
 
+def _find_ffmpeg_binary():
+    """Locate ffmpeg from the host or imageio-ffmpeg if that dependency is installed."""
+    binary=shutil.which("ffmpeg")
+    if binary: return binary
+    try:
+        import imageio_ffmpeg
+        binary=imageio_ffmpeg.get_ffmpeg_exe()
+        if binary and os.path.isfile(binary): return binary
+    except Exception:
+        pass
+    raise RuntimeError("ffmpeg is unavailable; install ffmpeg or imageio-ffmpeg to convert Groq WAV audio for WhatsApp")
+
+def _split_tts_text(text, max_chars=200):
+    """Split speech into Orpheus-safe chunks without cutting words where possible."""
+    remaining=re.sub(r"\s+"," ",(text or "")).strip()
+    chunks=[]
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining); break
+        cut=remaining.rfind(" ",0,max_chars+1)
+        if cut < max_chars//2: cut=max_chars
+        chunk=remaining[:cut].strip()
+        if not chunk: chunk=remaining[:max_chars].strip(); cut=max_chars
+        chunks.append(chunk)
+        remaining=remaining[cut:].strip()
+    return chunks
+
 def generate_tts_audio(text):
-    if not GROQ_API_KEY:raise RuntimeError("GROQ_API_KEY is missing")
-    clean=re.sub(r"[*_`#]","",text or "").strip(); clean=re.sub(r"\s+"," ",clean)[:3500]
-    r=requests.post("https://api.groq.com/openai/v1/audio/speech",headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},json={"model":TTS_MODEL,"voice":TTS_VOICE,"input":clean,"response_format":"mp3","speed":1.0},timeout=60); r.raise_for_status();
-    if not r.content: raise ValueError("Groq TTS returned empty audio")
-    return r.content
+    """Generate Orpheus WAV chunks (<=200 chars) and transcode them into WhatsApp-compatible MP3."""
+    if not GROQ_API_KEY: raise RuntimeError("GROQ_API_KEY is missing")
+    clean=re.sub(r"[*_`#]","",text or "").strip()
+    clean=re.sub(r"\s+"," ",clean)
+    if not clean: raise ValueError("No text remained for speech generation")
+    # Avoid unexpectedly large/expensive multi-request TTS jobs; send_ai_reply falls back to full text.
+    if len(clean) > 2000:
+        raise ValueError(f"Voice reply is {len(clean)} characters; the safe voice limit is 2000, so ARIA will send text instead")
+    chunks=_split_tts_text(clean,200)
+    ffmpeg=_find_ffmpeg_binary()
+    with tempfile.TemporaryDirectory(prefix="aria_tts_") as work:
+        wav_paths=[]
+        for index,chunk in enumerate(chunks):
+            response=requests.post("https://api.groq.com/openai/v1/audio/speech",
+                headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},
+                json={"model":TTS_MODEL,"voice":TTS_VOICE,"input":chunk,"response_format":"wav","speed":1.0},timeout=60)
+            if not response.ok:
+                raise requests.HTTPError(f"Groq TTS HTTP {response.status_code}: {(response.text or '')[:500]}",response=response)
+            if not response.content: raise ValueError(f"Groq TTS returned empty WAV audio for chunk {index+1}/{len(chunks)}")
+            path=os.path.join(work,f"chunk_{index:03d}.wav")
+            with open(path,"wb") as wav_file: wav_file.write(response.content)
+            wav_paths.append(path)
+        concat_path=os.path.join(work,"concat.txt")
+        with open(concat_path,"w",encoding="utf-8") as listing:
+            for path in wav_paths:
+                listing.write("file '"+path.replace("'","'\\''")+"'\n")
+        mp3_path=os.path.join(work,"aria_voice.mp3")
+        cmd=[ffmpeg,"-hide_banner","-loglevel","error","-y","-f","concat","-safe","0","-i",concat_path,"-vn","-codec:a","libmp3lame","-q:a","4",mp3_path]
+        converted=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
+        if converted.returncode != 0 or not os.path.isfile(mp3_path) or os.path.getsize(mp3_path)==0:
+            raise RuntimeError("ffmpeg WAV-to-MP3 conversion failed: "+(converted.stderr or "no details")[:400])
+        with open(mp3_path,"rb") as audio_file: return audio_file.read()
 
 def send_audio_bytes(to,audio_bytes,mime_type="audio/ogg",context_text=""):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:return False
@@ -1932,15 +1975,19 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* provider={IMAGE_PROVIDER}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy fallback only)'}; Gemini model={GEMINI_IMAGE_MODEL} ({'key configured' if GEMINI_API_KEY else 'key missing'})\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* Pollinations only; API key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy endpoint fallback only)'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
-    try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=8,stream=False)) else "EMPTY RESPONSE"
+    try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
     except Exception:return "FAILED"
 def check_gemini_health():
-    if not GEMINI_API_KEY:return "NOT CONFIGURED"
-    try:return "ONLINE" if gemini_call("Reply only with OK.",system="You are a health check.") else "EMPTY RESPONSE"
-    except Exception:return "FAILED"
+    if not GEMINI_API_KEY: return "NOT CONFIGURED"
+    try:
+        gemini_call("Reply only with OK.",system="You are a health check.",timeout=25,max_output_tokens=128)
+        return f"ONLINE ({GEMINI_MODEL})"
+    except Exception as e:
+        print(f"[GEMINI HEALTH ERROR] model={GEMINI_MODEL} {type(e).__name__}: {str(e)[:350]}")
+        return f"FAILED ({GEMINI_MODEL})"
 def check_groq_models():
     if not client:return "NOT CONFIGURED"
     try:
@@ -2841,6 +2888,13 @@ if __name__=="__main__":
 
 
 
+
+
+
+
+
+
+    
 
 
 
