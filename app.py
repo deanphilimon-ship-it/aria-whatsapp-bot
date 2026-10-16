@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.5.1 (Gemini retry, Groq voice and image-provider fixes)
+# VERSION 17.6 (Natural-language task routing, Gemini 3.6 Flash, natural release notes)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.5.1"
+VERSION = "v17.6.1"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -90,7 +90,8 @@ IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
 CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+# v17.5.1 reliability test: pin normal Gemini chat/vision/live-search calls to stable Gemini 3.6 Flash.
+GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
 ARIA_TIMEZONE = os.getenv("ARIA_TIMEZONE", "Africa/Lagos")
 DEPLOY_COMMIT = _env("RENDER_GIT_COMMIT") or _env("GIT_COMMIT") or _env("SOURCE_VERSION")
@@ -1196,9 +1197,13 @@ IDENTITY
 - Be intelligent, practical, direct and conversational.
 - Do not pretend to be human or claim access you do not have.
 RESPONSE STYLE
-- Respond naturally for WhatsApp. Keep normal answers concise.
+- Respond naturally for WhatsApp. Keep normal answers concise, warm, and helpful.
+- Answer the user's actual question directly first; do not lead with filler or a generic acknowledgement.
+- For ordinary conversational replies, add at most one short, relevant follow-up question or natural reaction to keep the conversation flowing. Do not force a follow-up when it would feel awkward, repetitive, insensitive, or unnecessary.
+- Do not add a conversational follow-up to a command/tool result. Existing command handlers must execute exactly as before; do not reinterpret, rerun, weaken, or decorate command execution in a way that changes its output or effects. Friendly tone applies to normal AI-generated wording only, never to security checks, authorization decisions, or tool results that must remain exact.
 - Use short paragraphs and bullets. No markdown tables or ### headings.
 - Do not add filler or unnecessarily repeat the question.
+- If the user only greets you, reply like a natural, familiar chat partner: brief, warm, and varied. Never use the canned line “What can I do for you today?” or a customer-service opening.
 - MATH AND EQUATIONS: When solving or explaining maths, write phone-friendly plain text, not LaTeX. Avoid LaTeX delimiters, dollar-wrapped equations, fraction/boxed commands, long symbolic notation, and decorative Unicode. Use examples like 3/4, x^2, sqrt(9), 2*x, and <= or >=. Show numbered steps and a clearly labelled final answer. Apply this to every chat answer, not only image-solving commands.
 ACCURACY
 - If uncertain, say so. Never invent sources, facts, API results, files, events or memories.
@@ -1216,7 +1221,7 @@ def build_tool_awareness_context():
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
         "Image generation: `.create <prompt>` / `.imagine <prompt>` create a new image. ARIA routes anime, realistic, fantasy, poster and general requests to configurable image models; Pollinations API key enables the current authenticated endpoint, with a legacy endpoint fallback. Image generation may consume provider credits. `.image` is NOT image generation.",
-        "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers.",
+        "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
         "Documents: `.docx <request>` creates an editable Word file and sends it back in WhatsApp. DOCX generation supports headings, bullets, numbered lists, tables, quotes and code blocks. Send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX to ask questions about it; `.doc <question>` remains available.",
@@ -1890,6 +1895,25 @@ def get_youtube_link(query):return f"*{query.title()}*\n\n▶️ Tap to search: 
 def get_runtime():
     s=int(time.time()-start_time);return f"{s//3600}h {(s%3600)//60}m {s%60}s"
 EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bsex video\b",r"\bsex tape\b",r"\bexplicit sex\b",r"\bsexual intercourse\b",r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",r"\bnaked\s+(?:photo|picture|image|pic)s?\b"]
+def _natural_greeting_reply(text):
+    """Return a short, human-sounding reply for a standalone greeting; otherwise None."""
+    greeting = re.sub(r"[.!?,]+", "", (text or "").strip().lower())
+    greeting = re.sub(r"\s+", " ", greeting)
+    greeting = re.sub(r"\s+aria$", "", greeting).strip()
+    replies = {
+        "hi": "Hey 🙂 What's up?",
+        "hello": "Hey 🙂 What's on your mind?",
+        "hey": "Hey 🙂 What's happening?",
+        "yo": "Yo 🙂 What's good?",
+        "sup": "Yo 🙂 What's happening?",
+        "good morning": "Morning 🙂 How's your day starting?",
+        "good afternoon": "Hey, how's your day going?",
+        "good evening": "Evening 🙂 How's it going?",
+        "how are you": "I'm good—ready to think things through with you. How are you?",
+        "how are you doing": "Doing well 🙂 How's your day going?",
+    }
+    return replies.get(greeting)
+
 def is_explicit_request(text):return bool(text) and any(re.search(p,re.sub(r"\s+"," ",str(text).lower()).strip(),re.I) for p in EXPLICIT_PATTERNS)
 def safety_block_message():return "I can help with educational, medical, safety, or non-explicit topics, but I can't generate or provide explicit sexual content."
 def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Responsive Intelligent Assistant.\n\nARIA is a WhatsApp AI assistant designed for conversation, question-driven vision, image fetching/generation, study help, documents, reminders, guided workflows and diagnostics.\n\nVersion reported by this running process: {VERSION}\nDeployment commit: {DEPLOY_COMMIT or 'not exposed by host'}\nProcess started (UTC): {STARTED_AT_UTC}\nOwner: Philimon Dean\nOwner protection: ENABLED\nContent safety: ENABLED\nReply-to-message context: 48-hour retention (when message was indexed)\nMath formatting: WhatsApp-friendly plain text\nVoice: CONFIGURABLE\n"""
@@ -2469,7 +2493,12 @@ def _send_vision_for_user(user,command):
 # ============================================================
 # Natural-language routing and once-per-release announcement
 # ============================================================
-RELEASE_ANNOUNCEMENT_VERSION = os.getenv("RELEASE_ANNOUNCEMENT_VERSION", "v17.5.1")
+RELEASE_ANNOUNCEMENT_VERSION = VERSION
+# Update this environment value as new release features are added; comma-separated items.
+RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
+    "RELEASE_ANNOUNCEMENT_FEATURES",
+    "Natural-language routing for more supported tasks, Gemini 3.6 Flash model upgrade, conversational intelligence layer, clearer conversational greetings"
+).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 def _send_release_announcement_once(user):
@@ -2482,12 +2511,12 @@ def _send_release_announcement_once(user):
     marker = profile.get("release_announcement_version")
     if marker == RELEASE_ANNOUNCEMENT_VERSION:
         return
+    feature_items = [item.strip() for item in RELEASE_ANNOUNCEMENT_FEATURES.split(",") if item.strip()]
+    feature_text = "\n".join(f"• {item}" for item in feature_items) or "• General improvements and reliability updates"
     message = (
         f"✨ ARIA has been updated ({RELEASE_ANNOUNCEMENT_VERSION})!\n\n"
-        "You can now ask for supported tasks in normal language—such as creating an image, "
-        "doing quick research, or getting guided help—without memorizing commands. "
-        "Commands still work too.\n\n"
-        "Example: ‘Create an anime-style picture of a knight under a moonlit sky.’"
+        "You can ask for more supported tasks in everyday language, while existing commands still work.\n\n"
+        f"*What's new*\n{feature_text}"
     )
     # Mark only after send_text returns without raising. WhatsApp's 24-hour service window
     # still applies; this function is called only in response to an inbound user message.
@@ -2497,6 +2526,70 @@ def _send_release_announcement_once(user):
         save_memory()
     except Exception as e:
         print("[RELEASE ANNOUNCEMENT ERROR]", repr(e)[:200])
+
+def _natural_task_request(text):
+    """Map only clear, low-risk natural-language requests to existing ARIA capabilities.
+
+    This intentionally does not route security, access, deletion, external messaging,
+    purchases, or ambiguous statements into actions. Returns (kind, payload) or None.
+    """
+    t=(text or "").strip()
+    if not t or t.startswith(".") or len(t)>1400:
+        return None
+    low=re.sub(r"\s+", " ", t.lower()).strip()
+
+    # Explicit reminder-list requests; creating reminders is already handled separately.
+    if re.fullmatch(r"(?:please\s+)?(?:show|list|check)\s+(?:my\s+)?reminders|what\s+reminders\s+do\s+i\s+have\??", low):
+        return ("reminders_list", "")
+    # Cancellation is allowed only when a concrete reminder ID is supplied.
+    m=re.fullmatch(r"(?:please\s+)?cancel\s+(?:my\s+)?reminder(?:\s+(?:with\s+)?id)?\s+([a-f0-9]{8})[.!]?", low)
+    if m:
+        return ("reminder_cancel", m.group(1))
+
+    # A guided plan is planning only; it must not claim to execute the plan.
+    m=re.match(r"^(?:please\s+)?(?:help me plan|help me organize|make me a plan for|create a plan for|walk me through)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 3:
+        return ("task", m.group(1).strip()[:1200])
+
+    # Study help and quizzes.
+    m=re.match(r"^(?:please\s+)?(?:quiz me on|test me on|give me a quiz on|make (?:me )?a quiz (?:about|on))\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("quiz", m.group(1).strip()[:700])
+    m=re.match(r"^(?:please\s+)?(?:help me study|make study notes on|give me study notes on|help me prepare for (?:my )?(?:test|exam|exam on)|prepare study notes for)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("study", m.group(1).strip()[:700])
+
+    # Simple learning requests. Avoid routing generic 'explain' follow-ups without a topic.
+    m=re.match(r"^(?:please\s+)?(?:explain|teach me about|help me understand)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("explain", m.group(1).strip()[:900])
+    m=re.match(r"^(?:please\s+)?what does\s+(.+?)\s+mean\??$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("define", m.group(1).strip()[:700])
+    m=re.match(r"^(?:please\s+)?(?:define|what is the meaning of)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        query=m.group(1).strip().rstrip("?!. ")
+        return ("define", query[:700])
+
+    # Translation is routed only when both the target language and source text are clear.
+    m=re.match(r"^(?:please\s+)?translate\s+(.+?)\s+into\s+([a-z][a-z -]{1,30})\s*[:,-]?\s*$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("translate", (m.group(2).strip(), m.group(1).strip()[:1000]))
+    m=re.match(r"^(?:please\s+)?translate\s+to\s+([a-z][a-z -]{1,30})\s*[:,-]\s*(.+)$", t, re.I)
+    if m and len(m.group(2).strip()) >= 2:
+        return ("translate", (m.group(1).strip(), m.group(2).strip()[:1000]))
+
+    # Summarize only when text/content is actually provided in the request.
+    m=re.match(r"^(?:please\s+)?(?:summari[sz]e|give me a summary of)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 20:
+        return ("summarize", m.group(1).strip()[:5000])
+
+    # YouTube helper only returns a search link; it does not claim to play audio.
+    m=re.match(r"^(?:please\s+)?(?:find|search for|look up)\s+(?:the\s+)?(?:song|music|track)\s+(.+)$", t, re.I)
+    if m and len(m.group(1).strip()) >= 2:
+        return ("youtube", m.group(1).strip()[:250])
+    return None
+
 
 def _natural_image_generation_prompt(text):
     """Return a bounded image prompt only for clear create/generate/draw requests."""
@@ -2526,12 +2619,12 @@ def _natural_research_query(text):
     low=t.lower()
     patterns=(r"^(?:please\s+)?(?:do|conduct|carry out|run)\s+(?:a\s+)?(?:quick\s+)?research\s+(?:on|about|into)\s+",
               r"^(?:please\s+)?research\s+(?:on|about|into)\s+",
-              r"^(?:please\s+)?(?:look up|find recent research on|search the web for|do a quick search on)\s+")
+              r"^(?:please\s+)?(?:look up|find recent research on|search the web for|do a quick search on|find out about|check the latest on|what(?:'s| is) the latest on|latest news about)\s+")
     for pattern in patterns:
         m=re.match(pattern,t,flags=re.I)
         if m:
             q=t[m.end():].strip(" .!?\n")
-            return q[:500] if len(q)>=3 else None
+            return q[:500] if len(q)>=2 else None
     return None
 
 @app.route("/webhook",methods=["GET","POST"])
@@ -2834,6 +2927,58 @@ def process_webhook(data):
         if tl.startswith(".define "):r=ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl.startswith(".study "):r=ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl.startswith(".quiz "):r=ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
+
+        # Conservative natural-language aliases for existing low-risk capabilities.
+        # Explicit dot commands above remain authoritative and unchanged.
+        natural_action = _natural_task_request(text)
+        if natural_action:
+            action, payload = natural_action
+            if action == "reminders_list":
+                active=list_reminders(user)
+                reply=("You have no active reminders. You can ask me naturally to remind you of something at a specific time." if not active else
+                       "〔 *REMINDERS* 〕\n\n"+"\n".join(f"• `{r['id']}` — {r['task']} — {_fmt_due(r)}" for r in active))
+            elif action == "reminder_cancel":
+                reply=(f"Reminder `{payload}` cancelled." if cancel_reminder(user,payload) else "I couldn't find that reminder ID. Nothing was changed.")
+            elif action == "task":
+                reply=handle_task_command(user, ".task "+payload)
+            elif action == "quiz":
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call(f"Create a 5-question quiz on '{payload}'. Do not reveal answers yet; ask the user to reply with their answers.",user)
+            elif action == "study":
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call(f"Create concise study notes for '{payload}'. Include a definition, key ideas, one example, common mistake, and 3 exam-focused points. Match the learner's level and explain unfamiliar terms.",user)
+            elif action == "explain":
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call(f"Explain '{payload}' clearly and naturally. Start with a simple explanation, then give an example and explain any important terms. Do not assume advanced knowledge unless the user asks for it.",user)
+            elif action == "define":
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call(f"Define '{payload}' in plain language and give one short example.",user)
+            elif action == "translate":
+                language, source_text = payload
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call(f"Translate the following text into {language}. Return only the natural translation unless a brief ambiguity note is necessary.\n\nText: {source_text}",user)
+            elif action == "summarize":
+                if not check_rate_limit(user,"ai"):
+                    reply="You've reached the hourly AI limit. Try again later."
+                else:
+                    reply=ai_call("Summarize the following clearly and briefly, preserving the important details:\n\n"+payload,user)
+            elif action == "youtube":
+                reply=get_youtube_link(payload)
+            else:
+                reply=None
+            if reply is not None:
+                add_to_memory(user,"assistant",reply);send_ai_reply(user,reply);return "OK",200
+
         if re.match(r"^\.(?:doc|document)(?:\s|$)",tl) or (get_document_context(user) and tl.startswith(("document ","ask document"))):
             q=re.sub(r"^\.?(?:ask\s+)?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
             r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
@@ -2865,6 +3010,9 @@ def process_webhook(data):
         if get_document_context(user) and not needs_live(text) and tl.startswith(("what ","who ","when ","where ","why ","how ","summarize", "explain")):
             # Only use document context when it is clearly the active context.
             r=ask_about_document(user,text);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
+        greeting_reply = _natural_greeting_reply(text)
+        if greeting_reply:
+            add_to_memory(user,"assistant",greeting_reply);send_ai_reply(user,greeting_reply);return "OK",200
         if not text:send_text(user,"Send me a message.");return "OK",200
         r=smart_ask(text,user);add_to_memory(user,"assistant",r);send_ai_reply(user,r)
     except Exception as e:
@@ -2882,47 +3030,3 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
