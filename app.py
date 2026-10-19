@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.7.1 (OpenRouter free chat + Gemini image generation)
+# VERSION 17.7.2 (fixed Gemma 4 31B OpenRouter chat + Gemini image generation)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.7.1"
+VERSION = "v17.7.2"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -66,8 +66,9 @@ GROQ_API_KEY = _env("GROQ_API_KEY")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = (os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1").strip().rstrip("/")
-# Use OpenRouter's free-model router by default to avoid accidentally selecting a paid model.
-OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL", "openrouter/free") or "openrouter/free").strip()  # keep default for free-only routing
+# Pin the second chat provider to one specific free model; do not use OpenRouter's dynamic free router.
+# This is intentionally fixed in source so an old Render OPENROUTER_MODEL variable cannot override it.
+OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -1426,7 +1427,7 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     return text
 
 def openrouter_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    """Call OpenRouter's OpenAI-compatible API. Default model routes only to free models."""
+    """Call the pinned Gemma 4 31B free model through OpenRouter."""
     if not OPENROUTER_API_KEY:raise RuntimeError("OPENROUTER_API_KEY is missing")
     started=time.perf_counter()
     payload={"model":OPENROUTER_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
@@ -1458,7 +1459,7 @@ def model_command_reply(from_number, argument=""):
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current.title()}*\n\n"
                 "Choose one with `.model groq`, `.model openrouter`, or `.model auto`.\n"
                 f"• Groq — main chat model ({CHAT_MODEL}); its existing response style is preserved.\n"
-                f"• OpenRouter — separate chat provider ({OPENROUTER_MODEL}); by default it routes to free models and uses a distinct conversational style.\n"
+                f"• OpenRouter — separate chat provider ({OPENROUTER_MODEL}); pinned to Gemma 4 31B (free) with a distinct conversational style.\n"
                 "• Auto — ARIA tries Groq first, then OpenRouter if Groq fails.\n\n"
                 f"Provider status:\n{availability}\n\n"
                 "Gemini is reserved for vision and image generation, not ordinary chat. A configured key does not guarantee quota; use `.diagnostics` to test provider connectivity.")
@@ -2554,7 +2555,7 @@ def get_diagnostics(user):
         checks.append(("DOCX generation dependency",False))
     lines=["〔 *ARIA JARVIS DIAGNOSTICS* 〕",f"Version: {VERSION}",f"Runtime: {get_runtime()}",f"Jarvis routing: {'ENABLED' if JARVIS_ENABLED else 'DISABLED'}", "", "*Configuration checks*"]
     lines.extend([f"{'✓' if ok else '⚠'} {name}: {'configured' if ok else 'missing / disabled'}" for name,ok in checks])
-    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"OpenRouter: {'KEY PRESENT (free router configured)' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}", f"Vision route: {'Gemini primary + Groq fallback when configured' if GEMINI_API_KEY or client else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
+    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"OpenRouter: {f'KEY PRESENT (fixed model: {OPENROUTER_MODEL})' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}", f"Vision route: {'Gemini primary + Groq fallback when configured' if GEMINI_API_KEY or client else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
     lines.append("✓ Tool selection uses bounded routes to existing handlers; no arbitrary shell/code execution is exposed.")
     lines.append("✓ Owner/admin commands are checked by backend handlers; ordinary users cannot run owner diagnostics or access commands.")
     lines.append("✓ Webhook signature verification is configured.") if APP_SECRET else lines.append("⚠ ALLOW_UNSIGNED_WEBHOOKS is on and WHATSAPP_APP_SECRET is unset: forged webhook requests are accepted. Set the secret." if ALLOW_UNSIGNED_WEBHOOKS else "⚠ WHATSAPP_APP_SECRET is unset: all incoming webhook requests are being rejected. Set it so ARIA can receive messages.")
@@ -2585,7 +2586,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "OpenRouter free-model router as separate chat provider; Gemini image generation with Pollinations fallback; Gemini vision first; Exa-only live search; image-caption handling; preserve v17.6.4 efficiency and Groq style"
+    "Pinned Gemma 4 31B free model via OpenRouter as separate chat provider; Gemini image generation with Pollinations fallback; Gemini/Groq vision; Exa live search; image-caption handling; preserve v17.6.4 efficiency and Groq style"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3128,6 +3129,46 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
