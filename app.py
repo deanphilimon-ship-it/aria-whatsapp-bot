@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.7.2 (fixed Gemma 4 31B OpenRouter chat + Gemini image generation)
+# VERSION 17.7.5 (numbered model switch + embedded-image DOCX + free-only image safety)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.7.2"
+VERSION = "v17.7.5"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -68,7 +68,7 @@ OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = (os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1").strip().rstrip("/")
 # Pin the second chat provider to one specific free model; do not use OpenRouter's dynamic free router.
 # This is intentionally fixed in source so an old Render OPENROUTER_MODEL variable cannot override it.
-OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -81,6 +81,8 @@ PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_K
 # Pollinations is retained as the image-generation fallback.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "zimage").strip() or "zimage"
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
+# Free-only safety: Pollinations generation may consume account credits. Opt in explicitly only after checking its balance.
+ALLOW_POLLINATIONS_IMAGE_FALLBACK = os.getenv("ALLOW_POLLINATIONS_IMAGE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
 # Gemini image generation is attempted first; Pollinations is the fallback.
 IMAGE_PROVIDER = "gemini"
 GEMINI_IMAGE_MODEL = (os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1") or "gemini-nano-banana-2.1").strip()
@@ -281,9 +283,9 @@ def classify_security_category(text, msg, user):
         return None
     if (msg or {}).get("type") == "audio":
         return "ai"
-    if tl in {".lock", ".unlock", ".security", ".menu", ".about", ".status", ".access", ".users", ".pending", ".diagnostics", ".help", ".model", ".voice on", ".voice off", ".reminders", ".remind", ".remind list"}:
+    if tl in {".lock", ".unlock", ".security", ".menu", ".about", ".status", ".access", ".users", ".pending", ".diagnostics", ".help", ".model", ".m", ".voice on", ".voice off", ".reminders", ".remind", ".remind list"}:
         return None
-    if tl.startswith((".lock ", ".unlock ", ".security ", ".help ", ".model ", ".ban ", ".unban ", ".allow ", ".deny ", ".unallow ")):
+    if tl.startswith((".lock ", ".unlock ", ".security ", ".help ", ".model ", ".m ", ".ban ", ".unban ", ".allow ", ".deny ", ".unallow ")):
         return None
     if tl.startswith((".create ", ".imagine ")):
         return "create"
@@ -817,8 +819,7 @@ def pint2_pexels(sender,query):
         try:
             r=requests.get("https://api.unsplash.com/photos/random",params={"query":query,"client_id":UNSPLASH_KEY,"orientation":"portrait"},timeout=15); r.raise_for_status(); return send_image_url(sender,r.json()["urls"]["regular"],f"Pint2 Fallback: {query}\nFrom Unsplash")
         except Exception as e:print("[UNSPLASH FALLBACK ERROR]",repr(e))
-    p=requests.utils.quote(f"{query}, fantasy art, aesthetic wallpaper, ultra detailed, high quality")
-    return send_image_url(sender,f"https://image.pollinations.ai/prompt/{p}?model={requests.utils.quote(IMAGE_MODEL)}&width={IMAGE_WIDTH}&height={max(IMAGE_HEIGHT,1536)}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true",f"Pint2 AI: {query}\nGenerated with FLUX")
+    return send_text(sender,"No wallpaper source returned a free image. The legacy Pollinations generation URL returned HTTP 402 before, so ARIA will not call it or risk credit usage. Try a different query or configure a free image source.")
 
 def pint3_anime(sender,query):
     q=query.lower().replace(" ","_")
@@ -1038,16 +1039,15 @@ def imagine_generate(sender, prompt, explicit_style=None):
     model=GEMINI_IMAGE_MODEL
     enhanced=enhance_image_prompt(prompt,style)
     seed=uuid.uuid4().int % 100000
-    send_text(sender,f"🎨 ARIA is creating your {style} image.\nPrimary: Gemini ({GEMINI_IMAGE_MODEL})\nFallback: Pollinations\n\n{prompt[:500]}")
-    # Gemini is attempted first. If its image model is unavailable, quota-limited, or
-    # returns an unusable image, Pollinations is attempted without looping indefinitely.
+    send_text(sender,f"🎨 ARIA is creating your {style} image.\nPrimary: Gemini ({GEMINI_IMAGE_MODEL})\nPaid/credit fallback: disabled by default\n\n{prompt[:500]}")
+    # Gemini is attempted first. Credit-consuming fallback is disabled unless the owner explicitly opts in.
     if GEMINI_API_KEY:
         try:
             raw,mime=_gemini_image_bytes(enhanced)
             if _send_image_bytes(sender,raw,mime,f"ARIA image · Gemini · {style}\n{prompt[:700]}"):
                 return True
         except Exception as e:print("[GEMINI IMAGE ERROR]",type(e).__name__,str(e)[:500])
-    if POLLINATIONS_API_KEY:
+    if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY:
         try:
             result=_pollinations_image_bytes(enhanced,image_model_for_style(style),seed)
             if result:
@@ -1055,19 +1055,28 @@ def imagine_generate(sender, prompt, explicit_style=None):
                 if _send_image_bytes(sender,raw,mime,f"ARIA image · Pollinations fallback · {style}\n{prompt[:700]}"):
                     return True
         except Exception as e:print("[POLLINATIONS IMAGE ERROR]",type(e).__name__,str(e)[:500])
-    # Legacy Pollinations endpoint retained for deployments without a Pollinations key.
-    try:
-        encoded=requests.utils.quote(enhanced,safe="")
-        url=(f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(image_model_for_style(style))}"
-             f"&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}")
-        if send_image_url(sender,url,f"ARIA image · Pollinations fallback · {style}\n{prompt[:700]}"):
-            return True
-    except Exception as e:print("[LEGACY IMAGE FALLBACK ERROR]",type(e).__name__,str(e)[:400])
-    send_text(sender,"Image generation failed through Gemini and the Pollinations fallback. Gemini image generation may be unavailable on the current API tier or out of quota. Check the API status and `.status`, then try again later.")
+    send_text(sender,"Image generation is currently unavailable on the configured free setup. Gemini may be out of quota, and ARIA did not try the legacy Pollinations endpoint because it returned HTTP 402 before and could involve credits. No paid fallback was attempted. You can still use `.image` to ask questions about an existing image.")
     return False
 
-def build_docx_bytes(title, markdown_text):
-    """Build a formatted editable DOCX from bounded Markdown-like text."""
+def _docx_inline_runs(paragraph, text):
+    """Render basic Markdown bold, italic, and inline-code markers as Word runs."""
+    parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*[^*]+\*)", str(text))
+    for part in parts:
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            paragraph.add_run(part[2:-2]).bold = True
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            paragraph.add_run(part[1:-1]).italic = True
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            run = paragraph.add_run(part[1:-1])
+            run.font.name = "Consolas"
+        else:
+            paragraph.add_run(part)
+
+
+def build_docx_bytes(title, markdown_text, image_bytes=None, image_mime=None, image_caption="Image attached by the user"):
+    """Build a formatted editable DOCX and optionally embed one user-supplied image."""
     from docx import Document
     from docx.shared import Inches, Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1133,6 +1142,21 @@ def build_docx_bytes(title, markdown_text):
             p = doc.add_paragraph(); r = p.add_run("\n".join(code_lines)); r.font.name="Consolas"; r.font.size=Pt(9)
             i += 1; continue
         p = doc.add_paragraph(); _docx_inline_runs(p, line); i += 1
+    if image_bytes:
+        mime = str(image_mime or "image/jpeg").split(";", 1)[0].strip().lower()
+        if mime not in {"image/jpeg", "image/png"}:
+            raise ValueError("DOCX image embedding currently supports JPEG and PNG images only.")
+        image_stream = io.BytesIO(image_bytes)
+        doc.add_paragraph()
+        image_heading = doc.add_paragraph(style="Heading 2")
+        _docx_inline_runs(image_heading, "Attached Image")
+        image_paragraph = doc.add_paragraph()
+        image_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        image_paragraph.add_run().add_picture(image_stream, width=Inches(5.8))
+        caption = doc.add_paragraph(str(image_caption or "Image attached by the user")[:300])
+        caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for run in caption.runs:
+            run.italic = True
     footer = sec.footer.paragraphs[0]
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
     footer.add_run("ARIA · Editable Word document")
@@ -1180,22 +1204,41 @@ def create_docx_for_user(user, request_text):
     request_text = re.sub(r"\s+", " ", str(request_text or "")).strip()[:1200]
     if not request_text:
         return send_text(user, "Usage: `.docx <what to write>`\nExample: `.docx Create a study guide on pharmacology receptors with definitions, examples, a comparison table, and revision questions.`")
-    send_text(user, "📝 ARIA is preparing your editable Word document. This may take a moment.")
+    attached_image = user_waiting_image.get(user)
+    if attached_image and time.time() - attached_image.get("saved_at", 0) > IMAGE_WAIT_TIMEOUT:
+        user_waiting_image.pop(user, None)
+        attached_image = None
+    image_bytes = None
+    image_mime = None
+    if attached_image:
+        try:
+            image_b64, image_mime = download_whatsapp_image(attached_image.get("media_id"), attached_image.get("mime_type"))
+            image_bytes = base64.b64decode(image_b64)
+            if image_mime not in {"image/jpeg", "image/png"}:
+                raise ValueError("For Word embedding, send the image as JPEG or PNG.")
+        except Exception as e:
+            print("[DOCX IMAGE ERROR]", type(e).__name__, str(e)[:400])
+            return send_text(user, "I couldn't attach the image to the Word file. Please resend it as a JPG or PNG, wait for ARIA to confirm receipt, then send `.docx <your request>` again. No document was created.")
+    send_text(user, "📝 ARIA is preparing your editable Word document" + (" with your attached image." if image_bytes else ".") + " This may take a moment.")
     prompt = ("Create complete, useful content for a Microsoft Word document based on this request. "
               "Return Markdown-like text only, with a clear title as the first # heading, sensible headings, concise paragraphs, bullet/numbered lists, and pipe tables when comparison data helps. "
               "Use accurate details; do not invent citations, references, quotations, or data. If references are requested, cite only sources you can identify reliably; otherwise clearly flag what needs verification. "
-              "Include useful diagram descriptions or simple text flowcharts when appropriate, but do not claim an image is embedded. "
-              "Keep the document suitable for editing in Word and avoid LaTeX-heavy notation.\n\nUser request: " + request_text)
+              "Include useful diagram descriptions or simple text flowcharts when appropriate. "
+              + ("A user-supplied image will be embedded after the document text; refer to it naturally if relevant, but do not claim to have visually analyzed it unless you actually have image understanding in this call. " if image_bytes else "Do not claim an image is embedded. ")
+              + "Keep the document suitable for editing in Word and avoid LaTeX-heavy notation.\n\nUser request: " + request_text)
     try:
         content = ai_call(prompt, user, max_output_tokens=5000)
         if not content or content.startswith(("AI request failed", "AI is not configured", "You've reached")):
             return send_text(user, "I couldn't generate the document content because the AI provider is unavailable or rate-limited. No file was created.")
         title_match = re.search(r"(?m)^#\s+(.+)$", content)
         title = title_match.group(1).strip()[:180] if title_match else request_text[:100]
-        data = build_docx_bytes(title, content)
+        data = build_docx_bytes(title, content, image_bytes=image_bytes, image_mime=image_mime,
+                                image_caption="Image supplied by the user for this document" if image_bytes else "")
         filename = _docx_filename(title)
         if send_docx_bytes(user, data, filename, f"{title}\nEditable Microsoft Word document created by ARIA."):
-            send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting. Review facts/references before submitting or publishing.")
+            if image_bytes:
+                user_waiting_image.pop(user, None)
+            send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting" + (" plus your embedded image." if image_bytes else ".") + " Review facts/references before submitting or publishing.")
             return True
         return False
     except Exception as e:
@@ -1238,9 +1281,13 @@ GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
 """
 
 OPENROUTER_CONVERSATIONAL_STYLE_LAYER="""OPENROUTER CONVERSATIONAL PERSONALITY
-- Sound like a thoughtful, curious conversation partner: relaxed, clear, and a little more expressive than a formal assistant.
-- Answer directly, then add useful context only when it helps. For casual messages, react naturally and ask at most one genuine follow-up question.
-- Do not copy the main model's terse service-desk greeting style. Avoid forced emojis, generic praise, and repetitive closing questions.
+- Sound like a relaxed, thoughtful person in a real chat: warm, curious, attentive, and naturally expressive, never like a help-desk script.
+- Match the user's energy and message length. For short casual messages, respond briefly and naturally; don't turn every message into advice or a mini-essay.
+- Let conversation breathe. You may react, tease lightly when appropriate, share a clear perspective, or pick up a detail the user just mentioned. Don't overdo emojis, praise, disclaimers, or repeated follow-up questions.
+- If the user is venting, acknowledge what they actually said before trying to solve it. Don't force positivity or immediately turn feelings into a checklist.
+- Ask at most one genuine follow-up question, and only when it would move the conversation forward. Never append a question just to keep the chat going.
+- Avoid canned openings like “How can I assist you today?”, “That’s a great question”, and “I’m here for you”. Avoid repeatedly announcing that you are an AI.
+- Keep technical help clear and practical, but remain conversational. Don't sacrifice accuracy or security to sound friendly.
 - Respect all existing ARIA commands, safety rules, tool boundaries, and user memory. Never claim to have run a tool unless ARIA actually did so.
 """
 
@@ -1250,7 +1297,7 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` / `.imagine <prompt>` try Gemini native image generation first, then Pollinations as a fallback. Image generation may consume provider quota or credits. `.image` is NOT image generation.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` try Gemini native image generation. Pollinations fallback is disabled by default to avoid unexpected credit usage; it can be enabled explicitly with ALLOW_POLLINATIONS_IMAGE_FALLBACK=true after checking the account balance. `.image` is NOT image generation.",
         "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
@@ -1274,7 +1321,7 @@ def build_tool_awareness_context():
         f"OpenRouter API: {'key present' if OPENROUTER_API_KEY else 'key missing'}; model={OPENROUTER_MODEL}; base URL={OPENROUTER_BASE_URL}; OpenRouter is the second chat provider.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation provider=Gemini ({GEMINI_IMAGE_MODEL}) first, Pollinations fallback; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}.",
+        f"Image generation provider=Gemini ({GEMINI_IMAGE_MODEL}) first; Pollinations fallback={'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled (free-only safety)'}; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured'}.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -1427,7 +1474,7 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     return text
 
 def openrouter_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    """Call the pinned Gemma 4 31B free model through OpenRouter."""
+    """Call the pinned Llama 3.3 70B free model through OpenRouter."""
     if not OPENROUTER_API_KEY:raise RuntimeError("OPENROUTER_API_KEY is missing")
     started=time.perf_counter()
     payload={"model":OPENROUTER_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
@@ -1455,24 +1502,24 @@ def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nOpenRouter chat: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}\nGemini vision/image: {'ready' if GEMINI_API_KEY else 'not configured (needs GEMINI_API_KEY)'}"
-        return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current.title()}*\n\n"
-                "Choose one with `.model groq`, `.model openrouter`, or `.model auto`.\n"
-                f"• Groq — main chat model ({CHAT_MODEL}); its existing response style is preserved.\n"
-                f"• OpenRouter — separate chat provider ({OPENROUTER_MODEL}); pinned to Gemma 4 31B (free) with a distinct conversational style.\n"
-                "• Auto — ARIA tries Groq first, then OpenRouter if Groq fails.\n\n"
+        current_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(current,current.title())
+        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nLlama companion: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}"
+        return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current_label}*\n\n"
+                "Switch with one number:\n`.model 1` — Groq, main assistant\n`.model 2` — Llama companion, more casual chat\n`.model 3` — Auto, Groq first then Llama fallback\n\n"
                 f"Provider status:\n{availability}\n\n"
-                "Gemini is reserved for vision and image generation, not ordinary chat. A configured key does not guarantee quota; use `.diagnostics` to test provider connectivity.")
-    aliases={"default":"groq","openai":"groq","automatic":"auto","second":"openrouter","router":"openrouter"}
+                "You can also use the older `.model groq`, `.model openrouter`, and `.model auto` commands. Model availability depends on provider quota and rate limits.")
+    aliases={"1":"groq","2":"openrouter","3":"auto","default":"groq","openai":"groq","automatic":"auto","second":"openrouter","router":"openrouter",
+             "g":"groq","main":"groq","primary":"groq","groq":"groq","llama":"openrouter","companion":"openrouter","friend":"openrouter","or":"openrouter","o":"openrouter","openrouter":"openrouter","a":"auto","both":"auto","auto":"auto"}
     choice=aliases.get(choice,choice)
     if choice not in {"groq","openrouter","auto"}:
-        return "Usage: `.model` · `.model groq` · `.model openrouter` · `.model auto`"
+        return "Choose a model with `.model 1` (Groq), `.model 2` (Llama companion), or `.model 3` (Auto)."
     if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
-    if choice=="openrouter" and not OPENROUTER_API_KEY:return "OpenRouter isn't configured yet. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
+    if choice=="openrouter" and not OPENROUTER_API_KEY:return "Llama companion isn't configured. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
     if choice=="auto" and not (client or OPENROUTER_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or OPENROUTER_API_KEY."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
-    return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
+    choice_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(choice,choice.title())
+    return f"Done — your chat model is now *{choice_label}*. Saved for your account only.\n\nSwitch any time: `.model 1` · `.model 2` · `.model 3`."
 
 
 def _provider_quota_notice(provider, exc, fallback=None):
@@ -2015,7 +2062,7 @@ def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
 • .model — choose Groq, OpenRouter, or Auto for normal conversation
-• .model groq | .model openrouter | .model auto
+• .model 1 (Groq) | .model 2 (Llama companion) | .model 3 (Auto); older names still work
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -2093,7 +2140,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini ({GEMINI_IMAGE_MODEL}) first, Pollinations fallback; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy endpoint fallback only)'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini ({GEMINI_IMAGE_MODEL}) first; Pollinations fallback {'ENABLED' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'DISABLED (free-only safety)'}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
@@ -2586,7 +2633,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Pinned Gemma 4 31B free model via OpenRouter as separate chat provider; Gemini image generation with Pollinations fallback; Gemini/Groq vision; Exa live search; image-caption handling; preserve v17.6.4 efficiency and Groq style"
+    "Llama 3.3 70B free chat selected for dialogue-oriented conversation style; numbered .model 1/2/3 switching; DOCX inline-run fix and embedded JPG/PNG support; free-only image fallback safety; Gemini/Groq vision; Exa live search; preserve existing security and Groq style"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -2984,14 +3031,14 @@ def process_webhook(data):
         for i,handler in enumerate([pint1_unsplash,pint2_pexels,pint3_anime,pint4_comics,pint5_education,pint_pinterest],1):
             if tl.startswith(f".pint{i} "):handler(user,text[len(f".pint{i}"):].strip());return "OK",200
 
-        if tl==".model" or tl.startswith(".model "):
+        if tl in {".model", ".m"} or tl.startswith((".model ", ".m ")):
             arg=text.split(None,1)[1] if len(text.split(None,1))>1 else ""
             send_text(user,model_command_reply(user,arg));return "OK",200
         if tl==".menu":send_text(user,get_menu());return "OK",200
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Choose `.model groq`, `.model openrouter`, or `.model auto` for normal chat.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (Groq), `.model 2` (Llama companion), `.model 3` (Auto). Older model commands still work.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -3129,33 +3176,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
