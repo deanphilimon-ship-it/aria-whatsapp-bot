@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.6.4 (Gemini-only token efficiency)
+# VERSION 17.7.0 (Qwen chat + Gemini image generation)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.6.4"
+VERSION = "v17.7.0"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -64,6 +64,9 @@ APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_API_KEY = _env("GROQ_API_KEY")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
+QWEN_API_KEY = _env("QWEN_API_KEY") or _env("DASHSCOPE_API_KEY")
+QWEN_BASE_URL = (os.getenv("QWEN_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1") or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip().rstrip("/")
+QWEN_MODEL = (os.getenv("QWEN_MODEL", "qwen3.7-plus") or "qwen3.7-plus").strip()
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -73,11 +76,12 @@ UNSPLASH_KEY = _env("UNSPLASH_KEY")
 PIXABAY_KEY = _env("PIXABAY_KEY")
 COMICVINE_KEY = _env("COMICVINE_KEY")
 PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_KEY") or _env("PINTEREST_TOKEN")
-# Legacy Pollinations alias remains configurable; generation now selects a model by style.
+# Pollinations is retained as the image-generation fallback.
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "zimage").strip() or "zimage"
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
-# Gemini is deliberately not used for image generation; image generation routes through Pollinations only.
-IMAGE_PROVIDER = "pollinations"
+# Gemini image generation is attempted first; Pollinations is the fallback.
+IMAGE_PROVIDER = "gemini"
+GEMINI_IMAGE_MODEL = (os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1") or "gemini-nano-banana-2.1").strip()
 POLLINATIONS_IMAGE_BASE = os.getenv("POLLINATIONS_IMAGE_BASE", "https://gen.pollinations.ai").strip().rstrip("/")
 IMAGE_MODEL_ANIME = os.getenv("IMAGE_MODEL_ANIME", "seedream5").strip() or "seedream5"
 IMAGE_MODEL_REALISTIC = os.getenv("IMAGE_MODEL_REALISTIC", "gptimage").strip() or "gptimage"
@@ -90,10 +94,10 @@ IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
 CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "qwen/qwen3.8-27b").strip()
-# v17.5.1 reliability test: pin normal Gemini chat/vision/live-search calls to stable Gemini 3.6 Flash.
+# Gemini 3.6 Flash is retained for vision calls; ordinary chat and live search do not use Gemini.
 GEMINI_MODEL = "gemini-3.6-flash"
 GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower()
-# Gemini-only efficiency controls; Groq settings and prompt flow remain unchanged.
+# Token-efficiency controls are retained from v17.6.4; Groq chat behavior remains unchanged.
 try: GEMINI_CHAT_MAX_OUTPUT_TOKENS = max(128, min(1024, int(os.getenv("GEMINI_CHAT_MAX_OUTPUT_TOKENS", "512"))))
 except (TypeError, ValueError): GEMINI_CHAT_MAX_OUTPUT_TOKENS = 512
 try: GEMINI_CHAT_TIMEOUT = max(10, min(45, int(os.getenv("GEMINI_CHAT_TIMEOUT", "25"))))
@@ -1002,57 +1006,63 @@ def _pollinations_image_bytes(prompt, model, seed):
     return r.content, ctype
 
 
+def _gemini_image_bytes(prompt):
+    """Generate an image with Gemini's native image endpoint; return (bytes, mime) or raise."""
+    if not GEMINI_API_KEY:raise RuntimeError("GEMINI_API_KEY is missing")
+    payload={"model":GEMINI_IMAGE_MODEL,"input":prompt,"response_format":{"type":"image","mime_type":"image/jpeg","aspect_ratio":"1:1","image_size":"1K"}}
+    r=requests.post("https://generativelanguage.googleapis.com/v1beta/interactions",headers={"Content-Type":"application/json","x-goog-api-key":GEMINI_API_KEY},json=payload,timeout=(10,100))
+    if not r.ok:raise RuntimeError(f"Gemini image HTTP {r.status_code}: {(r.text or '')[:350]}")
+    data=r.json(); image_obj=data.get("output_image") or {}
+    encoded=image_obj.get("data") if isinstance(image_obj,dict) else None
+    if not encoded:
+        # Be tolerant of equivalent output blocks in the Interactions response.
+        for step in data.get("output") or data.get("steps") or []:
+            if isinstance(step,dict):
+                candidate=step.get("output_image") or step.get("image") or {}
+                if isinstance(candidate,dict) and candidate.get("data"):
+                    encoded=candidate.get("data"); image_obj=candidate; break
+    if not encoded:raise ValueError("Gemini returned no image data")
+    raw=base64.b64decode(encoded,validate=True)
+    if not raw:raise ValueError("Gemini returned an empty image")
+    if len(raw)>5*1024*1024:raise ValueError("Gemini image exceeds WhatsApp's 5 MB limit")
+    mime=str(image_obj.get("mime_type") or image_obj.get("mimeType") or "image/jpeg").lower()
+    if mime not in {"image/jpeg","image/png"}:mime="image/jpeg"
+    print(f"[GEMINI IMAGE] model={GEMINI_IMAGE_MODEL} bytes={len(raw)} mime={mime}")
+    return raw,mime
+
+
 def imagine_generate(sender, prompt, explicit_style=None):
-    style = detect_image_style(prompt, explicit_style)
-    model = image_model_for_style(style)
-    enhanced = enhance_image_prompt(prompt, style)
-    seed = uuid.uuid4().int % 100000
-    send_text(sender, f"🎨 ARIA is creating your {style} image.\nModel route: {model}\n\n{prompt[:500]}")
-    # Image generation is Pollinations-only. Gemini remains available for chat/live-search/vision fallback,
-    # but is deliberately excluded from image generation because it has been unreliable for this deployment.
-    # The authenticated Pollinations endpoint supports style/model routing. A configured key can
-    # consume Pollen credits; this code never buys credits or changes billing settings.
+    style=detect_image_style(prompt,explicit_style)
+    model=GEMINI_IMAGE_MODEL
+    enhanced=enhance_image_prompt(prompt,style)
+    seed=uuid.uuid4().int % 100000
+    send_text(sender,f"🎨 ARIA is creating your {style} image.\nPrimary: Gemini ({GEMINI_IMAGE_MODEL})\nFallback: Pollinations\n\n{prompt[:500]}")
+    # Gemini is attempted first. If its image model is unavailable, quota-limited, or
+    # returns an unusable image, Pollinations is attempted without looping indefinitely.
+    if GEMINI_API_KEY:
+        try:
+            raw,mime=_gemini_image_bytes(enhanced)
+            if _send_image_bytes(sender,raw,mime,f"ARIA image · Gemini · {style}\n{prompt[:700]}"):
+                return True
+        except Exception as e:print("[GEMINI IMAGE ERROR]",type(e).__name__,str(e)[:500])
     if POLLINATIONS_API_KEY:
         try:
-            result = _pollinations_image_bytes(enhanced, model, seed)
+            result=_pollinations_image_bytes(enhanced,image_model_for_style(style),seed)
             if result:
-                raw, mime = result
-                if _send_image_bytes(sender, raw, mime, f"ARIA image · {style} · {model}\n{prompt[:700]}"):
+                raw,mime=result
+                if _send_image_bytes(sender,raw,mime,f"ARIA image · Pollinations fallback · {style}\n{prompt[:700]}"):
                     return True
-        except Exception as e:
-            print("[POLLINATIONS IMAGE ERROR]", type(e).__name__, str(e)[:500])
-    # Compatibility fallback for the legacy no-key endpoint. Its availability and free access
-    # are not guaranteed; if it fails, ARIA returns a clear message rather than looping forever.
+        except Exception as e:print("[POLLINATIONS IMAGE ERROR]",type(e).__name__,str(e)[:500])
+    # Legacy Pollinations endpoint retained for deployments without a Pollinations key.
     try:
-        encoded = requests.utils.quote(enhanced, safe="")
-        url = (f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(model)}"
-               f"&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}")
-        if send_image_url(sender, url, f"ARIA image · {style} · {model}\n{prompt[:700]}"):
+        encoded=requests.utils.quote(enhanced,safe="")
+        url=(f"https://image.pollinations.ai/prompt/{encoded}?model={requests.utils.quote(image_model_for_style(style))}"
+             f"&width={IMAGE_WIDTH}&height={IMAGE_HEIGHT}&enhance={str(IMAGE_ENHANCE).lower()}&nologo=true&seed={seed}")
+        if send_image_url(sender,url,f"ARIA image · Pollinations fallback · {style}\n{prompt[:700]}"):
             return True
-    except Exception as e:
-        print("[LEGACY IMAGE FALLBACK ERROR]", type(e).__name__, str(e)[:400])
-    send_text(sender, "Image generation failed through the configured provider and fallback. Check the image API key/model in Render, then try again. Use `.status` to check ARIA configuration.")
+    except Exception as e:print("[LEGACY IMAGE FALLBACK ERROR]",type(e).__name__,str(e)[:400])
+    send_text(sender,"Image generation failed through Gemini and the Pollinations fallback. Gemini image generation may be unavailable on the current API tier or out of quota. Check the API status and `.status`, then try again later.")
     return False
-
-
-# ============================================================
-# DOCX GENERATION
-# ============================================================
-def _docx_inline_runs(paragraph, text):
-    """Render basic Markdown bold/code markers as Word runs; leave content literal otherwise."""
-    parts = re.split(r"(\*\*.*?\*\*|`[^`]+`|\*[^*]+\*)", str(text))
-    for part in parts:
-        if not part:
-            continue
-        if part.startswith("**") and part.endswith("**") and len(part) > 4:
-            paragraph.add_run(part[2:-2]).bold = True
-        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
-            paragraph.add_run(part[1:-1]).italic = True
-        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
-            run = paragraph.add_run(part[1:-1]); run.font.name = "Consolas"
-        else:
-            paragraph.add_run(part)
-
 
 def build_docx_bytes(title, markdown_text):
     """Build a formatted editable DOCX from bounded Markdown-like text."""
@@ -1216,13 +1226,20 @@ SAFETY
 - Do not generate explicit sexual content. Educational, medical, anatomical, safety and non-explicit discussions may be handled clinically.
 """
 
-# This layer is added only when Gemini is the chat provider. Groq retains the
-# established default response style above.
+# The Qwen style layer is used only for the second chat provider. Groq retains
+# the established default response style above.
 GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
 - Answer the user's actual question directly first.
 - For ordinary conversation, add at most one short, relevant follow-up question or natural reaction to keep the conversation flowing. Do not force one when awkward, repetitive, insensitive, or unnecessary.
 - If the message is an existing command or tool result, do not add a follow-up or change its behavior. Existing command handlers, tool outputs, security checks, authorization decisions, and memory rules take precedence and must remain intact.
 - Be warm, concise, and familiar without sounding robotic or pretending to be human.
+"""
+
+QWEN_CONVERSATIONAL_STYLE_LAYER="""QWEN CONVERSATIONAL PERSONALITY
+- Sound like a thoughtful, curious conversation partner: relaxed, clear, and a little more expressive than a formal assistant.
+- Answer directly, then add useful context only when it helps. For casual messages, react naturally and ask at most one genuine follow-up question.
+- Do not copy the main model's terse service-desk greeting style. Avoid forced emojis, generic praise, and repetitive closing questions.
+- Respect all existing ARIA commands, safety rules, tool boundaries, and user memory. Never claim to have run a tool unless ARIA actually did so.
 """
 
 # Tool awareness only: this describes existing ARIA capabilities to the chat model.
@@ -1231,12 +1248,12 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` / `.imagine <prompt>` create a new image. ARIA routes anime, realistic, fantasy, poster and general requests to configurable image models; Pollinations API key enables the current authenticated endpoint, with a legacy endpoint fallback. Image generation may consume provider credits. `.image` is NOT image generation.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` try Gemini native image generation first, then Pollinations as a fallback. Image generation may consume provider quota or credits. `.image` is NOT image generation.",
         "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
         "Documents: `.docx <request>` creates an editable Word file and sends it back in WhatsApp. DOCX generation supports headings, bullets, numbered lists, tables, quotes and code blocks. Send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX to ask questions about it; `.doc <question>` remains available.",
-        "Live web information: `.search <question>`, `.news <topic>`, `.verify <claim>`, and automatic live search for recognized time-sensitive questions when configured. Live search uses Gemini with Google Search grounding and/or Exa search, depending on configuration, and may fail or hit quota; failure is flagged before an offline fallback.",
+        "Live web information: `.search <question>`, `.news <topic>`, `.verify <claim>`, and automatic live search for recognized time-sensitive questions when configured. Exa handles live search; Gemini is reserved for vision and image generation.",
         "Reminders: `.remind me to <task> at <time>`, `.reminders`, and `.remind cancel <id>`.",
         "Guided workflows: `.task <goal>` creates a short plan; `.task next`, `.task done`, `.task status`, and `.task cancel` help the user progress through it. Workflow steps are guidance, not permission to perform arbitrary actions.",
         "Diagnostics: `.diagnostics` is owner/admin-only and checks provider connectivity, model availability, required configuration, persistence, and security warnings.",
@@ -1251,10 +1268,11 @@ def build_tool_awareness_context():
     ]
     availability = [
         f"Groq chat/vision provider: {'key present' if client else 'key missing'}; chat model={CHAT_MODEL}; vision model={VISION_MODEL}.",
-        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; model={GEMINI_MODEL}; Gemini-backed live search and vision fallback require this key.",
-        f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa is a live-search provider, not an AI chat model.",
+        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL}; Exa handles live search.",
+        f"Qwen API: {'key present' if QWEN_API_KEY else 'key missing'}; model={QWEN_MODEL}; base URL={QWEN_BASE_URL}; Qwen is the second chat provider.",
+        f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation provider=Pollinations only; Pollinations API key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}; Pollinations style models anime={IMAGE_MODEL_ANIME}, realistic={IMAGE_MODEL_REALISTIC}, fantasy={IMAGE_MODEL_FANTASY}, poster={IMAGE_MODEL_POSTER}, general={IMAGE_MODEL_GENERAL}.",
+        f"Image generation provider=Gemini ({GEMINI_IMAGE_MODEL}) first, Pollinations fallback; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured (legacy endpoint fallback only)'}.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -1274,7 +1292,7 @@ def build_tool_awareness_context():
             "- If no relevant image/document context exists, ask the user to send it. Explain configuration dependencies honestly.")
 
 def build_gemini_tool_awareness_context():
-    """Compact Gemini-only context to reduce repeated input tokens without changing handlers."""
+    """Compact memory context used by legacy Gemini helper paths without changing handlers."""
     return (
         "ARIA CAPABILITIES AND SAFETY CONTEXT\n"
         f"Runtime identity: ARIA {VERSION}; commit={DEPLOY_COMMIT or 'not exposed by host'}; started_utc={STARTED_AT_UTC}.\n"
@@ -1402,38 +1420,56 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
     started=time.perf_counter()
     c=client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=max(1,min(8192,int(max_tokens))),top_p=.95,stream=False); text=_extract_groq_text(c)
-    print(f"[AI LATENCY] provider=groq seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
+    print(f"[AI LATENCY] provider=groq model={CHAT_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
     if not text:raise ValueError("Groq returned an empty response")
+    return text
+
+def qwen_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
+    """Call Qwen Model Studio using its OpenAI-compatible Chat Completions API."""
+    if not QWEN_API_KEY:raise RuntimeError("QWEN_API_KEY is missing")
+    started=time.perf_counter()
+    payload={"model":QWEN_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
+    r=requests.post(f"{QWEN_BASE_URL}/chat/completions",headers={"Authorization":f"Bearer {QWEN_API_KEY}","Content-Type":"application/json"},json=payload,timeout=(8,35))
+    if not r.ok:
+        body=(r.text or "")[:500]
+        err=RuntimeError(f"Qwen HTTP {r.status_code}: {body}")
+        err.status_code=r.status_code
+        raise err
+    data=r.json(); choices=data.get("choices") or []; msg=(choices[0].get("message") or {}) if choices else {}; text=msg.get("content")
+    if isinstance(text,list):text="\n".join(str(x.get("text", "")) for x in text if isinstance(x,dict))
+    text=str(text or "").strip()
+    usage=data.get("usage") or {}
+    print(f"[QWEN USAGE] model={data.get('model') or QWEN_MODEL} input_tokens={usage.get('prompt_tokens','n/a')} output_tokens={usage.get('completion_tokens','n/a')} total_tokens={usage.get('total_tokens','n/a')} latency_seconds={time.perf_counter()-started:.2f}")
+    if not text:raise ValueError(f"Qwen model {QWEN_MODEL} returned an empty response")
     return text
 
 def get_user_chat_model(from_number):
     choice=str(user_profile.get(from_number,{}).get("chat_model","groq")).strip().lower()
-    return choice if choice in {"groq","gemini","auto"} else "groq"
+    return choice if choice in {"groq","qwen","auto"} else "groq"
 
 
 def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        availability=f"Groq: {'ready' if client else 'not configured'}\nGemini: {'ready' if GEMINI_API_KEY else 'not configured (needs GEMINI_API_KEY)'}"
+        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nQwen chat: {'ready' if QWEN_API_KEY else 'not configured (needs QWEN_API_KEY)'}\nGemini vision/image: {'ready' if GEMINI_API_KEY else 'not configured (needs GEMINI_API_KEY)'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current.title()}*\n\n"
-                "Choose one with `.model groq`, `.model gemini`, or `.model auto`.\n"
-                "• Groq — current default, fast responses.\n"
-                f"• Gemini — Google Gemini API ({GEMINI_MODEL}).\n"
-                "• Auto — ARIA tries Groq first, then Gemini when available.\n\n"
+                "Choose one with `.model groq`, `.model qwen`, or `.model auto`.\n"
+                f"• Groq — main chat model ({CHAT_MODEL}); its existing response style is preserved.\n"
+                f"• Qwen — separate Qwen API provider ({QWEN_MODEL}) with a distinct conversational style.\n"
+                "• Auto — ARIA tries Groq first, then Qwen if Groq fails.\n\n"
                 f"Provider status:\n{availability}\n\n"
-                "A configured key does not guarantee quota or model access; use `.diagnostics` to test provider connectivity.")
-    aliases={"default":"groq","openai":"groq","google":"gemini","automatic":"auto"}
+                "Gemini is reserved for vision and image generation, not ordinary chat. A configured key does not guarantee quota; use `.diagnostics` to test provider connectivity.")
+    aliases={"default":"groq","openai":"groq","automatic":"auto","second":"qwen"}
     choice=aliases.get(choice,choice)
-    if choice not in {"groq","gemini","auto"}:
-        return "Usage: `.model` · `.model groq` · `.model gemini` · `.model auto`"
+    if choice not in {"groq","qwen","auto"}:
+        return "Usage: `.model` · `.model groq` · `.model qwen` · `.model auto`"
     if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
-    if choice=="gemini" and not GEMINI_API_KEY:return "Gemini isn't configured yet. Add GEMINI_API_KEY in Render, redeploy, then use `.model gemini`. Your current preference hasn't changed."
-    if choice=="auto" and not (client or GEMINI_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or GEMINI_API_KEY."
+    if choice=="qwen" and not QWEN_API_KEY:return "Qwen isn't configured yet. Add QWEN_API_KEY (or DASHSCOPE_API_KEY) in Render, then redeploy. Your current preference hasn't changed."
+    if choice=="auto" and not (client or QWEN_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or QWEN_API_KEY."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
     return f"Done. Your conversation model is now *{choice.title()}*. This preference is saved for your account only.\n\nUse `.model` to see provider status or `.model groq` to switch back."
-
 
 
 def _provider_quota_notice(provider, exc, fallback=None):
@@ -1466,59 +1502,45 @@ def _fallback_notice(provider, exc, fallback):
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
     if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):
         return "You've reached the hourly AI limit. Please try again in a while."
-    # Preserve Groq's established context size, system prompt, and output limits.
     ctx=build_memory_context(from_number,prompt,skip_last_user=True)
     full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
-    # Gemini gets a smaller recent-history window and context budget. This does not
-    # change the stored memory or the context Groq receives.
-    gemini_ctx=build_memory_context(from_number,prompt,skip_last_user=True,max_chars=1800,recent_messages=8)
-    if len(gemini_ctx)>1800: gemini_ctx=gemini_ctx[-1800:]
-    gemini_full=f"Current date/time: {_now_str()}\n\n"+(gemini_ctx+"\n\n" if gemini_ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
+    qwen_ctx=build_memory_context(from_number,prompt,skip_last_user=True,max_chars=1800,recent_messages=8)
+    if len(qwen_ctx)>1800:qwen_ctx=qwen_ctx[-1800:]
+    qwen_full=f"Current date/time: {_now_str()}\n\n"+(qwen_ctx+"\n\n" if qwen_ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
     errors=[]; failures=[]
-    groq_tool_context=build_tool_awareness_context()
-    gemini_tool_context=build_gemini_tool_awareness_context()
-    # Groq retains its original response pattern; only Gemini gets the new style layer
-    # and the compact prompt/context controls.
-    groq_system=system+"\n\n"+groq_tool_context
-    gemini_system=system+"\n\n"+GEMINI_CONVERSATIONAL_STYLE_LAYER+"\n\n"+gemini_tool_context
-    # Keep long-form generation requests (e.g. DOCX drafting) at their requested cap;
-    # cap ordinary chat/task answers to the configurable Gemini-only budget.
-    gemini_max_tokens=max_output_tokens if int(max_output_tokens)>1024 else min(int(max_output_tokens),GEMINI_CHAT_MAX_OUTPUT_TOKENS)
+    groq_system=system+"\n\n"+build_tool_awareness_context()
+    qwen_system=system+"\n\n"+QWEN_CONVERSATIONAL_STYLE_LAYER+"\n\n"+build_tool_awareness_context()
     preference=get_user_chat_model(from_number)
-    gemini_request=lambda:gemini_call(gemini_full,gemini_system,timeout=GEMINI_CHAT_TIMEOUT,max_output_tokens=gemini_max_tokens,max_retries=1)
-    if preference=="gemini":
-        providers=[("Gemini",gemini_request),
-                  ("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens))]
-    else:  # groq is the default; auto also tries Groq first, then Gemini
-        providers=[("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens)),
-                  ("Gemini",gemini_request)]
+    qwen_max_tokens=max_output_tokens if int(max_output_tokens)>1024 else min(int(max_output_tokens),512)
+    qwen_request=lambda:qwen_chat_call(qwen_full,qwen_system,max_tokens=qwen_max_tokens)
+    if preference=="qwen":
+        providers=[("Qwen",qwen_request),("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens))]
+    else:  # Groq is the default; auto tries Qwen only if Groq fails.
+        providers=[("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens)),("Qwen",qwen_request)]
     configured=[]
     for provider,call_provider in providers:
         if provider=="Groq" and not client:
             errors.append("Groq: not configured"); continue
-        if provider=="Gemini" and not GEMINI_API_KEY:
-            errors.append("Gemini: not configured"); continue
+        if provider=="Qwen" and not QWEN_API_KEY:
+            errors.append("Qwen: not configured"); continue
         configured.append(provider)
         try:
             result=call_provider()
             if failures:
                 first_provider,first_error=failures[0]
-                notice=_fallback_notice(first_provider,first_error,provider)
-                return notice+result
+                return _fallback_notice(first_provider,first_error,provider)+result
             return result
         except Exception as exc:
-            failures.append((provider,exc))
-            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+            failures.append((provider,exc)); errors.append(f"{provider}: {type(exc).__name__}: {exc}")
             print(f"[AI PROVIDER ERROR] provider={provider} error_type={type(exc).__name__} detail={str(exc)[:400]}")
     print("[AI ERROR SUMMARY]"," | ".join(map(str,errors)))
     quota_providers=[]
     for provider,exc in failures:
-        if _provider_quota_notice(provider,exc,None): quota_providers.append(provider)
+        if _provider_quota_notice(provider,exc,None):quota_providers.append(provider)
     if quota_providers:
         names=" and ".join(dict.fromkeys(quota_providers)); verb="has" if len(set(quota_providers))==1 else "have"
         return f"⏳ {names} {verb} hit an API usage or rate limit. Please try again after the limit resets. If it keeps happening, check the provider usage and billing settings."
-    if not configured:
-        return "AI is not configured.\n\nAdd GROQ_API_KEY and/or GEMINI_API_KEY to Render."
+    if not configured:return "AI is not configured.\n\nAdd GROQ_API_KEY and/or QWEN_API_KEY to Render."
     return "AI request failed.\n\nConfigured AI providers failed. Please try again shortly or use `.health` to check ARIA."
 
 # ============================================================
@@ -1544,15 +1566,18 @@ def groq_vision_call(base64_image,detected_mime,prompt):
 def vision_call(image_url,prompt,mime_type=None):
     try:b64,mime=download_whatsapp_image(image_url,mime_type)
     except Exception as e:return f"I couldn't retrieve that image from WhatsApp.\n\nReason: {str(e)[:500]}"
+    if GEMINI_API_KEY:
+        try:
+            out=gemini_call(prompt+"\n\nBe accurate and concise. If something cannot be determined, say so.",image_data=b64,mime_type=mime,timeout=GEMINI_CHAT_TIMEOUT,max_output_tokens=768,max_retries=1).strip()
+            if out:return out
+            print("[VISION GEMINI] empty response, trying Groq fallback")
+        except Exception as e:print("[VISION GEMINI ERROR]",repr(e))
     if client:
         try:
             out=groq_vision_call(b64,mime,prompt).strip()
             if out:return out
-            print("[VISION GROQ] empty response, trying fallback")
+            print("[VISION GROQ] empty response")
         except Exception as e:print("[VISION GROQ ERROR]",repr(e))
-    if GEMINI_API_KEY:
-        try:return gemini_call(prompt+"\n\nBe accurate and concise. If something cannot be determined, say so.",image_data=b64,mime_type=mime).strip()
-        except Exception as e:print("[VISION GEMINI ERROR]",repr(e))
     return "I couldn't process that image.\n\nBoth configured vision providers failed. Use `.health` to see their status."
 
 def format_math_for_whatsapp(text):
@@ -1999,7 +2024,7 @@ AI & STUDY
 • .quiz <topic>
 • .edu <subject> (educational diagrams + written key points)
 
-LIVE WEB (Gemini / Exa)
+LIVE WEB (Exa only)
 • .search <question> (current web lookup)
 • .news <topic>
 • .verify <claim> (fact-check a written claim)
@@ -2065,19 +2090,15 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {('ON ('+', '.join(p for p in LIVE_PROVIDER_ORDER if (GEMINI_API_KEY if p=='gemini' else EXA_API_KEY))+')') if LIVE_ENABLED else 'OFF - needs EXA_API_KEY or GEMINI_API_KEY'}\n*Image Generation:* Pollinations only; API key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy endpoint fallback only)'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Qwen Chat:* {'CONFIGURED' if QWEN_API_KEY else 'NOT CONFIGURED'}\n*Qwen Model:* {QWEN_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini ({GEMINI_IMAGE_MODEL}) first, Pollinations fallback; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing (legacy endpoint fallback only)'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
     except Exception:return "FAILED"
 def check_gemini_health():
-    if not GEMINI_API_KEY: return "NOT CONFIGURED"
-    try:
-        gemini_call("Reply only with OK.",system="You are a health check.",timeout=25,max_output_tokens=128)
-        return f"ONLINE ({GEMINI_MODEL})"
-    except Exception as e:
-        print(f"[GEMINI HEALTH ERROR] model={GEMINI_MODEL} {type(e).__name__}: {str(e)[:350]}")
-        return f"FAILED ({GEMINI_MODEL})"
+    # Do not spend Gemini text tokens on diagnostics: Gemini is reserved for vision/image generation.
+    if not GEMINI_API_KEY:return "NOT CONFIGURED"
+    return f"KEY PRESENT (vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL}; live test deferred until an image request)"
 def check_groq_models():
     if not client:return "NOT CONFIGURED"
     try:
@@ -2104,10 +2125,9 @@ if not APP_SECRET:
     else:print("[SECURITY] WHATSAPP_APP_SECRET is not set: ALL incoming webhook POSTs will be rejected (403). Set WHATSAPP_APP_SECRET.")
 
 # ============================================================
-# LIVE WEB SEARCH (Gemini Google Search grounding, uses GEMINI_API_KEY)
+# LIVE WEB SEARCH (Exa only; Gemini is reserved for vision and image generation)
 # ============================================================
-# Providers: "gemini" = Gemini + Google Search grounding (needs a PAID Gemini API plan for Gemini 3.x models),
-#            "exa"    = Exa Search API (optional; free monthly credits, no card required at signup).
+# Exa Search API is the dedicated live-search provider; Gemini is not used for live search.
 EXA_API_KEY=_env("EXA_API_KEY")
 EXA_SEARCH_TYPE=(os.getenv("EXA_SEARCH_TYPE","auto") or "auto").strip().lower()
 if EXA_SEARCH_TYPE not in {"instant","fast","auto"}:EXA_SEARCH_TYPE="auto"
@@ -2116,8 +2136,8 @@ def _int_env(name,default,lo,hi):
     except ValueError:return default
 EXA_NUM_RESULTS=_int_env("EXA_NUM_RESULTS",5,1,10)
 EXA_DAILY_LIMIT=_int_env("EXA_DAILY_LIMIT",25,0,5000)   # global cap per UTC day (0 = no Exa searches); protects free credits
-LIVE_PROVIDER_ORDER=[p for p in (x.strip().lower() for x in (os.getenv("LIVE_PROVIDER_ORDER","exa,gemini") or "exa,gemini").split(",")) if p in {"gemini","exa"}] or ["gemini","exa"]
-LIVE_ENABLED=bool(GEMINI_API_KEY or EXA_API_KEY)
+LIVE_PROVIDER_ORDER=["exa"] if EXA_API_KEY and EXA_DAILY_LIMIT>0 else []
+LIVE_ENABLED=bool(LIVE_PROVIDER_ORDER)
 _LIVE_RE=re.compile(r"\b(today|tonight|yesterday|tomorrow|latest|currently|current|right now|news|breaking|headlines?|price of|stock|share price|exchange rate|score|scores|fixtures?|weather|forecast|trending|this (?:week|month|year)|just (?:happened|announced|released)|update on|release date|who (?:is|are) the (?:current )?(?:president|prime minister|ceo|governor|king|champion)|2026)\b",re.I)
 def needs_live(text):return bool(_LIVE_RE.search(text or ""))
 def _now_str():
@@ -2168,7 +2188,7 @@ def _retry_after(resp,body):
 
 _live_cooldown={}; _live_status={}; _live_lock=threading.Lock(); _exa_day={"day":"","count":0}
 print(f"[STARTUP] ARIA version={VERSION} started_utc={STARTED_AT_UTC} commit={DEPLOY_COMMIT or 'unknown'} service_id={RENDER_SERVICE_ID or 'unknown'}")
-print(f"[STARTUP] live_search_enabled={LIVE_ENABLED} provider_order={','.join(LIVE_PROVIDER_ORDER)} exa_key_present={bool(EXA_API_KEY)} gemini_key_present={bool(GEMINI_API_KEY)}")
+print(f"[STARTUP] live_search_enabled={LIVE_ENABLED} provider_order={','.join(LIVE_PROVIDER_ORDER) or 'none'} exa_key_present={bool(EXA_API_KEY)} gemini_key_present={bool(GEMINI_API_KEY)}")
 def _cooldown_left(key):
     with _live_lock:
         c=_live_cooldown.get(key)
@@ -2519,8 +2539,8 @@ def get_diagnostics(user):
     checks.append(("Webhook verify token",bool(VERIFY_TOKEN)))
     checks.append(("Owner number",bool(OWNER_NUMBER)))
     checks.append(("Groq chat/vision key",bool(GROQ_API_KEY)))
-    checks.append(("Gemini chat key",bool(GEMINI_API_KEY)))
-    checks.append(("Gemini key",bool(GEMINI_API_KEY)))
+    checks.append(("Qwen chat key",bool(QWEN_API_KEY)))
+    checks.append(("Gemini vision/image key",bool(GEMINI_API_KEY)))
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
     checks.append(("Pinterest token",bool(PINTEREST_ACCESS_TOKEN)))
@@ -2532,7 +2552,7 @@ def get_diagnostics(user):
         checks.append(("DOCX generation dependency",False))
     lines=["〔 *ARIA JARVIS DIAGNOSTICS* 〕",f"Version: {VERSION}",f"Runtime: {get_runtime()}",f"Jarvis routing: {'ENABLED' if JARVIS_ENABLED else 'DISABLED'}", "", "*Configuration checks*"]
     lines.extend([f"{'✓' if ok else '⚠'} {name}: {'configured' if ok else 'missing / disabled'}" for name,ok in checks])
-    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"Vision route: {'Groq primary + Gemini fallback when configured' if client or GEMINI_API_KEY else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
+    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"Vision route: {'Gemini primary + Groq fallback when configured' if GEMINI_API_KEY or client else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
     lines.append("✓ Tool selection uses bounded routes to existing handlers; no arbitrary shell/code execution is exposed.")
     lines.append("✓ Owner/admin commands are checked by backend handlers; ordinary users cannot run owner diagnostics or access commands.")
     lines.append("✓ Webhook signature verification is configured.") if APP_SECRET else lines.append("⚠ ALLOW_UNSIGNED_WEBHOOKS is on and WHATSAPP_APP_SECRET is unset: forged webhook requests are accepted. Set the secret." if ALLOW_UNSIGNED_WEBHOOKS else "⚠ WHATSAPP_APP_SECRET is unset: all incoming webhook requests are being rejected. Set it so ARIA can receive messages.")
@@ -2563,7 +2583,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Gemini-only token efficiency, compact context, usage diagnostics and faster transient-error fallback; Groq response style preserved"
+    "Qwen as separate chat provider; Gemini image generation with Pollinations fallback; Gemini vision first; Exa-only live search; image-caption handling; preserve v17.6.4 efficiency and Groq style"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -2822,9 +2842,19 @@ def process_webhook(data):
         if tl==".users":send_text(user,get_users_list() if user==OWNER_NUMBER else "Owner only command.");return "OK",200
 
         if msg.get("type")=="image":
-            d=msg.get("image") or {}; mid=d.get("id")
+            d=msg.get("image") or {}; mid=d.get("id"); caption=str(d.get("caption") or "").strip(); mime=d.get("mime_type") or "image/jpeg"
             if not mid:return send_text(user,"I couldn't retrieve that image.") or "OK"
-            user_waiting_image[user]={"media_id":mid,"mime_type":d.get("mime_type") or "image/jpeg","saved_at":time.time()};send_text(user,"Image received. Ask me a question naturally, or use `.image <question>` for a specific visual question. Use `.describe` for a description, `.read` for text, `.solve` for a problem, or `.verify` to inspect credibility.");return "OK",200
+            user_waiting_image[user]={"media_id":mid,"mime_type":mime,"saved_at":time.time()}
+            if caption:
+                # Process image + caption as one incoming task; no second message is needed.
+                image_prompt=caption
+                if image_prompt.lower().startswith(".image "):image_prompt=image_prompt[7:].strip()
+                if not image_prompt:image_prompt="Describe this image accurately and mention any readable text."
+                add_to_memory(user,"user",f"[Image with caption/instruction] {caption}")
+                result=vision_call(mid,"The user sent this image with the following caption/instruction. Use the image and caption together to answer the request; if it is a command, follow its intent where supported.\n\nCaption/instruction: "+image_prompt,mime)
+                add_to_memory(user,"assistant",result);send_ai_reply(user,result)
+                return "OK",200
+            send_text(user,"Image received. Ask me a question naturally, or use `.image <question>` for a specific visual question. Use `.describe` for a description, `.read` for text, `.solve` for a problem, or `.verify` to inspect credibility.");return "OK",200
         if msg.get("type")=="document":
             d=msg.get("document") or {}; mid=d.get("id"); filename=d.get("filename") or "document.txt"
             try:
@@ -2898,7 +2928,7 @@ def process_webhook(data):
             add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl==".livetest":
             if user!=OWNER_NUMBER and user not in ADMIN_NUMBERS:return send_text(user,"Owner/admin only command.") or "OK"
-            if not (GEMINI_API_KEY or EXA_API_KEY):send_text(user,"No live search provider configured. Add EXA_API_KEY and/or GEMINI_API_KEY on Render.");return "OK",200
+            if not EXA_API_KEY:send_text(user,"No live search provider configured. Add EXA_API_KEY on Render.");return "OK",200
             lines=["〔 *LIVE SEARCH TEST* 〕","Each line is one real call (Exa costs about $0.007-0.015). Cooldowns are bypassed here.",""]
             if GEMINI_API_KEY:
                 for mdl in LIVE_MODELS:
@@ -3096,6 +3126,21 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
