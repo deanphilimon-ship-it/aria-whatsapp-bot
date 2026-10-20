@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.7.5 (numbered model switch + embedded-image DOCX + free-only image safety)
+# VERSION 17.7.7 (compact profile memory + WhatsApp image tables + concise chat style)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.7.5"
+VERSION = "v17.7.7"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -28,15 +28,16 @@ WORKFLOW_TIMEOUT = 24 * 60 * 60
 MAX_WORKFLOW_STEPS = 6
 conversation_memory = {}
 user_profile = {}
-MAX_HISTORY = 40
-RECENT_MEMORY_MESSAGES = 20
+MAX_HISTORY = 40  # persisted rolling buffer; only the latest 10 messages enter model prompts
+RECENT_MEMORY_MESSAGES = 10
 LONG_TERM_FACT_LIMIT = 50
-MEMORY_FILE = "aria_memory.json"
+MEMORY_FILE = "aria_memory.json"  # authoritative app/security store; do not replace with profile-only memory
+PROFILE_MEMORY_FILE = os.getenv("PROFILE_MEMORY_FILE", "memory.json")  # compact conversational memory mirror
 DOCUMENT_CONTEXT_LIMIT = 12000
 document_context = {}
 DOCUMENT_WAIT_TIMEOUT = 2 * 60 * 60
-MAX_MEMORY_CONTEXT_CHARS = 3500
-MAX_PROMPT_CHARS = 14000
+MAX_MEMORY_CONTEXT_CHARS = 1000
+MAX_PROMPT_CHARS = 3000
 JARVIS_ENABLED = os.getenv("JARVIS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 MAX_REMINDERS_PER_USER = 20
 
@@ -66,9 +67,9 @@ GROQ_API_KEY = _env("GROQ_API_KEY")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = (os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1").strip().rstrip("/")
-# Pin the second chat provider to one specific free model; do not use OpenRouter's dynamic free router.
-# This is intentionally fixed in source so an old Render OPENROUTER_MODEL variable cannot override it.
-OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
+# Pin the second chat provider to one specific free Gemma model; do not use OpenRouter's dynamic free router.
+# A stale Render OPENROUTER_MODEL variable cannot override this selection. Free endpoint availability/rate limits can still change.
+OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -78,21 +79,27 @@ UNSPLASH_KEY = _env("UNSPLASH_KEY")
 PIXABAY_KEY = _env("PIXABAY_KEY")
 COMICVINE_KEY = _env("COMICVINE_KEY")
 PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_KEY") or _env("PINTEREST_TOKEN")
-# Pollinations is retained as the image-generation fallback.
-IMAGE_MODEL = os.getenv("IMAGE_MODEL", "zimage").strip() or "zimage"
+# Image providers are opt-in to prevent surprise charges. Cloudflare Workers AI Free has a daily allocation;
+# usage above it can be billed on a paid Workers plan, so ARIA never enables it automatically.
+CLOUDFLARE_ACCOUNT_ID = _env("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = _env("CLOUDFLARE_API_TOKEN")
+ALLOW_CLOUDFLARE_IMAGE_GENERATION = os.getenv("ALLOW_CLOUDFLARE_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip() or "@cf/black-forest-labs/flux-1-schnell"
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
-# Free-only safety: Pollinations generation may consume account credits. Opt in explicitly only after checking its balance.
+# Pollinations generation requires authentication; HTTP 402 means the account/key budget is exhausted. Keep opt-in.
 ALLOW_POLLINATIONS_IMAGE_FALLBACK = os.getenv("ALLOW_POLLINATIONS_IMAGE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
-# Gemini image generation is attempted first; Pollinations is the fallback.
-IMAGE_PROVIDER = "gemini"
-GEMINI_IMAGE_MODEL = (os.getenv("GEMINI_IMAGE_MODEL", "gemini-nano-banana-2.1") or "gemini-nano-banana-2.1").strip()
+# Gemini image output has no free tier on the current image models, so it must be explicitly enabled.
+ALLOW_GEMINI_IMAGE_GENERATION = os.getenv("ALLOW_GEMINI_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
+GEMINI_IMAGE_MODEL = (os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-lite-image") or "gemini-3.1-flash-lite-image").strip()
 POLLINATIONS_IMAGE_BASE = os.getenv("POLLINATIONS_IMAGE_BASE", "https://gen.pollinations.ai").strip().rstrip("/")
-IMAGE_MODEL_ANIME = os.getenv("IMAGE_MODEL_ANIME", "seedream5").strip() or "seedream5"
-IMAGE_MODEL_REALISTIC = os.getenv("IMAGE_MODEL_REALISTIC", "gptimage").strip() or "gptimage"
-IMAGE_MODEL_FANTASY = os.getenv("IMAGE_MODEL_FANTASY", "nanobanana-2").strip() or "nanobanana-2"
-IMAGE_MODEL_POSTER = os.getenv("IMAGE_MODEL_POSTER", "ideogram-v4-turbo").strip() or "ideogram-v4-turbo"
-IMAGE_MODEL_GENERAL = os.getenv("IMAGE_MODEL_GENERAL", "zimage").strip() or "zimage"
+# Pollinations model defaults use the lighter FLUX.1 Schnell family; account pricing/balance still applies.
+IMAGE_MODEL_ANIME = os.getenv("IMAGE_MODEL_ANIME", "black-forest-labs/flux.1-schnell").strip() or "black-forest-labs/flux.1-schnell"
+IMAGE_MODEL_REALISTIC = os.getenv("IMAGE_MODEL_REALISTIC", "black-forest-labs/flux.1-schnell").strip() or "black-forest-labs/flux.1-schnell"
+IMAGE_MODEL_FANTASY = os.getenv("IMAGE_MODEL_FANTASY", "black-forest-labs/flux.1-schnell").strip() or "black-forest-labs/flux.1-schnell"
+IMAGE_MODEL_POSTER = os.getenv("IMAGE_MODEL_POSTER", "black-forest-labs/flux.1-schnell").strip() or "black-forest-labs/flux.1-schnell"
+IMAGE_MODEL_GENERAL = os.getenv("IMAGE_MODEL_GENERAL", "black-forest-labs/flux.1-schnell").strip() or "black-forest-labs/flux.1-schnell"
 DOCX_MAX_BYTES = 12 * 1024 * 1024
+POM_OTC_SAFETY_DOCX_PATH = os.getenv("POM_OTC_SAFETY_DOCX_PATH", "POM_OTC_Safety_Guidelines_REVISED.docx").strip() or "POM_OTC_Safety_Guidelines_REVISED.docx"
 IMAGE_WIDTH = int(os.getenv("IMAGE_WIDTH", "1024"))
 IMAGE_HEIGHT = int(os.getenv("IMAGE_HEIGHT", "1024"))
 IMAGE_ENHANCE = os.getenv("IMAGE_ENHANCE", "true").strip().lower() == "true"
@@ -515,6 +522,15 @@ def flush_remote(bans_only=False):
 def _apply_memory(data,banned):
     global conversation_memory,user_profile,BANNED_USERS,access_grants,pending_requests
     conversation_memory=data.get("convo",{}); user_profile=data.get("profile",{}); BANNED_USERS=set(banned)
+    # Backward-compatible per-user summary/long-term memory fields.
+    summaries=data.get("summary",{}) if isinstance(data.get("summary",{}),dict) else {}
+    long_terms=data.get("long_term",{}) if isinstance(data.get("long_term",{}),dict) else {}
+    for uid, summary in summaries.items():
+        if isinstance(summary, str) and summary:
+            user_profile.setdefault(str(uid), {}).setdefault("summary", summary)
+    for uid, items in long_terms.items():
+        if isinstance(items, list):
+            user_profile.setdefault(str(uid), {}).setdefault("long_term", items[-LONG_TERM_FACT_LIMIT:])
     grants=data.get("access")
     if isinstance(grants,dict):access_grants={str(k):v for k,v in grants.items() if isinstance(v,dict)}
     else:   # migrate v15.x saved logins: they now get a fresh ACCESS_DAYS window
@@ -540,14 +556,46 @@ def load_memory():
             print("[MEMORY] Loaded from local file")
         except Exception as e: print("[MEMORY LOAD ERROR]",repr(e))
     _apply_memory(data or {},banned or [])
+    # Recover compact conversational profile memory if the main local store is absent.
+    # This file intentionally contains no access grants, bans, or security state.
+    if os.path.exists(PROFILE_MEMORY_FILE):
+        try:
+            with open(PROFILE_MEMORY_FILE, encoding="utf-8") as f: profile_data=json.load(f)
+            profiles=profile_data.get("user_profile", {}) if isinstance(profile_data,dict) else {}
+            summaries=profile_data.get("summary", {}) if isinstance(profile_data,dict) else {}
+            long_terms=profile_data.get("long_term", {}) if isinstance(profile_data,dict) else {}
+            if isinstance(profiles,dict):
+                for uid, profile in profiles.items():
+                    if not isinstance(profile,dict): continue
+                    target=user_profile.setdefault(str(uid), {})
+                    if profile.get("name") and not target.get("name"): target["name"]=profile["name"]
+                    if profile.get("prefs") and not target.get("preferences"): target["preferences"]=profile["prefs"][:20]
+            if isinstance(summaries,dict):
+                for uid, summary in summaries.items():
+                    if isinstance(summary,str) and summary: user_profile.setdefault(str(uid),{}).setdefault("summary",summary[:600])
+            if isinstance(long_terms,dict):
+                for uid, items in long_terms.items():
+                    if isinstance(items,list) and items: user_profile.setdefault(str(uid),{}).setdefault("long_term",items[-LONG_TERM_FACT_LIMIT:])
+            print("[MEMORY] Loaded compact profile memory")
+        except Exception as e: print("[PROFILE MEMORY LOAD ERROR]",repr(e))
 
 def save_memory():
     global _dirty
     try:
         with _memory_lock:
             tmp=MEMORY_FILE+".tmp"
-            with open(tmp,"w",encoding="utf-8") as f: json.dump({"convo":conversation_memory,"profile":user_profile,"banned":list(BANNED_USERS),"access":access_grants,"pending":pending_requests,"auth":_active_grant_numbers()},f,ensure_ascii=False,indent=2)
+            with open(tmp,"w",encoding="utf-8") as f: json.dump({"convo":conversation_memory,"profile":user_profile,"summary":{u:p.get("summary","") for u,p in user_profile.items() if isinstance(p,dict) and p.get("summary")},"long_term":{u:p.get("long_term",[]) for u,p in user_profile.items() if isinstance(p,dict) and p.get("long_term")},"banned":list(BANNED_USERS),"access":access_grants,"pending":pending_requests,"auth":_active_grant_numbers()},f,ensure_ascii=False,indent=2)
             os.replace(tmp,MEMORY_FILE)
+            # Keep the requested small memory.json schema separate from the full
+            # application store so a profile file can never overwrite access/security data.
+            profile_tmp=PROFILE_MEMORY_FILE+".tmp"
+            compact={
+                "user_profile": {u:{"name":p.get("name",""),"prefs":p.get("preferences",[])[:20]} for u,p in user_profile.items() if isinstance(p,dict)},
+                "summary": {u:str(p.get("summary",""))[:600] for u,p in user_profile.items() if isinstance(p,dict) and p.get("summary")},
+                "long_term": {u:p.get("long_term",[])[-LONG_TERM_FACT_LIMIT:] for u,p in user_profile.items() if isinstance(p,dict) and p.get("long_term")}
+            }
+            with open(profile_tmp,"w",encoding="utf-8") as f: json.dump(compact,f,ensure_ascii=False,indent=2)
+            os.replace(profile_tmp,PROFILE_MEMORY_FILE)
     except Exception as e: print("[MEMORY SAVE ERROR]",repr(e))
     if REMOTE_ENABLED:
         _dirty=True
@@ -764,6 +812,134 @@ def _upload_whatsapp_media(image_bytes,mime_type):
     r=requests.post(graph_url(f"{PHONE_NUMBER_ID}/media"),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},data={"messaging_product":"whatsapp","type":mime_type},files={"file":("aria_image",image_bytes,mime_type)},timeout=45); r.raise_for_status(); mid=r.json().get("id")
     if not mid:raise RuntimeError("WhatsApp media upload returned no media ID")
     return mid
+
+def send_image_bytes(to,image_bytes,caption="Table generated by ARIA"):
+    """Upload and send an in-memory PNG/JPEG to WhatsApp Cloud API."""
+    if not image_bytes or not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:return False
+    message_url=graph_url(f"{PHONE_NUMBER_ID}/messages"); headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}","Content-Type":"application/json"}
+    try:
+        if len(image_bytes)>5*1024*1024: raise ValueError("Image exceeds WhatsApp's 5 MB limit")
+        mid=_upload_whatsapp_media(image_bytes,"image/png")
+        r=requests.post(message_url,headers=headers,json={"messaging_product":"whatsapp","to":to,"type":"image","image":{"id":mid,"caption":str(caption or "")[:1024]}},timeout=30)
+        r.raise_for_status()
+        try:
+            for item in (r.json().get("messages") or []):
+                if item.get("id"):record_message_context(item["id"],to,"outbound","image",caption,mid,"image/png")
+        except Exception as e: print("[REPLY CONTEXT TABLE IMAGE ERROR]",type(e).__name__)
+        return True
+    except Exception as e:
+        print("[WHATSAPP TABLE IMAGE ERROR]",repr(e))
+        return False
+
+
+def _is_table_request(text):
+    t=str(text or "").lower()
+    return any(k in t for k in ("tabular form","in table form","in a table","as a table","table format","compare in table","difference in table","differences in table","make a table","show me a table"))
+
+
+def _wrap_table_text(draw, text, font, max_width):
+    words=str(text or "").split(); lines=[]; current=""
+    for word in words:
+        candidate=(current+" "+word).strip()
+        if current and draw.textbbox((0,0),candidate,font=font)[2] > max_width:
+            lines.append(current); current=word
+        else: current=candidate
+    if current:lines.append(current)
+    return lines or [""]
+
+
+def render_table_png(headers, rows, title="Comparison table"):
+    """Render a clean readable table image using Pillow, with bounded rows/columns."""
+    from PIL import Image, ImageDraw, ImageFont
+    headers=[str(x)[:80] for x in headers[:4]]
+    rows=[[str(x)[:220] for x in row[:len(headers)]] for row in rows[:12]]
+    if not headers or not rows: raise ValueError("No table data")
+    while len(headers)>1 and any(len(row)<len(headers) for row in rows):
+        rows=[row+([""]*(len(headers)-len(row))) for row in rows]
+    width=1500; margin=38; title_h=95; cell_pad_x=20; cell_pad_y=17
+    try:
+        font=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",24)
+        head_font=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",25)
+        title_font=ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",34)
+    except Exception:
+        font=ImageFont.load_default(); head_font=font; title_font=font
+    # Allocate more width to descriptive columns, but keep all columns readable.
+    n=len(headers); usable=width-2*margin; col_widths=[usable//n]*n
+    if n==3: col_widths=[int(usable*.22),int(usable*.39),int(usable*.39)]
+    elif n==2: col_widths=[usable//2,usable-usable//2]
+    else: col_widths=[usable//n]*n; col_widths[-1]+=usable-sum(col_widths)
+    probe=Image.new("RGB",(width,100),(255,255,255)); d=ImageDraw.Draw(probe)
+    wrapped_headers=[_wrap_table_text(d,h,head_font,col_widths[i]-2*cell_pad_x) for i,h in enumerate(headers)]
+    header_height=max(max(d.textbbox((0,0),ln,font=head_font)[3] for ln in lines) for lines in wrapped_headers)+2*cell_pad_y
+    prepared=[]; total_h=margin+title_h+header_height
+    for row in rows:
+        cells=[]
+        for i in range(n):
+            cell=str(row[i] if i<len(row) else "")
+            lines=_wrap_table_text(d,cell,font,col_widths[i]-2*cell_pad_x)
+            cells.append(lines)
+        h=max(max(d.textbbox((0,0),ln,font=font)[3] for ln in lines) for lines in cells)+2*cell_pad_y
+        prepared.append((cells,h)); total_h+=h
+    total_h+=margin
+    im=Image.new("RGB",(width,min(max(total_h,360),5000)),"white"); draw=ImageDraw.Draw(im)
+    draw.text((margin,24),str(title or "Comparison table")[:100],font=title_font,fill=(22,48,75))
+    y=margin+title_h; x=margin
+    for i,lines in enumerate(wrapped_headers):
+        x0=x; x1=x+col_widths[i]; draw.rectangle((x0,y,x1,y+header_height),fill=(30,79,115),outline=(210,220,230),width=2)
+        ty=y+cell_pad_y
+        for ln in lines:draw.text((x0+cell_pad_x,ty),ln,font=head_font,fill="white");ty+=d.textbbox((0,0),ln,font=head_font)[3]+4
+        x=x1
+    y+=header_height
+    for ri,(cells,row_h) in enumerate(prepared):
+        x=margin
+        for ci,lines in enumerate(cells):
+            x1=x+col_widths[ci]; fill=(246,249,252) if ri%2==0 else (255,255,255)
+            draw.rectangle((x,y,x1,y+row_h),fill=fill,outline=(200,211,221),width=2)
+            ty=y+cell_pad_y
+            for ln in lines:draw.text((x+cell_pad_x,ty),ln,font=font,fill=(35,43,52));ty+=d.textbbox((0,0),ln,font=font)[3]+4
+            x=x1
+        y+=row_h
+    out=io.BytesIO(); im.save(out,format="PNG",optimize=True); return out.getvalue()
+
+
+def _table_fallback_bullets(headers, rows):
+    if not rows:return "I couldn't format that comparison as a table. Please try again."
+    out=[]
+    for i,row in enumerate(rows,1):
+        label=str(row[0] if row else f"Item {i}")
+        detail="; ".join(f"{headers[j]}: {row[j]}" for j in range(1,min(len(headers),len(row))) if str(row[j]).strip())
+        out.append(f"*{label}*\n{detail}" if detail else f"• {label}")
+    return "\n\n".join(out)
+
+
+def answer_table_request(user, request_text):
+    """Create a short factual table image; fall back to WhatsApp-safe bullets."""
+    prompt=("Return ONLY valid JSON, no Markdown fences, with schema {\"title\":string,\"headers\":[string,...],\"rows\":[[string,...],...]}. "
+            "Make a concise factual comparison table directly answering the user's request. Use 2-4 columns, 3-10 rows, short cell text, no pipe characters, and ensure every row has the same number of cells as headers. "
+            "For medical/health topics, distinguish conditions accurately and avoid implying disease and infection are mutually exclusive. Request: "+str(request_text)[:1800])
+    raw=ai_call(prompt,user,system=DEFAULT_SYSTEM_PROMPT+"\nYou produce concise factual table data as strict JSON only.",max_output_tokens=700)
+    try:
+        candidate=raw.strip(); candidate=re.sub(r"^```(?:json)?\s*|\s*```$","",candidate,flags=re.I)
+        start=candidate.find("{"); end=candidate.rfind("}")
+        data=json.loads(candidate[start:end+1]); headers=[str(x)[:80] for x in data.get("headers",[])[:4]]; rows=data.get("rows",[])[:10]
+        rows=[[str(x)[:220] for x in row[:len(headers)]] for row in rows if isinstance(row,list)]
+        if len(headers)<2 or not rows:raise ValueError("Malformed table JSON")
+        rows=[row+([""]*(len(headers)-len(row))) for row in rows]
+        title=str(data.get("title") or "Comparison table")[:100]
+        image_data=render_table_png(headers,rows,title)
+        if send_image_bytes(user,image_data,"📊 "+title):
+            add_to_memory(user,"assistant",f"[Sent table image] {title}")
+            return True
+        send_text(user,"I couldn't send the table as an image, so here's the comparison in WhatsApp-friendly text instead.\n\n"+_table_fallback_bullets(headers,rows))
+        return True
+    except Exception as e:
+        print("[TABLE IMAGE ERROR]",type(e).__name__,str(e)[:300])
+        if "headers" in locals() and "rows" in locals() and headers and rows:
+            send_text(user,"I couldn't render the table image this time, so here's the comparison as a readable list.\n\n"+_table_fallback_bullets(headers,rows))
+        else:
+            send_text(user,"I couldn't prepare that table just now. Please try again, or ask for the comparison as short bullet points.")
+        return True
+
 
 def send_image_url(to,image_url,caption=""):
     if not image_url:return False
@@ -992,6 +1168,29 @@ def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
         return False
 
 
+def _cloudflare_image_bytes(prompt, seed):
+    """Generate an image with Cloudflare Workers AI FLUX.1 Schnell."""
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        raise RuntimeError("Cloudflare image generation needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
+    payload = {"prompt": str(prompt)[:2048], "seed": int(seed)}
+    r = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"}, json=payload, timeout=(10, 100))
+    if not r.ok:
+        raise RuntimeError(f"Cloudflare image HTTP {r.status_code}: {(r.text or '')[:350]}")
+    data = r.json()
+    result = data.get("result") or {}
+    encoded = result.get("image") if isinstance(result, dict) else None
+    if not encoded:
+        raise ValueError("Cloudflare FLUX returned no image data")
+    raw = base64.b64decode(encoded, validate=True)
+    if not raw:
+        raise ValueError("Cloudflare FLUX returned an empty image")
+    if len(raw) > 5 * 1024 * 1024:
+        raise ValueError("Cloudflare image exceeds WhatsApp's 5 MB limit")
+    print(f"[CLOUDFLARE IMAGE] model={CLOUDFLARE_IMAGE_MODEL} bytes={len(raw)}")
+    return raw, "image/jpeg"
+
+
 def _pollinations_image_bytes(prompt, model, seed):
     """Use the current authenticated Pollinations endpoint when a key is configured."""
     if not POLLINATIONS_API_KEY:
@@ -1035,28 +1234,48 @@ def _gemini_image_bytes(prompt):
 
 
 def imagine_generate(sender, prompt, explicit_style=None):
-    style=detect_image_style(prompt,explicit_style)
-    model=GEMINI_IMAGE_MODEL
-    enhanced=enhance_image_prompt(prompt,style)
-    seed=uuid.uuid4().int % 100000
-    send_text(sender,f"🎨 ARIA is creating your {style} image.\nPrimary: Gemini ({GEMINI_IMAGE_MODEL})\nPaid/credit fallback: disabled by default\n\n{prompt[:500]}")
-    # Gemini is attempted first. Credit-consuming fallback is disabled unless the owner explicitly opts in.
-    if GEMINI_API_KEY:
+    style = detect_image_style(prompt, explicit_style)
+    enhanced = enhance_image_prompt(prompt, style)
+    seed = uuid.uuid4().int % 100000
+    enabled = []
+    if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
+        enabled.append("Cloudflare FLUX.1 Schnell")
+    if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY:
+        enabled.append(f"Gemini {GEMINI_IMAGE_MODEL}")
+    if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY:
+        enabled.append("Pollinations FLUX.1 Schnell")
+    send_text(sender, f"🎨 ARIA is preparing your {style} image.\nEnabled provider(s): {', '.join(enabled) if enabled else 'none configured'}\n\n{prompt[:500]}")
+
+    # Cloudflare FLUX is the preferred route when explicitly enabled; other providers are also opt-in.
+    if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
         try:
-            raw,mime=_gemini_image_bytes(enhanced)
-            if _send_image_bytes(sender,raw,mime,f"ARIA image · Gemini · {style}\n{prompt[:700]}"):
+            raw, mime = _cloudflare_image_bytes(enhanced, seed)
+            if _send_image_bytes(sender, raw, mime, f"ARIA image · Cloudflare FLUX.1 Schnell · {style}\n{prompt[:700]}"):
                 return True
-        except Exception as e:print("[GEMINI IMAGE ERROR]",type(e).__name__,str(e)[:500])
+        except Exception as e:
+            print("[CLOUDFLARE IMAGE ERROR]", type(e).__name__, str(e)[:500])
+
+    if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY:
+        try:
+            raw, mime = _gemini_image_bytes(enhanced)
+            if _send_image_bytes(sender, raw, mime, f"ARIA image · Gemini {GEMINI_IMAGE_MODEL} · {style}\n{prompt[:700]}"):
+                return True
+        except Exception as e:
+            print("[GEMINI IMAGE ERROR]", type(e).__name__, str(e)[:500])
+
     if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY:
         try:
-            result=_pollinations_image_bytes(enhanced,image_model_for_style(style),seed)
+            result = _pollinations_image_bytes(enhanced, image_model_for_style(style), seed)
             if result:
-                raw,mime=result
-                if _send_image_bytes(sender,raw,mime,f"ARIA image · Pollinations fallback · {style}\n{prompt[:700]}"):
+                raw, mime = result
+                if _send_image_bytes(sender, raw, mime, f"ARIA image · Pollinations · {style}\n{prompt[:700]}"):
                     return True
-        except Exception as e:print("[POLLINATIONS IMAGE ERROR]",type(e).__name__,str(e)[:500])
-    send_text(sender,"Image generation is currently unavailable on the configured free setup. Gemini may be out of quota, and ARIA did not try the legacy Pollinations endpoint because it returned HTTP 402 before and could involve credits. No paid fallback was attempted. You can still use `.image` to ask questions about an existing image.")
+        except Exception as e:
+            print("[POLLINATIONS IMAGE ERROR]", type(e).__name__, str(e)[:500])
+
+    send_text(sender, "Image generation is currently unavailable. Configure Cloudflare Workers AI with CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, then explicitly set ALLOW_CLOUDFLARE_IMAGE_GENERATION=true to use FLUX.1 Schnell. Gemini image generation and Pollinations remain off unless explicitly enabled because they may consume paid quota/credits. A Pollinations HTTP 402 means its account/key budget is exhausted. You can still use `.image` to ask questions about an existing image.")
     return False
+
 
 def _docx_inline_runs(paragraph, text):
     """Render basic Markdown bold, italic, and inline-code markers as Word runs."""
@@ -1198,6 +1417,26 @@ def send_docx_bytes(to, data, filename, caption=""):
         return False
 
 
+def send_safety_doc(chat_id, bot=None):
+    """Send the pre-approved POM/OTC safety DOCX only when the file is actually installed."""
+    path=os.path.abspath(POM_OTC_SAFETY_DOCX_PATH)
+    try:
+        if not os.path.isfile(path):
+            print(f"[SAFETY DOCX] configured file missing path={path}")
+            send_text(chat_id, "I can't send the POM vs OTC Safety Guidelines yet because the DOCX file isn't installed on this deployment. The owner needs to add `POM_OTC_Safety_Guidelines_REVISED.docx` and set `POM_OTC_SAFETY_DOCX_PATH` if it is stored elsewhere.")
+            return False
+        size=os.path.getsize(path)
+        if size<=0 or size>DOCX_MAX_BYTES:
+            send_text(chat_id, "The safety-guidelines DOCX is empty or exceeds the 12 MB delivery limit. Please ask the owner to replace it.")
+            return False
+        with open(path,"rb") as f:data=f.read()
+        return send_docx_bytes(chat_id,data,os.path.basename(path),"Here is your corrected POM vs OTC Safety Guidelines ✅")
+    except Exception as e:
+        print("[SAFETY DOCX ERROR]",type(e).__name__,str(e)[:300])
+        send_text(chat_id,"I couldn't send the safety-guidelines document. The owner should check the configured DOCX file and Render logs.")
+        return False
+
+
 def create_docx_for_user(user, request_text):
     if not check_rate_limit(user, "docx"):
         return send_text(user, "You've reached the hourly Word-document limit. Try again later.")
@@ -1257,8 +1496,9 @@ IDENTITY
 - Be intelligent, practical, direct and conversational.
 - Do not pretend to be human or claim access you do not have.
 RESPONSE STYLE
-- Respond naturally for WhatsApp. Keep normal answers concise.
-- Use short paragraphs and bullets. No markdown tables or ### headings.
+- Respond naturally for WhatsApp. For ordinary chat, aim for 1–2 short sentences (under about 150 tokens) unless the user asks for detail or the task genuinely needs steps.
+- Match the user's tone and use contractions naturally; emojis are occasional, not automatic. Never sound like a help-desk script.
+- Use short paragraphs and bullets. No markdown tables or ### headings in WhatsApp text replies; when a user explicitly asks for a table, ARIA's table handler may send it as an image instead.
 - Do not add filler or unnecessarily repeat the question.
 - If you only receive a greeting, reply briefly, warmly, and naturally. Avoid the canned line “What can I do for you today?” or a customer-service opening.
 - MATH AND EQUATIONS: When solving or explaining maths, write phone-friendly plain text, not LaTeX. Avoid LaTeX delimiters, dollar-wrapped equations, fraction/boxed commands, long symbolic notation, and decorative Unicode. Use examples like 3/4, x^2, sqrt(9), 2*x, and <= or >=. Show numbered steps and a clearly labelled final answer. Apply this to every chat answer, not only image-solving commands.
@@ -1297,7 +1537,7 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` / `.imagine <prompt>` try Gemini native image generation. Pollinations fallback is disabled by default to avoid unexpected credit usage; it can be enabled explicitly with ALLOW_POLLINATIONS_IMAGE_FALLBACK=true after checking the account balance. `.image` is NOT image generation.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` can use Cloudflare Workers AI FLUX.1 Schnell when configured and explicitly enabled. Gemini image generation and Pollinations are separate opt-in routes because their API calls may consume paid quota/credits. `.image` is NOT image generation.",
         "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
@@ -1317,11 +1557,11 @@ def build_tool_awareness_context():
     ]
     availability = [
         f"Groq chat/vision provider: {'key present' if client else 'key missing'}; chat model={CHAT_MODEL}; vision model={VISION_MODEL}.",
-        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL}; Exa handles live search.",
+        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL} (generation opt-in={ALLOW_GEMINI_IMAGE_GENERATION}); Exa handles live search.",
         f"OpenRouter API: {'key present' if OPENROUTER_API_KEY else 'key missing'}; model={OPENROUTER_MODEL}; base URL={OPENROUTER_BASE_URL}; OpenRouter is the second chat provider.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation provider=Gemini ({GEMINI_IMAGE_MODEL}) first; Pollinations fallback={'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled (free-only safety)'}; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured'}.",
+        f"Image generation: Cloudflare FLUX {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Gemini {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Pollinations {'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled/not configured'}; previous Pollinations status={'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled (free-only safety)'}; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured'}.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -1354,46 +1594,61 @@ def build_gemini_tool_awareness_context():
 
 
 def build_memory_context(from_number,current_input="",skip_last_user=False,max_chars=None,recent_messages=None):
+    """Build bounded context from profile summary and only the latest ten chat messages."""
     max_chars=max_chars or MAX_MEMORY_CONTEXT_CHARS
-    recent_messages=RECENT_MEMORY_MESSAGES if recent_messages is None else max(1,int(recent_messages))
-    p=user_profile.get(from_number,{}); head=[]
+    recent_messages=10 if recent_messages is None else max(1,min(10,int(recent_messages)))
+    p=user_profile.get(from_number,{})
+    head=[]
     if p.get("name"):head.append(f"You are talking to {p['name']}.")
-    facts=p.get("facts",[]); prefs=p.get("preferences",[])
-    if facts:head.append("Long-term facts:\n"+"\n".join(f"- {str(x)[:200]}" for x in facts[-15:]))
-    if prefs:head.append("Preferences:\n"+"\n".join(f"- {str(x)[:200]}" for x in prefs[-10:]))
+    if p.get("summary"):head.append("Conversation summary:\n"+str(p["summary"])[:600])
+    facts=p.get("facts",[]); prefs=p.get("preferences",[]); long_term=p.get("long_term",[])
+    if facts:head.append("Remembered facts:\n"+"\n".join(f"- {str(x)[:160]}" for x in facts[-8:]))
+    if prefs:head.append("Preferences:\n"+"\n".join(f"- {str(x)[:160]}" for x in prefs[-6:]))
+    if long_term:head.append("Long-term notes:\n"+"\n".join(f"- {str(x)[:160]}" for x in long_term[-6:]))
     head_text="\n\n".join(head)
-    msgs=list(conversation_memory.get(from_number,[]))
+    msgs=list(conversation_memory.get(from_number,[]))[-recent_messages:]
     if skip_last_user and msgs and msgs[-1].get("role")=="user":msgs=msgs[:-1]
-    budget=max(max_chars-len(head_text),800)
-    older_block=""
-    if len(msgs)>recent_messages and current_input:
-        stop={"what","when","where","which","that","this","with","from","about"}
-        terms={x.lower() for x in re.findall(r"[a-zA-Z0-9]{4,}",current_input) if x.lower() not in stop}
-        scored=[]
-        for m in msgs[:-recent_messages]:
-            c=str(m.get("content","")); score=sum(c.lower().count(t) for t in terms)
-            if score:scored.append((score,c,m.get("role","unknown")))
-        scored.sort(key=lambda x:x[0],reverse=True)
-        if scored:older_block=("Relevant older memory:\n"+"\n".join(f"{r}: {c[:300]}" for _,c,r in scored[:4]))[:budget//3]
-    recent_budget=budget-len(older_block); kept=[]; used=0
-    for m in reversed(msgs[-recent_messages:]):
-        line=f"{m.get('role','unknown')}: {str(m.get('content',''))[:400]}"
-        if kept and used+len(line)+1>recent_budget:break
-        kept.append(line); used+=len(line)+1
-    kept.reverse()
-    out=[]
-    if head_text:out.append(head_text)
-    active_reply = getattr(_reply_context_local, "prompt", "")
-    if active_reply:out.append(active_reply)
-    if kept:out.append("Recent conversation:\n"+"\n".join(kept))
-    if older_block:out.append(older_block)
-    return "\n\n".join(out)
+    active_reply=getattr(_reply_context_local,"prompt","")
+    parts=[x for x in (head_text,active_reply) if x]
+    if msgs:
+        lines=[]
+        for m in msgs:
+            lines.append(f"{m.get('role','unknown')}: {str(m.get('content',''))[:300]}")
+        parts.append("Recent conversation (latest 10 messages maximum):\n"+"\n".join(lines))
+    result="\n\n".join(parts)
+    return result[-max_chars:] if len(result)>max_chars else result
+
+
+def _refresh_user_summary(from_number):
+    """Create a small deterministic checkpoint without another paid model call."""
+    p=user_profile.setdefault(from_number,{})
+    msgs=conversation_memory.get(from_number,[])[-10:]
+    user_lines=[re.sub(r"\s+"," ",str(m.get("content",""))).strip() for m in msgs if m.get("role")=="user" and str(m.get("content","" )).strip()]
+    assistant_lines=[re.sub(r"\s+"," ",str(m.get("content",""))).strip() for m in msgs if m.get("role")=="assistant" and str(m.get("content","" )).strip()]
+    # Exclude command boilerplate and keep the checkpoint concise.
+    user_lines=[x for x in user_lines if not x.startswith(".") and not x.startswith("[")]
+    p["summary"]="\n".join([
+        "Recent topics: "+("; ".join(x[:110] for x in user_lines[-3:]) if user_lines else "No ordinary chat topics in the latest window."),
+        "ARIA replies: "+("; ".join(x[:90] for x in assistant_lines[-2:]) if assistant_lines else "No assistant reply checkpoint."),
+        "Updated: "+datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+    ])[:600]
+    # Preserve explicitly remembered facts/preferences; carry the summary checkpoint as one bounded long-term note.
+    long_term=p.setdefault("long_term",[])
+    checkpoint="Conversation checkpoint: "+p["summary"].splitlines()[0]
+    if checkpoint not in long_term:long_term.append(checkpoint)
+    p["long_term"]=long_term[-LONG_TERM_FACT_LIMIT:]
+    p["messages_since_summary"]=0
+
 
 _NO_MEMORY_PREFIXES=("🌐 Live search failed","🌐 Live check failed","AI request failed","AI is not configured","You've reached the hourly","I couldn't","No recent image","No recent document")
 def add_to_memory(from_number,role,content):
     if not str(content or "").strip():return
     if role=="assistant" and str(content).startswith(_NO_MEMORY_PREFIXES):return
-    conversation_memory.setdefault(from_number,[]).append({"role":role,"content":content}); conversation_memory[from_number]=conversation_memory[from_number][-MAX_HISTORY:]; save_memory()
+    conversation_memory.setdefault(from_number,[]).append({"role":role,"content":content}); conversation_memory[from_number]=conversation_memory[from_number][-MAX_HISTORY:]
+    p=user_profile.setdefault(from_number,{})
+    p["messages_since_summary"]=int(p.get("messages_since_summary",0))+1
+    if p["messages_since_summary"]>=10:_refresh_user_summary(from_number)
+    save_memory()
 
 def remember_user_fact(from_number,fact):
     fact=re.sub(r"\s+"," ",fact).strip().rstrip(".")
@@ -1474,7 +1729,7 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     return text
 
 def openrouter_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    """Call the pinned Llama 3.3 70B free model through OpenRouter."""
+    """Use the pinned Gemma 3 27B free endpoint; no dynamic model selection or paid fallback."""
     if not OPENROUTER_API_KEY:raise RuntimeError("OPENROUTER_API_KEY is missing")
     started=time.perf_counter()
     payload={"model":OPENROUTER_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
@@ -1502,23 +1757,23 @@ def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        current_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(current,current.title())
-        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nLlama companion: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}"
+        current_label={"groq":"Groq","openrouter":"Gemma companion","auto":"Automatic"}.get(current,current.title())
+        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nGemma companion: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current_label}*\n\n"
-                "Switch with one number:\n`.model 1` — Groq, main assistant\n`.model 2` — Llama companion, more casual chat\n`.model 3` — Auto, Groq first then Llama fallback\n\n"
+                "Switch with one number:\n`.model 1` — Groq, main assistant\n`.model 2` — Gemma companion, more casual chat\n`.model 3` — Auto, Groq first then pinned Gemma fallback\n\n"
                 f"Provider status:\n{availability}\n\n"
                 "You can also use the older `.model groq`, `.model openrouter`, and `.model auto` commands. Model availability depends on provider quota and rate limits.")
     aliases={"1":"groq","2":"openrouter","3":"auto","default":"groq","openai":"groq","automatic":"auto","second":"openrouter","router":"openrouter",
              "g":"groq","main":"groq","primary":"groq","groq":"groq","llama":"openrouter","companion":"openrouter","friend":"openrouter","or":"openrouter","o":"openrouter","openrouter":"openrouter","a":"auto","both":"auto","auto":"auto"}
     choice=aliases.get(choice,choice)
     if choice not in {"groq","openrouter","auto"}:
-        return "Choose a model with `.model 1` (Groq), `.model 2` (Llama companion), or `.model 3` (Auto)."
+        return "Choose a model with `.model 1` (Groq), `.model 2` (Gemma companion), or `.model 3` (Auto)."
     if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
-    if choice=="openrouter" and not OPENROUTER_API_KEY:return "Llama companion isn't configured. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
+    if choice=="openrouter" and not OPENROUTER_API_KEY:return "Gemma companion isn't configured. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
     if choice=="auto" and not (client or OPENROUTER_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or OPENROUTER_API_KEY."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
-    choice_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(choice,choice.title())
+    choice_label={"groq":"Groq","openrouter":"Gemma companion","auto":"Automatic"}.get(choice,choice.title())
     return f"Done — your chat model is now *{choice_label}*. Saved for your account only.\n\nSwitch any time: `.model 1` · `.model 2` · `.model 3`."
 
 
@@ -1554,8 +1809,8 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
         return "You've reached the hourly AI limit. Please try again in a while."
     ctx=build_memory_context(from_number,prompt,skip_last_user=True)
     full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
-    openrouter_ctx=build_memory_context(from_number,prompt,skip_last_user=True,max_chars=1800,recent_messages=8)
-    if len(openrouter_ctx)>1800:openrouter_ctx=openrouter_ctx[-1800:]
+    openrouter_ctx=build_memory_context(from_number,prompt,skip_last_user=True,max_chars=1000,recent_messages=10)
+    if len(openrouter_ctx)>1000:openrouter_ctx=openrouter_ctx[-1000:]
     openrouter_full=f"Current date/time: {_now_str()}\n\n"+(openrouter_ctx+"\n\n" if openrouter_ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
     errors=[]; failures=[]
     groq_system=system+"\n\n"+build_tool_awareness_context()
@@ -2062,7 +2317,7 @@ def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
 • .model — choose Groq, OpenRouter, or Auto for normal conversation
-• .model 1 (Groq) | .model 2 (Llama companion) | .model 3 (Auto); older names still work
+• .model 1 (Groq) | .model 2 (Gemma companion) | .model 3 (Auto); older names still work
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -2140,7 +2395,8 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini ({GEMINI_IMAGE_MODEL}) first; Pollinations fallback {'ENABLED' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'DISABLED (free-only safety)'}; Pollinations key {'configured' if POLLINATIONS_API_KEY else 'missing'}\n"""
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
+*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Cloudflare FLUX {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Gemini {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Pollinations {'ENABLED' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'DISABLED/NOT CONFIGURED'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
@@ -2602,7 +2858,7 @@ def get_diagnostics(user):
         checks.append(("DOCX generation dependency",False))
     lines=["〔 *ARIA JARVIS DIAGNOSTICS* 〕",f"Version: {VERSION}",f"Runtime: {get_runtime()}",f"Jarvis routing: {'ENABLED' if JARVIS_ENABLED else 'DISABLED'}", "", "*Configuration checks*"]
     lines.extend([f"{'✓' if ok else '⚠'} {name}: {'configured' if ok else 'missing / disabled'}" for name,ok in checks])
-    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"OpenRouter: {f'KEY PRESENT (fixed model: {OPENROUTER_MODEL})' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}", f"Vision route: {'Gemini primary + Groq fallback when configured' if GEMINI_API_KEY or client else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
+    lines.extend(["", "*Live provider checks (may use API quota)*", f"Groq chat: {check_groq_chat_health()}", f"Groq models: {check_groq_models()}", f"Gemini: {check_gemini_health()}", f"OpenRouter: {f'KEY PRESENT (model: {OPENROUTER_MODEL})' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}", f"Vision route: {'Gemini primary + Groq fallback when configured' if GEMINI_API_KEY or client else 'UNAVAILABLE'}", f"Live search: {live_status_line() if LIVE_ENABLED else 'disabled'}", f"Memory persistence: {'Upstash configured' if REMOTE_ENABLED else 'local-only; data may be lost on redeploy'}", "", "*Security notes*"])
     lines.append("✓ Tool selection uses bounded routes to existing handlers; no arbitrary shell/code execution is exposed.")
     lines.append("✓ Owner/admin commands are checked by backend handlers; ordinary users cannot run owner diagnostics or access commands.")
     lines.append("✓ Webhook signature verification is configured.") if APP_SECRET else lines.append("⚠ ALLOW_UNSIGNED_WEBHOOKS is on and WHATSAPP_APP_SECRET is unset: forged webhook requests are accepted. Set the secret." if ALLOW_UNSIGNED_WEBHOOKS else "⚠ WHATSAPP_APP_SECRET is unset: all incoming webhook requests are being rejected. Set it so ARIA can receive messages.")
@@ -2633,7 +2889,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Llama 3.3 70B free chat selected for dialogue-oriented conversation style; numbered .model 1/2/3 switching; DOCX inline-run fix and embedded JPG/PNG support; free-only image fallback safety; Gemini/Groq vision; Exa live search; preserve existing security and Groq style"
+    "Pinned Gemma companion; numbered .model 1/2/3 switching; compact memory.json profile mirror with last-10 prompt context; WhatsApp-safe table images with bullet fallback; concise human chat style; DOCX image embedding and existing security preserved"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -2965,7 +3221,7 @@ def process_webhook(data):
             r=handle_task_command(user,text);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
         if tl==".health":
-            health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
+            health=f"〔 *ARIA HEALTH* 〕\n\n*Version:* {VERSION}\n*Runtime:* {get_runtime()}\n\n〔 *CORE* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}\n*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n\n〔 *GROQ* 〕\n*Chat:* {check_groq_chat_health()}\n*Models:* {check_groq_models()}\n*Vision:* {'READY' if client else 'NOT CONFIGURED'}\n*Chat Model:* {CHAT_MODEL}\n*Vision Model:* {VISION_MODEL}\n\n〔 *GEMINI* 〕\n*API:* {check_gemini_health()}\n*Vision:* {'READY' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n\n〔 *VOICE* 〕\n*Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SECURITY* 〕\n*Owner:* PROTECTED\n*Password:* {'ENVIRONMENT' if ARIA_PASSWORD else 'DISABLED'}\n*Content Safety:* ENABLED";send_text(user,health);return "OK",200
 
         if tl.startswith(".verify "):
             claim=text[8:].strip()[:1000]
@@ -3038,7 +3294,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (Groq), `.model 2` (Llama companion), `.model 3` (Auto). Older model commands still work.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (Groq), `.model 2` (Gemma companion), `.model 3` (Auto). Older model commands still work.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -3073,6 +3329,10 @@ def process_webhook(data):
         if tl.startswith(".define "):r=ai_call(f"Define '{text[8:].strip()}'. Give a concise definition and one short example.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl.startswith(".study "):r=ai_call(f"Create concise study notes for '{text[7:].strip()}'. Include definition, key ideas, one example, common mistake, and 3 exam-focused points.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl.startswith(".quiz "):r=ai_call(f"Create a 5-question quiz on '{text[6:].strip()}'. Do not reveal answers yet; ask the user to reply with their answers.",user);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
+
+        if text and _is_table_request(text) and not _is_control_command(tl):
+            answer_table_request(user,text)  # ai_call enforces the existing hourly limit
+            return "OK",200
 
         # Conservative natural-language aliases for existing low-risk capabilities.
         # Explicit dot commands above remain authoritative and unchanged.
@@ -3176,6 +3436,17 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
 
 
 
