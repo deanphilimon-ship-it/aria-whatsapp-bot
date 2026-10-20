@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.7.7 (compact profile memory + WhatsApp image tables + concise chat style)
+# VERSION 17.7.8 (Llama companion + alternate Groq fallback)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.7.7"
+VERSION = "v17.7.8"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -67,9 +67,11 @@ GROQ_API_KEY = _env("GROQ_API_KEY")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
 OPENROUTER_BASE_URL = (os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1") or "https://openrouter.ai/api/v1").strip().rstrip("/")
-# Pin the second chat provider to one specific free Gemma model; do not use OpenRouter's dynamic free router.
+# Pin the companion to one specific free Llama model; do not use OpenRouter's dynamic free router.
 # A stale Render OPENROUTER_MODEL variable cannot override this selection. Free endpoint availability/rate limits can still change.
-OPENROUTER_MODEL = "google/gemma-3-27b-it:free"
+OPENROUTER_MODEL = "meta-llama/llama-3.2-3b-instruct:free"
+# Separate Groq fallback for when the OpenRouter companion is unavailable. Main Groq CHAT_MODEL remains unchanged.
+GROQ_COMPANION_FALLBACK_MODEL = "openai/gpt-oss-20b"
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -1558,7 +1560,7 @@ def build_tool_awareness_context():
     availability = [
         f"Groq chat/vision provider: {'key present' if client else 'key missing'}; chat model={CHAT_MODEL}; vision model={VISION_MODEL}.",
         f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL} (generation opt-in={ALLOW_GEMINI_IMAGE_GENERATION}); Exa handles live search.",
-        f"OpenRouter API: {'key present' if OPENROUTER_API_KEY else 'key missing'}; model={OPENROUTER_MODEL}; base URL={OPENROUTER_BASE_URL}; OpenRouter is the second chat provider.",
+        f"OpenRouter API: {'key present' if OPENROUTER_API_KEY else 'key missing'}; model={OPENROUTER_MODEL}; base URL={OPENROUTER_BASE_URL}; OpenRouter Llama is the companion; alternate Groq GPT-OSS 20B is Plan B.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
         f"Image generation: Cloudflare FLUX {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Gemini {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Pollinations {'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled/not configured'}; previous Pollinations status={'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled (free-only safety)'}; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured'}.",
@@ -1728,8 +1730,18 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
+def groq_companion_fallback_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
+    """Use a separate, pinned Groq model as Plan B; leave the primary Groq model untouched."""
+    if not client:raise RuntimeError("GROQ_API_KEY is missing")
+    started=time.perf_counter()
+    c=client.chat.completions.create(model=GROQ_COMPANION_FALLBACK_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=max(1,min(8192,int(max_tokens))),top_p=.95,stream=False)
+    text=_extract_groq_text(c)
+    print(f"[AI LATENCY] provider=groq-plan-b model={GROQ_COMPANION_FALLBACK_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
+    if not text:raise ValueError(f"Groq Plan B model {GROQ_COMPANION_FALLBACK_MODEL} returned an empty response")
+    return text
+
 def openrouter_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    """Use the pinned Gemma 3 27B free endpoint; no dynamic model selection or paid fallback."""
+    """Use the pinned Llama 3.2 3B free endpoint; no dynamic model selection or paid OpenRouter fallback."""
     if not OPENROUTER_API_KEY:raise RuntimeError("OPENROUTER_API_KEY is missing")
     started=time.perf_counter()
     payload={"model":OPENROUTER_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],"temperature":0.7,"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
@@ -1757,23 +1769,23 @@ def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        current_label={"groq":"Groq","openrouter":"Gemma companion","auto":"Automatic"}.get(current,current.title())
-        availability=f"Groq GPT chat: {'ready' if client else 'not configured'}\nGemma companion: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}"
+        current_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(current,current.title())
+        availability=f"Groq main chat: {'ready' if client else 'not configured'}\nLlama companion: {'ready' if OPENROUTER_API_KEY else 'not configured (needs OPENROUTER_API_KEY)'}\nGroq Plan B: {GROQ_COMPANION_FALLBACK_MODEL if client else 'not configured (needs GROQ_API_KEY)'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current_label}*\n\n"
-                "Switch with one number:\n`.model 1` — Groq, main assistant\n`.model 2` — Gemma companion, more casual chat\n`.model 3` — Auto, Groq first then pinned Gemma fallback\n\n"
+                "Switch with one number:\n`.model 1` — Groq, main assistant\n`.model 2` — Llama companion, more casual chat\n`.model 3` — Auto, Groq first, then Llama, then alternate Groq fallback\n\n"
                 f"Provider status:\n{availability}\n\n"
                 "You can also use the older `.model groq`, `.model openrouter`, and `.model auto` commands. Model availability depends on provider quota and rate limits.")
     aliases={"1":"groq","2":"openrouter","3":"auto","default":"groq","openai":"groq","automatic":"auto","second":"openrouter","router":"openrouter",
              "g":"groq","main":"groq","primary":"groq","groq":"groq","llama":"openrouter","companion":"openrouter","friend":"openrouter","or":"openrouter","o":"openrouter","openrouter":"openrouter","a":"auto","both":"auto","auto":"auto"}
     choice=aliases.get(choice,choice)
     if choice not in {"groq","openrouter","auto"}:
-        return "Choose a model with `.model 1` (Groq), `.model 2` (Gemma companion), or `.model 3` (Auto)."
+        return "Choose a model with `.model 1` (Groq), `.model 2` (Llama companion), or `.model 3` (Auto)."
     if choice=="groq" and not client:return "Groq isn't configured. Add GROQ_API_KEY before selecting it."
-    if choice=="openrouter" and not OPENROUTER_API_KEY:return "Gemma companion isn't configured. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
+    if choice=="openrouter" and not OPENROUTER_API_KEY:return "Llama companion isn't configured. Add OPENROUTER_API_KEY in Render, then redeploy. Your current preference hasn't changed."
     if choice=="auto" and not (client or OPENROUTER_API_KEY):return "No chat providers are configured yet. Add GROQ_API_KEY and/or OPENROUTER_API_KEY."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
-    choice_label={"groq":"Groq","openrouter":"Gemma companion","auto":"Automatic"}.get(choice,choice.title())
+    choice_label={"groq":"Groq","openrouter":"Llama companion","auto":"Automatic"}.get(choice,choice.title())
     return f"Done — your chat model is now *{choice_label}*. Saved for your account only.\n\nSwitch any time: `.model 1` · `.model 2` · `.model 3`."
 
 
@@ -1818,14 +1830,17 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
     preference=get_user_chat_model(from_number)
     openrouter_max_tokens=max_output_tokens if int(max_output_tokens)>1024 else min(int(max_output_tokens),512)
     openrouter_request=lambda:openrouter_chat_call(openrouter_full,openrouter_system,max_tokens=openrouter_max_tokens)
+    groq_primary_request=lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens)
+    groq_plan_b_request=lambda:groq_companion_fallback_call(full,groq_system,max_tokens=max_output_tokens)
     if preference=="openrouter":
-        providers=[("OpenRouter",openrouter_request),("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens))]
-    else:  # Groq is the default; auto tries OpenRouter only if Groq fails.
-        providers=[("Groq",lambda:groq_chat_call(full,groq_system,max_tokens=max_output_tokens)),("OpenRouter",openrouter_request)]
+        # Explicit companion mode: Llama first, then a different Groq model, then the usual Groq model.
+        providers=[("OpenRouter",openrouter_request),("Groq Plan B",groq_plan_b_request),("Groq",groq_primary_request)]
+    else:  # Keep Groq as the default; try Llama and then alternate Groq only after earlier providers fail.
+        providers=[("Groq",groq_primary_request),("OpenRouter",openrouter_request),("Groq Plan B",groq_plan_b_request)]
     configured=[]
     for provider,call_provider in providers:
-        if provider=="Groq" and not client:
-            errors.append("Groq: not configured"); continue
+        if provider in {"Groq", "Groq Plan B"} and not client:
+            errors.append(f"{provider}: not configured"); continue
         if provider=="OpenRouter" and not OPENROUTER_API_KEY:
             errors.append("OpenRouter: not configured"); continue
         configured.append(provider)
@@ -2317,7 +2332,7 @@ def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
 • .model — choose Groq, OpenRouter, or Auto for normal conversation
-• .model 1 (Groq) | .model 2 (Gemma companion) | .model 3 (Auto); older names still work
+• .model 1 (Groq) | .model 2 (Llama companion) | .model 3 (Auto); older names still work
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -2395,7 +2410,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Plan B:* {GROQ_COMPANION_FALLBACK_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
 *Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Cloudflare FLUX {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Gemini {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Pollinations {'ENABLED' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'DISABLED/NOT CONFIGURED'}\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
@@ -2889,7 +2904,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Pinned Gemma companion; numbered .model 1/2/3 switching; compact memory.json profile mirror with last-10 prompt context; WhatsApp-safe table images with bullet fallback; concise human chat style; DOCX image embedding and existing security preserved"
+    "Pinned Llama 3.2 3B free companion; alternate Groq GPT-OSS 20B fallback; numbered .model 1/2/3 switching; compact memory.json profile mirror with last-10 prompt context; WhatsApp-safe table images with bullet fallback; concise human chat style; DOCX image embedding and existing security preserved"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3294,7 +3309,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (Groq), `.model 2` (Gemma companion), `.model 3` (Auto). Older model commands still work.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (Groq), `.model 2` (Llama companion), `.model 3` (Auto). Older model commands still work.",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
@@ -3436,6 +3451,18 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
