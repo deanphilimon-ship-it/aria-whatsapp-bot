@@ -7,7 +7,7 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.7.9 (Gemma free companion + paid-route guard)
+# VERSION 17.7.9 (Gemini image primary + Cloudflare fallback; Gemma free companion)
 # ============================================================
 app = Flask(__name__)
 VERSION = "v17.7.9"
@@ -81,8 +81,8 @@ UNSPLASH_KEY = _env("UNSPLASH_KEY")
 PIXABAY_KEY = _env("PIXABAY_KEY")
 COMICVINE_KEY = _env("COMICVINE_KEY")
 PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_KEY") or _env("PINTEREST_TOKEN")
-# Image providers are opt-in to prevent surprise charges. Cloudflare Workers AI Free has a daily allocation;
-# usage above it can be billed on a paid Workers plan, so ARIA never enables it automatically.
+# Image providers remain explicitly opt-in to avoid surprise charges. Gemini is primary; Cloudflare FLUX is fallback.
+# Both providers may consume paid quota depending on account/model/plan, so enable them deliberately in Render.
 CLOUDFLARE_ACCOUNT_ID = _env("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_API_TOKEN = _env("CLOUDFLARE_API_TOKEN")
 ALLOW_CLOUDFLARE_IMAGE_GENERATION = os.getenv("ALLOW_CLOUDFLARE_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -90,7 +90,7 @@ CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-l
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
 # Pollinations generation requires authentication; HTTP 402 means the account/key budget is exhausted. Keep opt-in.
 ALLOW_POLLINATIONS_IMAGE_FALLBACK = os.getenv("ALLOW_POLLINATIONS_IMAGE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
-# Gemini image output has no free tier on the current image models, so it must be explicitly enabled.
+# Gemini is the primary image-generation provider, but remains explicitly opt-in because image calls may be billable.
 ALLOW_GEMINI_IMAGE_GENERATION = os.getenv("ALLOW_GEMINI_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_IMAGE_MODEL = (os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-lite-image") or "gemini-3.1-flash-lite-image").strip()
 POLLINATIONS_IMAGE_BASE = os.getenv("POLLINATIONS_IMAGE_BASE", "https://gen.pollinations.ai").strip().rstrip("/")
@@ -1239,25 +1239,17 @@ def imagine_generate(sender, prompt, explicit_style=None):
     style = detect_image_style(prompt, explicit_style)
     enhanced = enhance_image_prompt(prompt, style)
     seed = uuid.uuid4().int % 100000
+    gemini_ready = ALLOW_GEMINI_IMAGE_GENERATION and bool(GEMINI_API_KEY)
+    cloudflare_ready = ALLOW_CLOUDFLARE_IMAGE_GENERATION and bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)
     enabled = []
-    if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
-        enabled.append("Cloudflare FLUX.1 Schnell")
-    if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY:
-        enabled.append(f"Gemini {GEMINI_IMAGE_MODEL}")
-    if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY:
-        enabled.append("Pollinations FLUX.1 Schnell")
-    send_text(sender, f"🎨 ARIA is preparing your {style} image.\nEnabled provider(s): {', '.join(enabled) if enabled else 'none configured'}\n\n{prompt[:500]}")
+    if gemini_ready:
+        enabled.append(f"Gemini {GEMINI_IMAGE_MODEL} (primary)")
+    if cloudflare_ready:
+        enabled.append("Cloudflare FLUX.1 Schnell (fallback)")
+    send_text(sender, f"🎨 ARIA is preparing your {style} image.\nProvider order: {', '.join(enabled) if enabled else 'none configured/enabled'}\n\n{prompt[:500]}")
 
-    # Cloudflare FLUX is the preferred route when explicitly enabled; other providers are also opt-in.
-    if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
-        try:
-            raw, mime = _cloudflare_image_bytes(enhanced, seed)
-            if _send_image_bytes(sender, raw, mime, f"ARIA image · Cloudflare FLUX.1 Schnell · {style}\n{prompt[:700]}"):
-                return True
-        except Exception as e:
-            print("[CLOUDFLARE IMAGE ERROR]", type(e).__name__, str(e)[:500])
-
-    if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY:
+    # Gemini is primary. Cloudflare is tried only if Gemini is unavailable or fails.
+    if gemini_ready:
         try:
             raw, mime = _gemini_image_bytes(enhanced)
             if _send_image_bytes(sender, raw, mime, f"ARIA image · Gemini {GEMINI_IMAGE_MODEL} · {style}\n{prompt[:700]}"):
@@ -1265,17 +1257,27 @@ def imagine_generate(sender, prompt, explicit_style=None):
         except Exception as e:
             print("[GEMINI IMAGE ERROR]", type(e).__name__, str(e)[:500])
 
-    if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY:
+    if cloudflare_ready:
         try:
-            result = _pollinations_image_bytes(enhanced, image_model_for_style(style), seed)
-            if result:
-                raw, mime = result
-                if _send_image_bytes(sender, raw, mime, f"ARIA image · Pollinations · {style}\n{prompt[:700]}"):
-                    return True
+            raw, mime = _cloudflare_image_bytes(enhanced, seed)
+            if _send_image_bytes(sender, raw, mime, f"ARIA image · Cloudflare FLUX.1 Schnell (fallback) · {style}\n{prompt[:700]}"):
+                return True
         except Exception as e:
-            print("[POLLINATIONS IMAGE ERROR]", type(e).__name__, str(e)[:500])
+            print("[CLOUDFLARE IMAGE FALLBACK ERROR]", type(e).__name__, str(e)[:500])
 
-    send_text(sender, "Image generation is currently unavailable. Configure Cloudflare Workers AI with CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN, then explicitly set ALLOW_CLOUDFLARE_IMAGE_GENERATION=true to use FLUX.1 Schnell. Gemini image generation and Pollinations remain off unless explicitly enabled because they may consume paid quota/credits. A Pollinations HTTP 402 means its account/key budget is exhausted. You can still use `.image` to ask questions about an existing image.")
+    if not GEMINI_API_KEY:
+        gemini_status = "Gemini is not configured (missing GEMINI_API_KEY)."
+    elif not ALLOW_GEMINI_IMAGE_GENERATION:
+        gemini_status = "Gemini image generation is disabled; set ALLOW_GEMINI_IMAGE_GENERATION=true to enable the primary provider."
+    else:
+        gemini_status = "Gemini image generation failed or could not deliver the image."
+    if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
+        cloudflare_status = "Cloudflare fallback needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN."
+    elif not ALLOW_CLOUDFLARE_IMAGE_GENERATION:
+        cloudflare_status = "Cloudflare fallback is disabled; set ALLOW_CLOUDFLARE_IMAGE_GENERATION=true to enable it."
+    else:
+        cloudflare_status = "Cloudflare fallback also failed or could not deliver the image."
+    send_text(sender, f"Image generation is currently unavailable.\n{gemini_status}\n{cloudflare_status}\nNo Pollinations or unapproved provider was used. Gemini and Cloudflare usage may consume quota or incur charges depending on your account and plan. You can still use `.image` to ask questions about an existing image.")
     return False
 
 
@@ -1539,7 +1541,7 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` / `.imagine <prompt>` can use Cloudflare Workers AI FLUX.1 Schnell when configured and explicitly enabled. Gemini image generation and Pollinations are separate opt-in routes because their API calls may consume paid quota/credits. `.image` is NOT image generation.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` tries Gemini first, then Cloudflare Workers AI FLUX.1 Schnell as fallback. Both must be configured and explicitly enabled; usage may consume paid quota/credits. Pollinations is not in the generation route. `.image` is NOT image generation.",
         "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
@@ -1559,11 +1561,11 @@ def build_tool_awareness_context():
     ]
     availability = [
         f"Groq chat/vision provider: {'key present' if client else 'key missing'}; chat model={CHAT_MODEL}; vision model={VISION_MODEL}.",
-        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL} (generation opt-in={ALLOW_GEMINI_IMAGE_GENERATION}); Exa handles live search.",
+        f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image model={GEMINI_IMAGE_MODEL} (primary; enabled={ALLOW_GEMINI_IMAGE_GENERATION}); Exa handles live search.",
         f"OpenRouter API: {'key present' if OPENROUTER_API_KEY else 'key missing'}; model={OPENROUTER_MODEL}; base URL={OPENROUTER_BASE_URL}; OpenRouter Gemma free is the companion; alternate Groq GPT-OSS 20B is Plan B.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation: Cloudflare FLUX {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Gemini {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Pollinations {'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled/not configured'}; previous Pollinations status={'enabled' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'disabled (free-only safety)'}; Pollinations key={'configured' if POLLINATIONS_API_KEY else 'not configured'}.",
+        f"Image generation order: Gemini primary {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Cloudflare FLUX fallback {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Pollinations is not used by the generation route.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -2414,7 +2416,7 @@ Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
     local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Plan B:* {GROQ_COMPANION_FALLBACK_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*OpenRouter Chat:* {'CONFIGURED' if OPENROUTER_API_KEY else 'NOT CONFIGURED'}\n*OpenRouter Model:* {OPENROUTER_MODEL}\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
-*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Cloudflare FLUX {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Gemini {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Pollinations {'ENABLED' if ALLOW_POLLINATIONS_IMAGE_FALLBACK and POLLINATIONS_API_KEY else 'DISABLED/NOT CONFIGURED'}\n"""
+*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini primary {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Cloudflare FLUX fallback {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Pollinations not used\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
@@ -3454,45 +3456,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
