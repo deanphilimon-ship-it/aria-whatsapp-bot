@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.8.1 (early model-command dispatch + concise status)
+# VERSION 17.8.2 (Wikimedia-only education + technical image generation)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.8.1"
+VERSION = "v17.8.2"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -82,7 +82,7 @@ PINTEREST_ACCESS_TOKEN = _env("PINTEREST_ACCESS_TOKEN") or _env("PINTEREST_API_K
 CLOUDFLARE_ACCOUNT_ID = _env("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_API_TOKEN = _env("CLOUDFLARE_API_TOKEN")
 ALLOW_CLOUDFLARE_IMAGE_GENERATION = os.getenv("ALLOW_CLOUDFLARE_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
-CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip() or "@cf/black-forest-labs/flux-1-schnell"
+CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev").strip() or "@cf/black-forest-labs/flux-2-dev"
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
 # Pollinations generation requires authentication; HTTP 402 means the account/key budget is exhausted. Keep opt-in.
 ALLOW_POLLINATIONS_IMAGE_FALLBACK = os.getenv("ALLOW_POLLINATIONS_IMAGE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -1052,37 +1052,33 @@ def _wikimedia_edu_candidates(query):
                 out.append({"url":info.get("thumburl") or info.get("url"),"title":title,"source":"Wikimedia Commons","creator":mv("Artist"),"license":mv("LicenseShortName"),"score":_edu_score(title,query)})
         except Exception as e:print("[EDU WIKIMEDIA ERROR]",repr(e))
     return out
-def _openverse_edu_candidates(query):
-    out=[]
-    try:
-        r=requests.get("https://api.openverse.org/v1/images/",params={"q":f"{query} diagram","page_size":12,"category":"illustration","extension":"jpg,png"},headers={"User-Agent":"ARIA-Bot/1.0"},timeout=15); r.raise_for_status()
-        for x in r.json().get("results",[]):
-            u=x.get("url") or x.get("thumbnail"); title=x.get("title") or "Educational image"
-            if u:out.append({"url":u,"title":title,"source":"Openverse","creator":x.get("creator"),"license":x.get("license"),"score":_edu_score(title,query)})
-    except Exception as e:print("[EDU OPENVERSE ERROR]",repr(e))
-    return out
 def pint5_education(sender,query):
-    if not check_rate_limit(sender,"pint5"):return send_text(sender,"Too many education searches. Try again later.")
-    send_text(sender,f"🧪 Education: *{query}*\nSearching educational diagrams...")
-    cands=[c for c in _wikimedia_edu_candidates(query) if c["score"]>=1]
-    if len(cands)<2:cands+=[c for c in _openverse_edu_candidates(query) if c["score"]>=1]
-    seen=set(); uniq=[]
-    for c in sorted(cands,key=lambda c:c["score"],reverse=True):
-        if c["url"] and c["url"] not in seen:seen.add(c["url"]);uniq.append(c)
-    sent=0
-    for c in uniq[:6]:
-        if _send_educational_result(sender,c):
-            sent+=1
-            if sent>=2:break
-    if not sent:
-        send_text(sender,f"I couldn't find a suitable educational diagram for *{query}* from Wikimedia Commons/Openverse. I won't substitute a general photo. I'll still try to give you written study help.\n\nTry a more specific query, e.g. `.edu human heart anatomy` or `.edu Krebs cycle`.")
+    """Return one relevant Wikimedia Commons educational diagram; never switch to another source."""
+    query=re.sub(r"\s+", " ", str(query or "")).strip()[:180]
+    if len(query)<2:
+        return send_text(sender,"Usage: `.edu <subject>` — e.g. `.edu human heart anatomy`.")
+    if not check_rate_limit(sender,"pint5"):
+        return send_text(sender,"Too many education searches. Try again later.")
+    send_text(sender,f"🧪 Education: *{query}*\nSearching Wikimedia Commons for a relevant diagram...")
     try:
-        r=ai_call(f"Give exam-focused study help for: {query}. Use 4 short bullet points explaining the key parts, structures, or steps. If a diagram was not found, explain the topic clearly without pretending a diagram was retrieved.",sender)
-        if r and not r.startswith(("AI request failed","AI is not configured","You've reached")):send_text(sender,f"〔 *{query.upper()} - KEY POINTS* 〕\n\n{r}")
-        elif not sent:send_text(sender,"Written study help is unavailable because ARIA's AI provider is not configured or has reached its limit.")
+        candidates=[c for c in _wikimedia_edu_candidates(query) if c.get("score",-1)>=1 and c.get("url")]
+        # Deduplicate results and pick only the highest-scoring candidate. No second provider or AI fallback.
+        unique={}
+        for item in candidates:
+            unique.setdefault(item["url"],item)
+        ranked=sorted(unique.values(),key=lambda item:item.get("score",-1),reverse=True)
+        if not ranked:
+            send_text(sender,f"I couldn't find a suitable educational diagram for *{query}* on Wikimedia Commons. I did not try another source or generate an AI substitute.\n\nTry a more specific topic, e.g. `.edu human heart anatomy` or `.edu Krebs cycle`.")
+            return False
+        chosen=ranked[0]
+        if not _send_educational_result(sender,chosen):
+            send_text(sender,f"I found a possible Wikimedia diagram for *{query}*, but WhatsApp couldn't deliver it. I haven't tried another image or source. Please try again later or use a more specific topic.")
+            return False
+        return True
     except Exception as e:
-        print("[EDU EXPLAIN ERROR]",repr(e))
-        if not sent:send_text(sender,"I couldn't retrieve a diagram or generate written study help this time. Try `.explain <topic>` or try `.edu` again later.")
+        print("[EDU WIKIMEDIA COMMAND ERROR]",type(e).__name__,str(e)[:300])
+        send_text(sender,"The educational diagram search failed while contacting Wikimedia Commons. No alternate source or AI image was attempted. Please try again later.")
+        return False
 
 def pint_pinterest(sender,query):
     if not PINTEREST_ACCESS_TOKEN:return send_text(sender,"Pinterest is not configured.\n\nAdd `PINTEREST_ACCESS_TOKEN` to Render.")
@@ -1105,10 +1101,12 @@ def pint_pinterest(sender,query):
 
 def detect_image_style(prompt, explicit_style=None):
     """Return a bounded image style route; never executes user-provided model names."""
-    allowed = {"anime", "realistic", "fantasy", "poster", "general"}
+    allowed = {"anime", "realistic", "fantasy", "poster", "diagram", "general"}
     if explicit_style and explicit_style.lower() in allowed:
         return explicit_style.lower()
     low = str(prompt or "").lower()
+    if re.search(r"\b(diagram|schematic|labelled|labeled|cross.?section|anatomy|cell structure|scientific illustration|educational illustration|flowchart|circuit diagram|technical drawing)\b", low):
+        return "diagram"
     if re.search(r"\b(poster|flyer|logo|typography|text in the image|banner|cover art|advertisement)\b", low):
         return "poster"
     if re.search(r"\b(anime|manga|manhwa|cel.?shaded|anime.?style)\b", low):
@@ -1126,6 +1124,7 @@ def image_model_for_style(style):
         "realistic": IMAGE_MODEL_REALISTIC,
         "fantasy": IMAGE_MODEL_FANTASY,
         "poster": IMAGE_MODEL_POSTER,
+        "diagram": IMAGE_MODEL_GENERAL,
         "general": IMAGE_MODEL_GENERAL,
     }.get(style, IMAGE_MODEL_GENERAL)
 
@@ -1137,10 +1136,12 @@ def enhance_image_prompt(prompt, style):
         "realistic": "photorealistic, physically plausible lighting, natural material texture, realistic anatomy and perspective, sharp professional photography",
         "fantasy": "cinematic fantasy concept art, intricate believable materials, dramatic atmospheric lighting, rich environmental detail, strong focal subject",
         "poster": "professional graphic-design poster, clear visual hierarchy, deliberate negative space, crisp layout, legible typography; reproduce only text explicitly requested and do not invent extra lettering",
+        "diagram": "technical educational textbook diagram, prioritize structural accuracy and clear spatial relationships over decoration; clean white background, uncluttered schematic or cross-section, consistent scale and orientation, crisp boundaries, distinguishable components, clear arrows only where meaningful, neutral scientific presentation; do not invent labels, numbers, formulas, parts, or mechanisms; avoid decorative lighting, cinematic effects, fantasy styling, and photorealistic clutter",
         "general": "high-quality professional illustration, clear focal point, coherent composition, intentional lighting, refined details",
     }
     p = re.sub(r"\s+", " ", str(prompt or "")).strip()[:700]
-    return f"{p}. Visual direction: {style_notes.get(style, style_notes['general'])}. Avoid blurry details, malformed anatomy, clutter, unintended text, watermarks, and low-resolution appearance."[:1800]
+    accuracy_note = " For scientific or educational subjects, depict only the requested subject and conventional textbook structure; visual generation cannot independently verify scientific correctness, so do not fabricate fine labels or unsupported details." if style == "diagram" else ""
+    return f"{p}. Visual direction: {style_notes.get(style, style_notes['general'])}.{accuracy_note} Avoid blurry details, malformed anatomy, clutter, unintended text, watermarks, and low-resolution appearance."[:1800]
 
 
 def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
@@ -1167,7 +1168,7 @@ def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
 
 
 def _cloudflare_image_bytes(prompt):
-    """Generate an image with Cloudflare Workers AI FLUX.1 Schnell."""
+    """Generate a detailed image with the configured Cloudflare Workers AI model."""
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         raise RuntimeError("Cloudflare image generation needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
@@ -1240,7 +1241,7 @@ def imagine_generate(sender, prompt, explicit_style=None):
     if gemini_ready:
         enabled.append(f"Gemini {GEMINI_IMAGE_MODEL} (primary)")
     if cloudflare_ready:
-        enabled.append("Cloudflare FLUX.1 Schnell (fallback)")
+        enabled.append(f"Cloudflare {CLOUDFLARE_IMAGE_MODEL} (fallback)")
     send_text(sender, f"🎨 ARIA is preparing your {style} image.\nProvider order: {', '.join(enabled) if enabled else 'none configured/enabled'}\n\n{prompt[:500]}")
 
     # Gemini is primary. Cloudflare is tried only if Gemini is unavailable or fails.
@@ -1255,7 +1256,7 @@ def imagine_generate(sender, prompt, explicit_style=None):
     if cloudflare_ready:
         try:
             raw, mime = _cloudflare_image_bytes(enhanced)
-            if _send_image_bytes(sender, raw, mime, f"ARIA image · Cloudflare FLUX.1 Schnell (fallback) · {style}\n{prompt[:700]}"):
+            if _send_image_bytes(sender, raw, mime, f"ARIA image · Cloudflare {CLOUDFLARE_IMAGE_MODEL} (fallback) · {style}\n{prompt[:700]}"):
                 return True
         except Exception as e:
             print("[CLOUDFLARE IMAGE FALLBACK ERROR]", type(e).__name__, str(e)[:500])
@@ -1521,6 +1522,7 @@ GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
 
 COMPANION_CONVERSATIONAL_STYLE_LAYER="""GROQ COMPANION CONVERSATIONAL PERSONALITY
 - Sound like a relaxed, thoughtful person in a real chat: warm, curious, attentive, and naturally expressive, never like a help-desk script.
+- Keep replies noticeably shorter than the main model by default: usually 1–3 sentences for ordinary chat, expanding only when the user asks for detail or the task requires it.
 - Match the user's energy and message length. For short casual messages, respond briefly and naturally; don't turn every message into advice or a mini-essay.
 - Let conversation breathe. You may react, tease lightly when appropriate, share a clear perspective, or pick up a detail the user just mentioned. Don't overdo emojis, praise, disclaimers, or repeated follow-up questions.
 - If the user is venting, acknowledge what they actually said before trying to solve it. Don't force positivity or immediately turn feelings into a checklist.
@@ -1536,8 +1538,8 @@ def build_tool_awareness_context():
     """Curated, runtime-aware description of implemented tools; never expose source or secrets."""
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
-        "Image generation: `.create <prompt>` / `.imagine <prompt>` tries Gemini first, then Cloudflare Workers AI FLUX.1 Schnell as fallback. Both must be configured and explicitly enabled; usage may consume paid quota/credits. Pollinations is not in the generation route. `.image` is NOT image generation.",
-        "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia/Openverse for educational diagrams and attempts written key points; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
+        "Image generation: `.create <prompt>` / `.imagine <prompt>` tries Gemini first, then the configured Cloudflare Workers AI image model as fallback. Diagram prompts receive technical, accuracy-oriented instructions; generated images can still contain scientific errors. Both must be configured and explicitly enabled; usage may consume paid quota/credits. Pollinations is not in the generation route. `.image` is NOT image generation.",
+        "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia Commons for one relevant educational diagram only; if it fails, ARIA reports the failure without trying another source or generating an AI substitute; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
         "Documents: `.docx <request>` creates an editable Word file and sends it back in WhatsApp. DOCX generation supports headings, bullets, numbered lists, tables, quotes and code blocks. Send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX to ask questions about it; `.doc <question>` remains available.",
@@ -1560,7 +1562,7 @@ def build_tool_awareness_context():
         f"Groq companion model: {GROQ_COMPANION_MODEL}; uses the same GROQ_API_KEY as the main model.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
-        f"Image generation order: Gemini primary {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Cloudflare FLUX fallback {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Pollinations is not used by the generation route.",
+        f"Cloudflare image model: {CLOUDFLARE_IMAGE_MODEL}; image generation order: Gemini primary {'enabled' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'disabled/not configured'}; Cloudflare {CLOUDFLARE_IMAGE_MODEL} fallback {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Pollinations is not used by the generation route.",
         f"WhatsApp media delivery: {'credentials present' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'credentials missing'}.",
         f"Memory persistence: {'Upstash configured; verify connection in logs' if REMOTE_ENABLED else 'LOCAL ONLY; grants and memory can be lost on redeploy'}; access grants/pending requests are stored with ARIA data.",
         f"Jarvis routing: {'enabled' if JARVIS_ENABLED else 'disabled'}; code execution/coding-agent tools are not implemented.",
@@ -2314,7 +2316,7 @@ AI & STUDY
 • .define <word>
 • .study <topic>
 • .quiz <topic>
-• .edu <subject> (educational diagrams + written key points)
+• .edu <subject> (one Wikimedia Commons educational diagram; no alternate-source or AI fallback)
 
 LIVE WEB (Exa only)
 • .search <question> (current web lookup)
@@ -2324,7 +2326,7 @@ LIVE WEB (Exa only)
 
 IMAGE TOOLS — CREATE A NEW IMAGE
 • .create <prompt> (auto-routes image style)
-• .create --style anime|realistic|fantasy|poster|general <prompt>
+• .create --style anime|realistic|fantasy|poster|diagram|general <prompt>
 • .imagine <prompt> (legacy alias)
 
 IMAGE TOOLS — FIND EXISTING IMAGES
@@ -2383,7 +2385,7 @@ Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
     local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq GPT-OSS-20B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
-*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini primary {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Cloudflare FLUX fallback {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Pollinations not used\n"""
+*Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Cloudflare model {CLOUDFLARE_IMAGE_MODEL}; Gemini primary {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Cloudflare {CLOUDFLARE_IMAGE_MODEL} fallback {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Pollinations not used\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
     try:return "ONLINE" if _extract_groq_text(client.chat.completions.create(model=CHAT_MODEL,messages=[{"role":"user","content":"Reply only with OK."}],max_tokens=64,temperature=0,stream=False)) else "EMPTY RESPONSE"
@@ -3286,17 +3288,17 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (GPT-OSS-20B companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate an image with `.create <prompt>` or select a style with `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Generate new images with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (GPT-OSS-20B companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
             args=text.split(None,1)[1].strip()[:1200]; explicit_style=None
             style_match=re.match(r"^--style\s+(anime|realistic|fantasy|poster|general)\s+(.+)$",args,re.I)
             if style_match: explicit_style=style_match.group(1).lower(); args=style_match.group(2).strip()
-            if not args:send_text(user,"Usage: `.create <prompt>` or `.create --style anime|realistic|fantasy|poster|general <prompt>`");return "OK",200
+            if not args:send_text(user,"Usage: `.create <prompt>` or `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`");return "OK",200
             if not check_rate_limit(user,"create"):send_text(user,"You've reached the hourly image limit. Try again later.");return "OK",200
             imagine_generate(user,args,explicit_style);return "OK",200
-        if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>`\nOr choose a style: `.create --style anime|realistic|fantasy|poster|general <prompt>`");return "OK",200
+        if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>`\nOr choose a style: `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`");return "OK",200
         if tl.startswith((".docx ",".word ")) or tl in {".docx",".word"}:
             request_text=text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ""
             create_docx_for_user(user,request_text);return "OK",200
@@ -3428,6 +3430,21 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
