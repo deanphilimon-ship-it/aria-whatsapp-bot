@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.8.0 (Cloudflare FLUX payload fix + Groq GPT-OSS companion)
+# VERSION 17.8.1 (early model-command dispatch + concise status)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.8.0"
+VERSION = "v17.8.1"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -2382,7 +2382,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Deployment Commit:* {DEPLOY_COMMIT or 'not exposed by host'}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq GPT-OSS-20B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq GPT-OSS-20B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Gemini Image Model:* {GEMINI_IMAGE_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
 *Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation:* Gemini primary {'ENABLED' if ALLOW_GEMINI_IMAGE_GENERATION and GEMINI_API_KEY else 'DISABLED/NOT CONFIGURED'}; Cloudflare FLUX fallback {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Pollinations not used\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
@@ -3054,6 +3054,14 @@ def process_webhook(data):
         if security_reply is not None:
             send_text(user, security_reply)
             return "OK",200
+        # Handle model selection immediately after authentication/security checks.
+        # This is a control command, not a chat prompt: do not let quota checks,
+        # natural-language routing, or other handlers pass it to the language model.
+        if tl in {".model", ".m"} or tl.startswith((".model ", ".m ")):
+            parts = text.split(None, 1)
+            arg = parts[1] if len(parts) > 1 else ""
+            send_text(user, model_command_reply(user, arg))
+            return "OK",200
         _authed=user
         # Recheck immediately before dispatch. An operation already in flight when the
         # owner locks ARIA may finish, but subsequent work is stopped as soon as observed.
@@ -3274,9 +3282,6 @@ def process_webhook(data):
         for i,handler in enumerate([pint1_unsplash,pint2_pexels,pint3_anime,pint4_comics,pint5_education,pint_pinterest],1):
             if tl.startswith(f".pint{i} "):handler(user,text[len(f".pint{i}"):].strip());return "OK",200
 
-        if tl in {".model", ".m"} or tl.startswith((".model ", ".m ")):
-            arg=text.split(None,1)[1] if len(text.split(None,1))>1 else ""
-            send_text(user,model_command_reply(user,arg));return "OK",200
         if tl==".menu":send_text(user,get_menu());return "OK",200
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
@@ -3423,6 +3428,31 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
