@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.8.2 (Wikimedia-only education + technical image generation)
+# VERSION 17.8.3 (strict model selection + natural companion conversation)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.8.2"
+VERSION = "v17.8.3"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -1521,14 +1521,15 @@ GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
 """
 
 COMPANION_CONVERSATIONAL_STYLE_LAYER="""GROQ COMPANION CONVERSATIONAL PERSONALITY
-- Sound like a relaxed, thoughtful person in a real chat: warm, curious, attentive, and naturally expressive, never like a help-desk script.
-- Keep replies noticeably shorter than the main model by default: usually 1–3 sentences for ordinary chat, expanding only when the user asks for detail or the task requires it.
-- Match the user's energy and message length. For short casual messages, respond briefly and naturally; don't turn every message into advice or a mini-essay.
-- Let conversation breathe. You may react, tease lightly when appropriate, share a clear perspective, or pick up a detail the user just mentioned. Don't overdo emojis, praise, disclaimers, or repeated follow-up questions.
+- Sound like a relaxed, thoughtful companion in a real WhatsApp conversation: warm, curious, attentive, naturally expressive, and never like a help-desk script.
+- Keep ordinary replies concise but not abrupt, usually 1–3 sentences. Expand when the person needs explanation, practical help, or a thoughtful response.
+- Respond to the meaning and emotional tone of the user's actual message. If they share an experience, opinion, joke, worry, or something about their day, engage with that specific detail instead of treating it like a task request.
+- Do not default to “What can I do for you?”, “What do you want to test?”, “How can I help?”, or other service-desk questions. Do not assume the user is testing the bot. Only ask what they need when their message genuinely calls for clarification.
+- For greetings, use a natural greeting and, if it fits, one easy conversational question. For statements such as “I'm bored,” react to the situation and ask a relevant question only if it feels natural.
+- Let conversation breathe. You may share a clear perspective, light humor, or a relevant observation. Don't force jokes, emojis, praise, advice, or a follow-up question into every reply.
 - If the user is venting, acknowledge what they actually said before trying to solve it. Don't force positivity or immediately turn feelings into a checklist.
-- Ask at most one genuine follow-up question, and only when it would move the conversation forward. Never append a question just to keep the chat going.
-- Avoid canned openings like “How can I assist you today?”, “That’s a great question”, and “I’m here for you”. Avoid repeatedly announcing that you are an AI.
-- Keep technical help clear and practical, but remain conversational. Don't sacrifice accuracy or security to sound friendly.
+- Ask at most one genuine, context-specific follow-up question, and only when it would move the conversation forward. Avoid repetitive questions and never ask a generic question merely to keep the chat going.
+- Keep technical help clear and practical while retaining a friendly tone. Don't sacrifice accuracy or security to sound personable.
 - Respect all existing ARIA commands, safety rules, tool boundaries, and user memory. Never claim to have run a tool unless ARIA actually did so.
 """
 
@@ -1812,9 +1813,14 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
     if not client:
         return "AI is not configured.\n\nAdd GROQ_API_KEY to Render."
     if preference=="companion":
-        providers=[("Groq companion GPT-OSS-20B",groq_companion_request),("Groq main GPT-OSS-120B",groq_primary_request)]
+        # Explicit Model 2 means the 20B is the only model allowed to answer.
+        # Never silently substitute the 120B; report failure if the companion fails.
+        providers=[("Groq companion GPT-OSS-20B",groq_companion_request)]
+    elif preference=="groq":
+        # Explicit Model 1 means the 120B is the only model allowed to answer.
+        providers=[("Groq main GPT-OSS-120B",groq_primary_request)]
     else:
-        # Default/Auto uses the main model first, then the smaller companion if the main fails.
+        # Auto alone uses the main first, then companion as fallback.
         providers=[("Groq main GPT-OSS-120B",groq_primary_request),("Groq companion GPT-OSS-20B",groq_companion_request)]
     configured=[]
     for provider,call_provider in providers:
@@ -1834,7 +1840,13 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
         if _provider_quota_notice(provider,exc,None):quota_providers.append(provider)
     if quota_providers:
         names=" and ".join(dict.fromkeys(quota_providers)); verb="has" if len(set(quota_providers))==1 else "have"
+        if preference=="companion":
+            return f"⏳ The selected Groq companion model ({GROQ_COMPANION_MODEL}) {verb} hit an API usage or rate limit. I haven't switched to the 120B. Please try again after the limit resets."
         return f"⏳ {names} {verb} hit an API usage or rate limit. Please try again after the limit resets. Both models use the same Groq account, so a shared account limit may affect both."
+    if preference=="companion":
+        return f"⚠️ The selected companion model ({GROQ_COMPANION_MODEL}) couldn't answer this message. I haven't switched to the 120B. Please try again shortly or check `.health`."
+    if preference=="groq":
+        return f"⚠️ The selected main model ({CHAT_MODEL}) couldn't answer this message. I haven't switched to the companion. Please try again shortly or check `.health`."
     return "AI request failed.\n\nBoth Groq chat models failed. Please try again shortly or use `.health` to check ARIA."
 
 # ============================================================
@@ -2878,7 +2890,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Groq GPT-OSS-20B companion with separate conversational style; GPT-OSS-120B main; numbered .model 1/2/3 switching; compact memory.json profile mirror with last-10 prompt context; WhatsApp-safe table images with bullet fallback; concise human chat style; DOCX image embedding and existing security preserved"
+    "Groq GPT-OSS-20B companion with separate conversational style; explicit .model 2 stays on 20B with no silent 120B fallback; GPT-OSS-120B main; numbered .model 1/2/3 switching; compact memory.json profile mirror with last-10 prompt context; WhatsApp-safe table images with bullet fallback; natural companion conversation; DOCX image embedding and existing security preserved"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3430,110 +3442,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
