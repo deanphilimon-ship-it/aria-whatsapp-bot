@@ -7,10 +7,10 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION 17.8.5 (Cloudflare-only image generation + prompt-based image editing)
+# VERSION v18.0.4-candidate (unified .pint command router)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v17.8.5"
+VERSION = "v18.0.4-candidate"
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -65,9 +65,9 @@ APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_API_KEY = _env("GROQ_API_KEY")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
-# The companion is a separate, smaller Groq model using the same GROQ_API_KEY.
+# The companion is Qwen 3.8 27B on Groq, using the same GROQ_API_KEY/account as the primary.
 # CHAT_MODEL remains the primary model; this model gets a distinct conversational style layer.
-GROQ_COMPANION_MODEL = "openai/gpt-oss-20b"
+GROQ_COMPANION_MODEL = "qwen/qwen3.8-27b"
 VOICE_MODE = os.getenv("VOICE_MODE", "text").strip().lower()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
@@ -83,6 +83,13 @@ CLOUDFLARE_ACCOUNT_ID = _env("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_API_TOKEN = _env("CLOUDFLARE_API_TOKEN")
 ALLOW_CLOUDFLARE_IMAGE_GENERATION = os.getenv("ALLOW_CLOUDFLARE_IMAGE_GENERATION", "false").strip().lower() in {"1", "true", "yes", "on"}
 CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev").strip() or "@cf/black-forest-labs/flux-2-dev"
+# FLUX.2 Dev supports steps and guidance on the REST multipart endpoint.
+try: CLOUDFLARE_IMAGE_STEPS = max(1, min(50, int(os.getenv("CLOUDFLARE_IMAGE_STEPS", "25"))))
+except (TypeError, ValueError): CLOUDFLARE_IMAGE_STEPS = 25
+try: CLOUDFLARE_IMAGE_GUIDANCE = max(1.0, min(10.0, float(os.getenv("CLOUDFLARE_IMAGE_GUIDANCE", "4.0"))))
+except (TypeError, ValueError): CLOUDFLARE_IMAGE_GUIDANCE = 4.0
+try: CLOUDFLARE_IMAGE_TIMEOUT = max(30, min(240, int(os.getenv("CLOUDFLARE_IMAGE_TIMEOUT", "180"))))
+except (TypeError, ValueError): CLOUDFLARE_IMAGE_TIMEOUT = 180
 POLLINATIONS_API_KEY = _env("POLLINATIONS_API_KEY")
 # Pollinations generation requires authentication; HTTP 402 means the account/key budget is exhausted. Keep opt-in.
 ALLOW_POLLINATIONS_IMAGE_FALLBACK = os.getenv("ALLOW_POLLINATIONS_IMAGE_FALLBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -189,7 +196,8 @@ def check_rate_limit(number, api_name):
     now=time.time(); key=f"{number}_{api_name}"
     with _rate_lock:
         api_requests[key]=[t for t in api_requests[key] if now-t<3600]
-        if number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and len(api_requests[key])>=LIMITS.get(api_name,100): return False
+        privileged = set(ADMIN_NUMBERS); privileged.update({n for n in (OWNER_NUMBER,) if n})
+        if number not in privileged and len(api_requests[key])>=LIMITS.get(api_name,100): return False
         api_requests[key].append(now)
     return True
 
@@ -276,15 +284,31 @@ def security_quota_check(number, category):
 
 def classify_security_category(text, msg, user):
     """Classify provider-consuming work before dispatch; control/help commands are not charged."""
+    msg = msg or {}
+    # Image captions are actionable (vision Q&A or edit). Use the caption as the text for
+    # classification so security quotas still apply; bare image receipts remain free.
+    if msg.get("type") == "image" and not (text or "").strip():
+        text = str((msg.get("image") or {}).get("caption") or "").strip()
     tl = (text or "").strip().lower()
     if not tl:
-        if (msg or {}).get("type") == "audio":
+        if msg.get("type") == "audio":
             return "ai"
         return None
-    if (msg or {}).get("type") in {"image", "sticker", "reaction", "location", "contacts", "unsupported"}:
+    if msg.get("type") in {"sticker", "reaction", "location", "contacts", "unsupported"}:
         return None
-    if (msg or {}).get("type") == "audio":
+    if msg.get("type") == "image" and not tl:
+        return None
+    if msg.get("type") == "audio":
         return "ai"
+    # Caption arrives on the same image message, before user_waiting_image is updated.
+    # Classify it here so Redis quotas still cover one-shot image+caption work.
+    if msg.get("type") == "image" and tl:
+        if tl == ".edit":
+            return None
+        if _is_image_edit_caption(text):
+            return "create"
+        # Any other non-empty caption is treated as vision work (Q&A / describe / solve).
+        return "vision"
     if tl in {".lock", ".unlock", ".security", ".menu", ".about", ".status", ".access", ".users", ".pending", ".diagnostics", ".help", ".model", ".m", ".voice on", ".voice off", ".reminders", ".remind", ".remind list"}:
         return None
     if tl.startswith((".lock ", ".unlock ", ".security ", ".help ", ".model ", ".m ", ".ban ", ".unban ", ".allow ", ".deny ", ".unallow ")):
@@ -294,7 +318,7 @@ def classify_security_category(text, msg, user):
     if tl.startswith((".docx ", ".word ")) or re.match(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b", tl):
         return "docx"
     if tl.startswith((".image ", ".describe ask ")) or tl in {".describe", ".describe detailed", ".read", ".solve", ".math", ".verify"} or tl.startswith((".read ", ".solve ", ".math ", ".verify ")):
-        return "vision" if tl != ".verify" or user_waiting_image.get(user) else "live"
+        return "vision" if tl != ".verify" or _recent_image_for_user(user) else "live"
     if tl.startswith((".search ", ".news ")) or tl.startswith(".livetest"):
         return "live"
     if tl.startswith((".photo ", ".wallpaper ", ".anime ", ".comic ", ".edu ", ".pinterest ", ".pint1 ", ".pint2 ", ".pint3 ", ".pint4 ", ".pint5 ", ".pint6 ")):
@@ -302,10 +326,10 @@ def classify_security_category(text, msg, user):
     if re.search(r"\b(?:find|get|show|fetch|look\s+for)\b", tl) and re.search(r"\b(?:image|images|picture|pictures|photo|photos|wallpaper|anime|comic|diagram)\b", tl):
         return "fetch"
     # Natural-language edits of a recent image consume the image-generation quota.
-    if user_waiting_image.get(user) and _image_is_fresh(user, IMAGE_WAIT_TIMEOUT) and _looks_like_image_edit_request(text):
+    if _looks_like_image_edit_request(text) and _image_is_fresh(user, IMAGE_WAIT_TIMEOUT):
         return "create"
     # Plain-language questions about a recent image are provider-consuming vision work.
-    if user_waiting_image.get(user) and _image_is_fresh(user, NL_VISION_WINDOW) and _looks_like_image_question(text) and not needs_live(text):
+    if _looks_like_image_question(text) and not needs_live(text) and _image_is_fresh(user, NL_VISION_WINDOW):
         return "vision"
     # Other natural-language questions and AI commands go through chat providers.
     if tl.startswith(".task "):
@@ -379,7 +403,8 @@ def save_reply_context():
             os.replace(tmp, REPLY_CONTEXT_FILE)
         except Exception as e:
             print("[REPLY CONTEXT LOCAL SAVE ERROR]", type(e).__name__)
-    if REMOTE_ENABLED:
+    # snapshot was captured under the lock; remote write uses that frozen copy only.
+    if REMOTE_ENABLED and snapshot is not None:
         try:
             # A 48-hour key TTL provides an additional cleanup safety net.
             remote_cmd("SET", REPLY_CONTEXT_KEY, snapshot, "EX", REPLY_CONTEXT_WINDOW_SECONDS)
@@ -684,12 +709,16 @@ def check_auth(from_number,text):
         if len(recent)<PASSWORD_MAX_FAILS:
             if hmac.compare_digest(t.encode(),PASSWORD.encode()):
                 # Strict private mode: a shared password never replaces owner approval.
-                # The existing password field remains supported, but a new number must
-                # still be approved through .allow or included in the explicit allowlists.
+                # Matching only clears the fail window; the number still needs .allow /
+                # ALLOWED_USERS / ADMIN_NUMBERS. This avoids silent "password worked"
+                # expectations while preventing fail-counter pollution from the owner test.
                 pw_fail.pop(from_number,None)
             else:
                 recent.append(now)
-        pw_fail[from_number]=recent
+                pw_fail[from_number]=recent
+        elif recent:
+            # Keep the recent fail list only when we actually recorded a failure this hour.
+            pw_fail[from_number]=recent
     # owner-approval request flow
     _pending_cleanup()
     created=False
@@ -973,17 +1002,50 @@ def send_image_url(to,image_url,caption=""):
 # ============================================================
 # MEDIA / PINT
 # ============================================================
+PINT_MODE_ALIASES = {
+    "photo": "photo", "photos": "photo", "picture": "photo", "pictures": "photo", "pic": "photo", "pics": "photo",
+    "wallpaper": "wallpaper", "wallpapers": "wallpaper", "wall": "wallpaper", "background": "wallpaper", "backgrounds": "wallpaper",
+    "anime": "anime", "manga": "anime", "pfp": "anime", "avatar": "anime", "profile": "anime", "icon": "anime",
+    "comic": "comic", "comics": "comic", "superhero": "comic", "superheroes": "comic",
+    "edu": "edu", "education": "edu", "diagram": "edu", "diagrams": "edu",
+    "pinterest": "pinterest", "pin": "pinterest", "pins": "pinterest",
+}
+def parse_pint_command(command):
+    """Parse `.pint [mode] <query>`; an unrecognized first word defaults to photo search."""
+    raw = re.sub(r"^\s*\.pint\b", "", str(command or ""), count=1, flags=re.I).strip()
+    if not raw or raw.lower() in {"help", "menu", "?"}:
+        return "help", ""
+    parts = raw.split(None, 1)
+    first = parts[0].lower()
+    if first in PINT_MODE_ALIASES:
+        mode = PINT_MODE_ALIASES[first]
+        query = parts[1].strip() if len(parts) > 1 else ""
+        return mode, query
+    # Convenience: `.pint black panther` means a real photo search.
+    return "photo", raw
+
+def pint_usage_text():
+    return ("〔 PINT — FIND EXISTING IMAGES 〕\n\n"
+            "Use `.pint <type> <search>`\n\n"
+            "• `.pint photo <subject>` — real photographs\n"
+            "• `.pint wallpaper <subject>` — wallpapers/backgrounds\n"
+            "• `.pint anime <character>` — existing anime art; also accepts `pfp` or `avatar`\n"
+            "• `.pint comic <character/title>` — comic/character results\n"
+            "• `.pint edu <subject>` — educational diagrams\n"
+            "• `.pint pinterest <search>` — Pinterest results (requires working API access)\n\n"
+            "Shortcuts still work: `.photo`, `.wallpaper`, `.anime`, `.comic`, `.edu`, `.pinterest`.\n"
+            "If you omit the type, `.pint <search>` searches for a real photo. PINT retrieves existing images; it does not generate an AI image.")
 def pint1_unsplash(sender,query):
     if not UNSPLASH_KEY:return send_text(sender,"Unsplash is not configured.")
     if not check_rate_limit(sender,"pint1"):return send_text(sender,"Too many Unsplash searches. Try again later.")
-    send_text(sender,f"Pint1 Unsplash: *{query}*...")
+    send_text(sender,f"📷 PINT photo search: *{query}*...")
     try:
         r=requests.get("https://api.unsplash.com/photos/random",params={"query":query,"client_id":UNSPLASH_KEY,"orientation":"portrait"},timeout=15); r.raise_for_status(); x=r.json(); send_image_url(sender,x["urls"]["regular"],f"Pint1: {query}\nPhoto by {x['user']['name']} on Unsplash")
     except Exception as e:print("[UNSPLASH ERROR]",repr(e)); send_text(sender,f"No results on Unsplash for: {query}")
 
 def pint2_pexels(sender,query):
     if not check_rate_limit(sender,"pint2"):return send_text(sender,"Too many wallpaper searches. Try again later.")
-    send_text(sender,f"Pint2 Wallhaven: *{query}*...")
+    send_text(sender,f"🖼️ PINT wallpaper search: *{query}*...")
     try:
         r=requests.get("https://wallhaven.cc/api/v1/search",params={"q":query,"sorting":"random","atleast":"1920x1080","ratios":"16x9,9x16"},timeout=15); r.raise_for_status(); d=r.json().get("data",[])
         if d and d[0].get("path"):return send_image_url(sender,d[0]["path"],f"Pint2: {query}\n{d[0].get('resolution','Unknown resolution')} | Wallhaven")
@@ -991,14 +1053,14 @@ def pint2_pexels(sender,query):
     except Exception as e:print("[WALLHAVEN ERROR]",repr(e))
     if UNSPLASH_KEY:
         try:
-            r=requests.get("https://api.unsplash.com/photos/random",params={"query":query,"client_id":UNSPLASH_KEY,"orientation":"portrait"},timeout=15); r.raise_for_status(); return send_image_url(sender,r.json()["urls"]["regular"],f"Pint2 Fallback: {query}\nFrom Unsplash")
+            r=requests.get("https://api.unsplash.com/photos/random",params={"query":query,"client_id":UNSPLASH_KEY,"orientation":"landscape"},timeout=15); r.raise_for_status(); return send_image_url(sender,r.json()["urls"]["regular"],f"Wallpaper search: {query}\nLandscape photo from Unsplash (fallback source)")
         except Exception as e:print("[UNSPLASH FALLBACK ERROR]",repr(e))
     return send_text(sender,"No wallpaper source returned a free image. The legacy Pollinations generation URL returned HTTP 402 before, so ARIA will not call it or risk credit usage. Try a different query or configure a free image source.")
 
 def pint3_anime(sender,query):
     q=query.lower().replace(" ","_")
     if any(x in q for x in ["naked","nude","boobs","pussy","sex","nsfw"]):return send_text(sender,"SFW only. Try Goku, Naruto, Luffy, etc.")
-    send_text(sender,f"Pint3 Danbooru: *{query}*...")
+    send_text(sender,f"🎌 PINT anime search: *{query}*...")
     try:
         r=requests.get("https://danbooru.donmai.us/posts.json",params={"tags":f"{q} rating:g","limit":1,"random":"true"},headers={"User-Agent":"ARIA-Bot/1.0"},timeout=15); r.raise_for_status(); posts=r.json()
         if not posts:return send_text(sender,f"No results for: *{query}*")
@@ -1010,7 +1072,7 @@ def pint3_anime(sender,query):
 def pint4_comics(sender,query):
     if not COMICVINE_KEY:return send_text(sender,"ComicVine is not configured. Add COMICVINE_KEY to Render.")
     if not check_rate_limit(sender,"pint4"):return send_text(sender,"Too many comic searches. Try again later.")
-    send_text(sender,f"Pint4 Comics: *{query}*...")
+    send_text(sender,f"💥 PINT comic search: *{query}*...")
     try:
         r=requests.get("https://comicvine.gamespot.com/api/search/",params={"api_key":COMICVINE_KEY,"format":"json","query":query,"resources":"character,issue,volume","limit":1},headers={"User-Agent":"ARIA-Bot/1.0"},timeout=15); r.raise_for_status(); d=r.json()
         if d.get("status_code")!=1:return send_text(sender,"ComicVine returned an API error.")
@@ -1020,6 +1082,27 @@ def pint4_comics(sender,query):
         if u:return send_image_url(sender,u,f"Pint4: {name}\n{desc}...\nType: {x.get('resource_type','unknown')}")
         send_text(sender,f"Pint4: {name}\n{desc}...")
     except Exception as e:print("[COMICVINE ERROR]",repr(e)); send_text(sender,"ComicVine failed. Try again in a few seconds.")
+
+
+def handle_pint_command(sender, command):
+    mode, query = parse_pint_command(command)
+    if mode == "help":
+        return send_text(sender, pint_usage_text())
+    if not query or len(query.strip()) < 2:
+        return send_text(sender, f"Usage: `.pint {mode} <search>`\n\n{pint_usage_text()}")
+    handlers = {
+        "photo": pint1_unsplash,
+        "wallpaper": pint2_pexels,
+        "anime": pint3_anime,
+        "comic": pint4_comics,
+        "edu": pint5_education,
+        "pinterest": pint_pinterest,
+    }
+    handler = handlers.get(mode)
+    if not handler:
+        return send_text(sender, pint_usage_text())
+    return handler(sender, query[:180])
+
 
 def _send_educational_result(sender,result):
     u=result.get("url") or result.get("thumbnail")
@@ -1111,10 +1194,15 @@ def detect_image_style(prompt, explicit_style=None):
         return "poster"
     if re.search(r"\b(anime|manga|manhwa|cel.?shaded|anime.?style)\b", low):
         return "anime"
-    if re.search(r"\b(photorealistic|photorealism|realistic|realism|professional photo|real photo)\b", low):
+    if re.search(r"\b(photorealistic|photorealism|realistic|realism|professional photo|real photo|photo|photograph|photographic)\b", low):
         return "realistic"
     if re.search(r"\b(fantasy|dark fantasy|templar|dragon|mythical|sorcerer|enchanted|epic warrior)\b", low):
         return "fantasy"
+    # If a person is the subject and the user did not choose an art style,
+    # prefer photography over the default illustration route. Keep this after
+    # anime/fantasy/diagram/poster checks so explicit genre intent wins.
+    if re.search(r"\b(?:portrait|headshot|selfie|face|person|people|woman|women|man|men|girl|girls|boy|boys|child|children|adult|couple|family|mother|father|bride|groom|model|character)\b", low):
+        return "realistic"
     return "general"
 
 
@@ -1132,16 +1220,17 @@ def image_model_for_style(style):
 def enhance_image_prompt(prompt, style):
     """Add concise composition/style guidance without changing the requested subject."""
     style_notes = {
-        "anime": "anime or manhwa illustration, confident linework, expressive composition, layered detail, controlled color palette, polished professional finish",
-        "realistic": "photorealistic, physically plausible lighting, natural material texture, realistic anatomy and perspective, sharp professional photography",
-        "fantasy": "cinematic fantasy concept art, intricate believable materials, dramatic atmospheric lighting, rich environmental detail, strong focal subject",
-        "poster": "professional graphic-design poster, clear visual hierarchy, deliberate negative space, crisp layout, legible typography; reproduce only text explicitly requested and do not invent extra lettering",
+        "anime": "polished anime/manhwa illustration, deliberate linework, expressive but coherent character design, layered foreground and background, controlled palette, clean edges and detailed clothing/hair textures",
+        "realistic": "photorealistic camera-captured image, natural human proportions and anatomy, lifelike skin texture with subtle pores and natural imperfections, realistic hair strands and fabric texture, physically plausible light and shadows, natural color response, believable lens perspective and depth of field, sharp focus on the main subject without plastic skin or excessive beauty retouching",
+        "fantasy": "cinematic fantasy concept art, detailed believable materials, atmospheric depth, dramatic but readable lighting, clear focal subject, richly designed environment",
+        "poster": "professional graphic-design poster, strong visual hierarchy, deliberate negative space, crisp layout, high contrast where useful, legible typography; reproduce only text explicitly requested and do not invent extra lettering",
         "diagram": "technical educational textbook diagram, prioritize structural accuracy and clear spatial relationships over decoration; clean white background, uncluttered schematic or cross-section, consistent scale and orientation, crisp boundaries, distinguishable components, clear arrows only where meaningful, neutral scientific presentation; do not invent labels, numbers, formulas, parts, or mechanisms; avoid decorative lighting, cinematic effects, fantasy styling, and photorealistic clutter",
-        "general": "high-quality professional illustration, clear focal point, coherent composition, intentional lighting, refined details",
+        "general": "high-quality professional illustration, clear focal subject, coherent foreground/midground/background, intentional lighting and perspective, fine material textures, crisp edges, balanced contrast, refined detail",
     }
-    p = re.sub(r"\s+", " ", str(prompt or "")).strip()[:700]
+    p = re.sub(r"\s+", " ", str(prompt or "")).strip()[:1500]
     accuracy_note = " For scientific or educational subjects, depict only the requested subject and conventional textbook structure; visual generation cannot independently verify scientific correctness, so do not fabricate fine labels or unsupported details." if style == "diagram" else ""
-    return f"{p}. Visual direction: {style_notes.get(style, style_notes['general'])}.{accuracy_note} Avoid blurry details, malformed anatomy, clutter, unintended text, watermarks, and low-resolution appearance."[:1800]
+    quality_note = " Keep the requested subject and details faithful; use a clear focal point, coherent composition, clean edges, and well-defined textures. No watermark or extra lettering unless requested."
+    return f"{p}. Visual direction: {style_notes.get(style, style_notes['general'])}.{accuracy_note}{quality_note}"[:2048]
 
 
 def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
@@ -1167,49 +1256,77 @@ def _send_image_bytes(to, image_bytes, mime_type="image/png", caption=""):
         return False
 
 
-def _cloudflare_image_bytes(prompt, source_image=None, source_mime="image/jpeg"):
-    """Generate or edit an image with Cloudflare FLUX.2; optional source image is a reference."""
+def _cloudflare_image_bytes(prompt, source_image=None, source_mime="image/jpeg", output_width=None, output_height=None):
+    """Generate/edit with Cloudflare FLUX.2 Dev using documented multipart fields."""
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         raise RuntimeError("Cloudflare image generation needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN")
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
-    # FLUX.2 Dev requires multipart/form-data, even for text-only prompts.
-    # Let requests generate the multipart boundary; do not set Content-Type manually.
+    # requests creates the multipart boundary. Never set Content-Type manually.
+    width = max(256, min(1920, int(output_width if output_width else IMAGE_WIDTH)))
+    height = max(256, min(1920, int(output_height if output_height else IMAGE_HEIGHT)))
     fields = {
         "prompt": (None, str(prompt)[:2048]),
-        "width": (None, "1024"),
-        "height": (None, "1024"),
+        "steps": (None, str(CLOUDFLARE_IMAGE_STEPS)),
+        "guidance": (None, str(CLOUDFLARE_IMAGE_GUIDANCE)),
+        "width": (None, str(width)),
+        "height": (None, str(height)),
     }
     if source_image:
-        # FLUX.2 reference inputs are expected to be no larger than 512x512.
+        # FLUX.2 Dev reference images must be below 512x512. Pillow is required for resizing.
         try:
-            from PIL import Image
-            with Image.open(io.BytesIO(source_image)) as im:
-                im.load()
-                im.thumbnail((512, 512), getattr(Image, "Resampling", Image).LANCZOS)
+            from PIL import Image, ImageOps
+            with Image.open(io.BytesIO(source_image)) as opened:
+                opened.load()
+                im = ImageOps.exif_transpose(opened)
+                im.thumbnail((511, 511), getattr(Image, "Resampling", Image).LANCZOS)
                 buf = io.BytesIO()
                 if source_mime == "image/png":
+                    if im.mode not in ("RGB", "RGBA", "L"):
+                        im = im.convert("RGBA")
                     im.save(buf, format="PNG", optimize=True)
                     input_mime, input_name = "image/png", "source.png"
                 else:
                     if im.mode not in ("RGB", "L"):
                         im = im.convert("RGB")
-                    im.save(buf, format="JPEG", quality=92, optimize=True)
+                    im.save(buf, format="JPEG", quality=90, optimize=True)
                     input_mime, input_name = "image/jpeg", "source.jpg"
                 source_image = buf.getvalue()
+        except ImportError as exc:
+            raise RuntimeError("Image editing requires Pillow. Add Pillow to the Python dependencies and redeploy before using .edit.") from exc
         except Exception as exc:
             raise ValueError(f"Could not prepare the source image for editing: {type(exc).__name__}: {str(exc)[:180]}") from exc
         if not source_image:
             raise ValueError("The source image is empty after preparation")
         fields["input_image_0"] = (input_name, source_image, input_mime)
-    r = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, files=fields, timeout=(10, 100))
+    r = requests.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, files=fields,
+                      timeout=(10, CLOUDFLARE_IMAGE_TIMEOUT))
     if not r.ok:
-        raise RuntimeError(f"Cloudflare image HTTP {r.status_code}: {(r.text or '')[:350]}")
+        body = (r.text or "")[:600]
+        try:
+            parsed = r.json()
+            if isinstance(parsed, dict):
+                errors = parsed.get("errors") or []
+                if errors:
+                    body = "; ".join(str(e.get("message") or e) for e in errors)[:600]
+                elif parsed.get("error"):
+                    body = str(parsed["error"])[:600]
+        except Exception:
+            pass
+        raise RuntimeError(f"Cloudflare image HTTP {r.status_code}: {body}")
     ctype = (r.headers.get("Content-Type") or "").split(";", 1)[0].lower()
+    raw = b""
+    mime = ctype
     if ctype in {"image/jpeg", "image/png"}:
         raw = r.content
-        mime = ctype
     elif ctype == "image/webp":
-        raise ValueError("Cloudflare returned WebP, but WhatsApp delivery supports JPEG/PNG only in this handler")
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(r.content)) as im:
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, format="PNG", optimize=True)
+                raw, mime = buf.getvalue(), "image/png"
+        except Exception as exc:
+            raise ValueError(f"Cloudflare returned WebP and conversion to PNG failed: {type(exc).__name__}") from exc
     else:
         try:
             data = r.json()
@@ -1217,16 +1334,57 @@ def _cloudflare_image_bytes(prompt, source_image=None, source_mime="image/jpeg")
             raise ValueError(f"Cloudflare returned an unrecognized image response ({ctype or 'unknown content type'})") from exc
         result = data.get("result") or {}
         encoded = result.get("image") if isinstance(result, dict) else None
+        if isinstance(encoded, str) and encoded.startswith("data:") and "," in encoded:
+            header, encoded = encoded.split(",", 1)
+            if "image/png" in header: mime = "image/png"
+            elif "image/webp" in header: mime = "image/webp"
+            else: mime = "image/jpeg"
         if not encoded:
             raise ValueError("Cloudflare FLUX returned no image data")
-        raw = base64.b64decode(encoded, validate=True)
-        mime = "image/jpeg"
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError("Cloudflare FLUX returned malformed base64 image data") from exc
+        if mime == "image/webp":
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(raw)) as im:
+                    buf = io.BytesIO(); im.convert("RGB").save(buf, format="PNG", optimize=True)
+                    raw, mime = buf.getvalue(), "image/png"
+            except Exception as exc:
+                raise ValueError(f"Cloudflare returned WebP and conversion to PNG failed: {type(exc).__name__}") from exc
+        elif mime not in {"image/jpeg", "image/png"}:
+            # FLUX.2's documented JSON result is base64; identify the actual encoded format.
+            if raw.startswith(b"\x89PNG\r\n\x1a\n"): mime = "image/png"
+            elif raw.startswith(b"\xff\xd8\xff"): mime = "image/jpeg"
+            else: raise ValueError("Cloudflare returned image data in an unsupported format")
     if not raw:
         raise ValueError("Cloudflare FLUX returned an empty image")
     if len(raw) > 5 * 1024 * 1024:
         raise ValueError("Cloudflare image exceeds WhatsApp's 5 MB limit")
-    print(f"[CLOUDFLARE IMAGE] model={CLOUDFLARE_IMAGE_MODEL} bytes={len(raw)}")
+    if mime not in {"image/jpeg", "image/png"}:
+        raise ValueError(f"Cloudflare returned unsupported image format: {mime or 'unknown'}")
+    print(f"[CLOUDFLARE IMAGE] model={CLOUDFLARE_IMAGE_MODEL} steps={CLOUDFLARE_IMAGE_STEPS} guidance={CLOUDFLARE_IMAGE_GUIDANCE} size={width}x{height} bytes={len(raw)}")
     return raw, mime
+
+
+def _image_error_user_message(exc, operation="generation"):
+    """Translate common provider failures without hiding the diagnostic from Render logs."""
+    message = str(exc or "")
+    low = message.lower()
+    if "http 401" in low or "http 403" in low or "unauthorized" in low or "forbidden" in low:
+        return "Cloudflare rejected the API credentials or permissions. Check CLOUDFLARE_ACCOUNT_ID and the Workers AI API token permissions in Render."
+    if any(x in low for x in ("http 402", "http 429", "quota", "neurons", "rate limit", "billing")):
+        return "Cloudflare image usage is unavailable because of a quota, rate limit, or billing limit. Check your Cloudflare Workers AI usage before retrying."
+    if any(x in low for x in ("safety", "moderation", "content policy", "prompt rejected", "sensitive content")):
+        return "Cloudflare's safety checks rejected this image prompt. Try a clearer, non-graphic description of the intended scene; ARIA will not bypass the provider's safety checks."
+    if "http 400" in low:
+        return "Cloudflare rejected the image request (HTTP 400). The request details are in the Render logs; this can indicate an unsupported parameter or a rejected prompt."
+    if "timeout" in low or "timed out" in low:
+        return f"Cloudflare image {operation} timed out. Try again later or raise CLOUDFLARE_IMAGE_TIMEOUT (maximum 240 seconds)."
+    if "requires pillow" in low or "no module named 'pil'" in low:
+        return "Image editing needs the Pillow Python package. Add Pillow to the app's dependencies before retrying .edit."
+    return f"Cloudflare image {operation} failed. No other provider was called. Check the detailed [CLOUDFLARE IMAGE ERROR] entry in the Render logs."
 
 
 def _pollinations_image_bytes(prompt, model, seed):
@@ -1265,9 +1423,42 @@ def imagine_generate(sender, prompt, explicit_style=None, provider=None):
         send_text(sender, "Cloudflare generated an image, but WhatsApp delivery failed. No other provider was called.")
         return False
     except Exception as e:
-        print("[CLOUDFLARE IMAGE ERROR]", type(e).__name__, str(e)[:500])
-        send_text(sender, "Image generation failed with Cloudflare. No other provider was called. Check the Cloudflare error in the Render logs.")
+        print("[CLOUDFLARE IMAGE ERROR]", type(e).__name__, str(e)[:700])
+        send_text(sender, _image_error_user_message(e, "generation"))
         return False
+
+
+def _edit_output_dimensions(source_bytes):
+    """Choose a FLUX output size close to the source aspect ratio after EXIF orientation."""
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(io.BytesIO(source_bytes)) as opened:
+            opened.load()
+            oriented = ImageOps.exif_transpose(opened)
+            src_w, src_h = oriented.size
+    except Exception as exc:
+        raise ValueError(f"Could not read source image dimensions: {type(exc).__name__}") from exc
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("Source image has invalid dimensions")
+    # FLUX dimensions are kept within a practical range and rounded to multiples of 16.
+    scale = min(1024.0 / max(src_w, src_h), 1.0)
+    w = max(256, min(1024, int(round((src_w * scale) / 16.0) * 16)))
+    h = max(256, min(1024, int(round((src_h * scale) / 16.0) * 16)))
+    # Avoid extreme aspect ratios outside a 4:1 envelope, while preserving common portrait/landscape photos.
+    if w > h * 4: w = h * 4
+    if h > w * 4: h = w * 4
+    return w, h
+
+
+def _unsafe_intimate_image_edit_request(prompt):
+    """Block requests to turn an image into sexualized/nude content; allow ordinary edits."""
+    t = re.sub(r"\s+", " ", str(prompt or "")).strip().lower()
+    patterns = (
+        r"\b(?:make|turn|edit|change|transform|show|put|remove)\b.{0,100}\b(?:nude|naked|topless|undressed|strip(?:ped|ping)?|sexually explicit|explicit sexual|pornographic|revenge porn|deepfake porn|sexuali[sz]e|erotic(?:ized|ised)?)\b",
+        r"\b(?:nude|naked|topless|undressed|revenge porn|deepfake porn|sexually explicit|pornographic)\b.{0,100}\b(?:make|turn|edit|change|transform|show|put|remove|image|photo|picture|person|woman|man|girl|boy|me|her|him|them)\b",
+        r"\b(?:put|dress|change)\b.{0,80}\b(?:her|him|them|me|the person|the woman|the man)\b.{0,80}\b(?:lingerie|underwear|see.?through|transparent clothes)\b",
+    )
+    return any(re.search(pattern, t, re.I) for pattern in patterns)
 
 
 def imagine_edit(sender, prompt, explicit_style=None):
@@ -1276,9 +1467,12 @@ def imagine_edit(sender, prompt, explicit_style=None):
     if not saved:
         send_text(sender, "No recent image is waiting. Send the image first, then tell me what to change or use `.edit <instructions>`.")
         return False
-    prompt = re.sub(r"\s+", " ", str(prompt or "")).strip()[:900]
+    prompt = re.sub(r"\s+", " ", str(prompt or "")).strip()[:1600]
     if not prompt:
         send_text(sender, "Tell me what to change, e.g. `.edit change the background to a rainy neon city and keep the person recognizable`.")
+        return False
+    if _unsafe_intimate_image_edit_request(prompt):
+        send_text(sender, "I can help with ordinary photo edits, but I can't transform an image into nude, pornographic, or sexually explicit content. Try a non-sexual change such as lighting, clothing color, or background.")
         return False
     if not (CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN):
         send_text(sender, "Image editing needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN. Gemini is reserved for vision and will not be used for image editing.")
@@ -1299,13 +1493,14 @@ def imagine_edit(sender, prompt, explicit_style=None):
         edit_prompt = (
             "Edit the supplied reference image according to the user's instructions. Preserve the main subject's identity, "
             "recognizable features, composition, and all unmentioned details as much as possible. Make only the requested changes; "
-            "do not add unrelated objects or text. If the request asks for a style transformation, apply that style to the existing image. "
+            "do not add unrelated objects or text. Do not apply a new artistic style unless the user explicitly requested one. "
             f"User's requested edit: {prompt}"
         )
-        if style != "general":
-            edit_prompt = enhance_image_prompt(edit_prompt, style)
-        send_text(sender, f"🖼️ Editing your image with Cloudflare only. I'll try to preserve the parts you didn't ask to change.\n\nRequested change: {prompt[:450]}")
-        raw, out_mime = _cloudflare_image_bytes(edit_prompt, source, mime)
+        if explicit_style:
+            edit_prompt += f" Apply the explicitly requested {style} style only to the extent needed for this edit."
+        out_width, out_height = _edit_output_dimensions(source)
+        send_text(sender, f"🖼️ Editing your image with Cloudflare only ({out_width}×{out_height}). I'll try to preserve the parts you didn't ask to change.\n\nRequested change: {prompt[:450]}")
+        raw, out_mime = _cloudflare_image_bytes(edit_prompt, source, mime, out_width, out_height)
         delivered = _send_image_bytes(sender, raw, out_mime, f"ARIA image edit · Cloudflare {CLOUDFLARE_IMAGE_MODEL} · {style}\n{prompt[:700]}")
         if delivered:
             add_to_memory(sender, "assistant", f"[Edited image with Cloudflare] {prompt[:300]}")
@@ -1313,8 +1508,8 @@ def imagine_edit(sender, prompt, explicit_style=None):
         send_text(sender, "Cloudflare processed the edit, but WhatsApp delivery failed. Your original image remains in the chat.")
         return False
     except Exception as e:
-        print("[CLOUDFLARE IMAGE EDIT ERROR]", type(e).__name__, str(e)[:500])
-        send_text(sender, "Image editing failed with Cloudflare. Your original image is unchanged; check the Cloudflare error in the Render logs.")
+        print("[CLOUDFLARE IMAGE EDIT ERROR]", type(e).__name__, str(e)[:700])
+        send_text(sender, _image_error_user_message(e, "editing") + " Your original image remains unchanged.")
         return False
 
 def _docx_inline_runs(paragraph, text):
@@ -1483,9 +1678,9 @@ def create_docx_for_user(user, request_text):
     request_text = re.sub(r"\s+", " ", str(request_text or "")).strip()[:1200]
     if not request_text:
         return send_text(user, "Usage: `.docx <what to write>`\nExample: `.docx Create a study guide on pharmacology receptors with definitions, examples, a comparison table, and revision questions.`")
-    attached_image = user_waiting_image.get(user)
+    attached_image = _recent_image_for_user(user)
     if attached_image and time.time() - attached_image.get("saved_at", 0) > IMAGE_WAIT_TIMEOUT:
-        user_waiting_image.pop(user, None)
+        clear_pending_image(user)
         attached_image = None
     image_bytes = None
     image_mime = None
@@ -1516,7 +1711,7 @@ def create_docx_for_user(user, request_text):
         filename = _docx_filename(title)
         if send_docx_bytes(user, data, filename, f"{title}\nEditable Microsoft Word document created by ARIA."):
             if image_bytes:
-                user_waiting_image.pop(user, None)
+                clear_pending_image(user)
             send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting" + (" plus your embedded image." if image_bytes else ".") + " Review facts/references before submitting or publishing.")
             return True
         return False
@@ -1560,17 +1755,32 @@ GEMINI_CONVERSATIONAL_STYLE_LAYER="""GEMINI CONVERSATIONAL INTELLIGENCE
 - Be warm, concise, and familiar without sounding robotic or pretending to be human.
 """
 
-COMPANION_CONVERSATIONAL_STYLE_LAYER="""GROQ COMPANION CONVERSATIONAL PERSONALITY
-- Sound like a relaxed, thoughtful companion in a real WhatsApp conversation: warm, curious, attentive, naturally expressive, and never like a help-desk script.
-- Keep ordinary replies concise but not abrupt, usually 1–3 sentences. Expand when the person needs explanation, practical help, or a thoughtful response.
-- Respond to the meaning and emotional tone of the user's actual message. If they share an experience, opinion, joke, worry, or something about their day, engage with that specific detail instead of treating it like a task request.
-- Do not default to “What can I do for you?”, “What do you want to test?”, “How can I help?”, or other service-desk questions. Do not assume the user is testing the bot. Only ask what they need when their message genuinely calls for clarification.
-- For greetings, use a natural greeting and, if it fits, one easy conversational question. For statements such as “I'm bored,” react to the situation and ask a relevant question only if it feels natural.
-- Let conversation breathe. You may share a clear perspective, light humor, or a relevant observation. Don't force jokes, emojis, praise, advice, or a follow-up question into every reply.
-- If the user is venting, acknowledge what they actually said before trying to solve it. Don't force positivity or immediately turn feelings into a checklist.
-- Ask at most one genuine, context-specific follow-up question, and only when it would move the conversation forward. Avoid repetitive questions and never ask a generic question merely to keep the chat going.
-- Keep technical help clear and practical while retaining a friendly tone. Don't sacrifice accuracy or security to sound personable.
-- Respect all existing ARIA commands, safety rules, tool boundaries, and user memory. Never claim to have run a tool unless ARIA actually did so.
+COMPANION_CONVERSATIONAL_STYLE_LAYER="""QWEN COMPANION — NATURAL CONVERSATION POLICY
+CORE FEEL
+- Be a recognisable conversational partner: relaxed, attentive, curious when genuinely interested, lightly witty when the moment invites it, and comfortable being direct. Do not sound like customer support, a motivational poster, a therapist script, or a generic chatbot.
+- Stay transparently an AI assistant. Never invent human experiences, a personal life, physical actions, feelings as literal human experiences, or memories that are not in the supplied conversation/profile. You can still express a clear conversational stance (for example, “Honestly, I think…”).
+- Treat casual conversation as conversation, not a hidden task. If the user shares a thought, story, frustration, joke, win, random observation, or opinion, respond to that specific thing before offering help or changing the subject.
+
+RESPONSE RHYTHM
+- Default to 1–3 short, natural sentences. A one-line reply is fine when it genuinely fits; give more depth when the user is exploring an idea, upset, asking for reasoning, or needs practical guidance.
+- Lead with the most human-relevant part: react, answer, or take a position. Do not begin by paraphrasing the user's message as a formula (“It sounds like you're saying…” / “I understand that…”).
+- Avoid repetitive response templates. Vary sentence length and openings naturally. Do not mechanically end every message with a question, “I'm here for you,” “That makes sense,” an offer to help, or an emoji.
+- Prefer conversational prose over lists. Use bullets only when they improve clarity, such as steps, comparisons, or several distinct ideas.
+- Match the user's energy without mimicking their exact wording. Slang is optional, not compulsory; do not use Nigerian Pidgin unless the user explicitly uses/requests it. Emojis are occasional and purposeful, never decoration on every reply.
+
+SOCIAL INTELLIGENCE
+- Read the likely intent: banter, connection, curiosity, venting, advice, serious problem, or a concrete task. If uncertain, respond to the most likely intent without making the exchange feel like an interview.
+- For banter, play along with a little wit or teasing when welcome; don't overdo it, insult the user, or force a joke. For opinions, offer an actual view with a brief reason instead of bland neutrality; disagree respectfully when warranted.
+- For emotional disclosures, acknowledge the specific situation in plain language. Don't rush to fix it, diagnose the user, overstate empathy, preach, or force optimism. If advice seems wanted, offer one useful next thought; if they mainly want to talk, leave room for that.
+- Notice details already present in recent conversation and use them when relevant. Don't ask the user to repeat something already supplied. Avoid pretending to remember details outside the available context.
+- Ask at most one follow-up question, and only when it adds something. Make it specific to what the user just said. If the message is complete on its own, simply respond and let the user decide what comes next.
+- When greeted, greet back in a way that fits the wording and current context. Never default to “How can I help?” or assume the user is testing the bot. “What's up?” is acceptable sometimes, not as a mandatory ending.
+
+HELPFULNESS AND HONESTY
+- For real questions, answer directly first. For technical help, be clear, practical, and accurate; warmth must not bury the solution. Admit uncertainty and explain limitations without over-apologising.
+- Keep responses compact by default, but don't flatten philosophical, personal, or nuanced discussions into shallow one-liners. Follow the user's lead on depth.
+- Do not manufacture drama, intimacy, praise, confidence, facts, sources, tool use, or certainty to seem more human. No fake “I was thinking about you” or claims of independent activity between messages.
+- Existing ARIA commands, tool routing, authorization, safety, quotas, and memory rules take priority. Never claim to have run a tool unless it actually ran.
 """
 
 # Tool awareness only: this describes existing ARIA capabilities to the chat model.
@@ -1700,7 +1910,7 @@ def remember_user_fact(from_number,fact):
     return f"Got it. I'll remember that: *{fact}*."
 
 def forget_user_memory(from_number):
-    conversation_memory.pop(from_number,None); user_profile.pop(from_number,None); document_context.pop(from_number,None); user_waiting_image.pop(from_number,None); clear_reply_context_for_user(from_number); save_memory()
+    conversation_memory.pop(from_number,None); user_profile.pop(from_number,None); document_context.pop(from_number,None); clear_pending_image(from_number); clear_reply_context_for_user(from_number); save_memory()
 
 def learn_fact(from_number,text):
     m=re.search(r"my name is\s+(.+)",text,re.I)
@@ -1770,11 +1980,20 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
-def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
-    """Use the smaller Groq model for companion chat or fallback; leave the primary model untouched."""
+def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024,temperature=0.7):
+    """Use the Qwen companion on Groq; slightly warmer sampling than Model 1 for natural chat."""
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
     started=time.perf_counter()
-    c=client.chat.completions.create(model=GROQ_COMPANION_MODEL,messages=[{"role":"system","content":system},{"role":"user","content":prompt}],temperature=.6,max_tokens=max(1,min(8192,int(max_tokens))),top_p=.95,stream=False)
+    temp = max(0.2, min(1.2, float(temperature)))
+    c=client.chat.completions.create(
+        model=GROQ_COMPANION_MODEL,
+        messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
+        temperature=temp,
+        max_tokens=max(1,min(8192,int(max_tokens))),
+        top_p=.80,
+        reasoning_effort="none",
+        stream=False,
+    )
     text=_extract_groq_text(c)
     print(f"[AI LATENCY] provider=groq-companion model={GROQ_COMPANION_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)}")
     if not text:raise ValueError(f"Groq companion model {GROQ_COMPANION_MODEL} returned an empty response")
@@ -1793,22 +2012,22 @@ def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        current_label={"groq":"Groq main (GPT-OSS-120B)","companion":"Groq companion (GPT-OSS-20B)","auto":"Automatic"}.get(current,current.title())
+        current_label={"groq":"Groq main (GPT-OSS-120B)","companion":"Groq companion (Qwen 3.8 27B)","auto":"Automatic"}.get(current,current.title())
         availability=f"Groq main: {'ready' if client else 'not configured'}\nGroq companion: {GROQ_COMPANION_MODEL if client else 'not configured (needs GROQ_API_KEY)'}\nAPI key: {'present' if GROQ_API_KEY else 'missing'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current_label}*\n\n"
-                "Switch with one number:\n`.model 1` — GPT-OSS-120B, main assistant\n`.model 2` — GPT-OSS-20B, casual companion chat\n`.model 3` — Auto, main first then companion fallback\n\n"
+                "Switch with one number:\n`.model 1` — GPT-OSS-120B, main assistant\n`.model 2` — Qwen 3.8 27B, casual companion chat\n`.model 3` — Auto, main first then companion fallback\n\n"
                 f"Provider status:\n{availability}\n\n"
                 "Both models use the same GROQ_API_KEY. The companion has a separate conversational style; it is not a separate provider or extra unlimited quota.")
     aliases={"1":"groq","2":"companion","3":"auto","default":"groq","openai":"groq","automatic":"auto","second":"companion","router":"companion",
              "g":"groq","main":"groq","primary":"groq","groq":"groq","llama":"companion","gemma":"companion","companion":"companion","friend":"companion","or":"companion","o":"companion","openrouter":"companion","a":"auto","both":"auto","auto":"auto"}
     choice=aliases.get(choice,choice)
     if choice not in {"groq","companion","auto"}:
-        return "Choose `.model 1` (GPT-OSS-120B main), `.model 2` (GPT-OSS-20B companion), or `.model 3` (Auto)."
+        return "Choose `.model 1` (GPT-OSS-120B main), `.model 2` (Qwen 3.8 27B companion), or `.model 3` (Auto)."
     if choice in {"groq","companion","auto"} and not client:
         return "Groq isn't configured. Add GROQ_API_KEY before selecting a chat model. Your current preference hasn't changed."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
-    choice_label={"groq":"GPT-OSS-120B main","companion":"GPT-OSS-20B companion","auto":"Automatic (main then companion)"}.get(choice,choice.title())
+    choice_label={"groq":"GPT-OSS-120B main","companion":"Qwen 3.8 27B companion","auto":"Automatic (main then companion)"}.get(choice,choice.title())
     return f"Done — your chat model is now *{choice_label}*. Saved for your account only.\n\nSwitch any time: `.model 1` · `.model 2` · `.model 3`."
 
 def _provider_quota_notice(provider, exc, fallback=None):
@@ -1839,7 +2058,8 @@ def _fallback_notice(provider, exc, fallback):
 
 
 def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=1024):
-    if from_number not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and not check_rate_limit(from_number,"ai"):
+    privileged = set(ADMIN_NUMBERS); privileged.update({n for n in (OWNER_NUMBER,) if n})
+    if from_number not in privileged and not check_rate_limit(from_number,"ai"):
         return "You've reached the hourly AI limit. Please try again in a while."
     ctx=build_memory_context(from_number,prompt,skip_last_user=True)
     full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
@@ -1847,21 +2067,38 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
     preference=get_user_chat_model(from_number)
     tool_context=build_tool_awareness_context()
     main_system=system+"\n\n"+tool_context
-    companion_system=system+"\n\n"+COMPANION_CONVERSATIONAL_STYLE_LAYER+"\n\n"+tool_context
+    # Model 2: prioritize natural chat. Slim identity + companion policy.
+    # Skip the full tool catalog on ordinary chat so replies do not sound like a menu.
+    # Attach tool awareness only when the user is clearly asking about capabilities/commands.
+    companion_base=(
+        "You are ARIA, a WhatsApp companion AI for Philimon Dean's instance. "
+        "Be intelligent, direct, and conversational. Do not pretend to be human or claim tools, files, or memories you were not given. "
+        "Never invent sources. For maths, use plain phone-friendly text (3/4, x^2, sqrt(9)), not LaTeX."
+    )
+    _need_tools=bool(re.search(
+        r"(?i)\b(?:what can you do|your (?:commands|features|tools|capabilities)|how do i (?:use|make|create)|\.menu|\.help|\.create|\.edit|\.search|\.docx|\.remind|\.task)\b",
+        str(prompt or ""),
+    ))
+    companion_system=companion_base+"\n\n"+COMPANION_CONVERSATIONAL_STYLE_LAYER
+    if _need_tools:
+        companion_system=companion_system+"\n\n"+tool_context
+    elif system is not DEFAULT_SYSTEM_PROMPT and str(system or "").strip() and str(system).strip()!=DEFAULT_SYSTEM_PROMPT.strip():
+        # Preserve specialized system prompts (tables, explain-professor, etc.) when callers pass them.
+        companion_system=str(system)+"\n\n"+COMPANION_CONVERSATIONAL_STYLE_LAYER
     groq_primary_request=lambda:groq_chat_call(full,main_system,max_tokens=max_output_tokens)
     groq_companion_request=lambda:groq_companion_call(full,companion_system,max_tokens=max_output_tokens)
     if not client:
         return "AI is not configured.\n\nAdd GROQ_API_KEY to Render."
     if preference=="companion":
-        # Explicit Model 2 means the 20B is the only model allowed to answer.
+        # Explicit Model 2 means Qwen is the only model allowed to answer.
         # Never silently substitute the 120B; report failure if the companion fails.
-        providers=[("Groq companion GPT-OSS-20B",groq_companion_request)]
+        providers=[("Groq companion Qwen 3.8 27B",groq_companion_request)]
     elif preference=="groq":
         # Explicit Model 1 means the 120B is the only model allowed to answer.
         providers=[("Groq main GPT-OSS-120B",groq_primary_request)]
     else:
         # Auto alone uses the main first, then companion as fallback.
-        providers=[("Groq main GPT-OSS-120B",groq_primary_request),("Groq companion GPT-OSS-20B",groq_companion_request)]
+        providers=[("Groq main GPT-OSS-120B",groq_primary_request),("Groq companion Qwen 3.8 27B",groq_companion_request)]
     configured=[]
     for provider,call_provider in providers:
         configured.append(provider)
@@ -2312,7 +2549,7 @@ def ai_explain(topic,field_num,from_number):
 def get_youtube_link(query):return f"*{query.title()}*\n\n▶️ Tap to search: https://www.youtube.com/results?search_query={requests.utils.quote(query)}"
 def get_runtime():
     s=int(time.time()-start_time);return f"{s//3600}h {(s%3600)//60}m {s%60}s"
-EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bsex video\b",r"\bsex tape\b",r"\bexplicit sex\b",r"\bsexual intercourse\b",r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",r"\bnaked\s+(?:photo|picture|image|pic)s?\b"]
+EXPLICIT_PATTERNS=[r"\bporn(?:ography)?\b",r"\bpornographic\b",r"\bnsfw\b",r"\bsex video\b",r"\bsex tape\b",r"\bexplicit sex\b",r"\bsexual intercourse\b",r"\bgenital(?:s)?\b.*\bphoto(?:s)?\b",r"\bnude(?:d)?\s+(?:photo|picture|image|pic)s?\b",r"\bnaked\s+(?:photo|picture|image|pic)s?\b",r"\b(?:make|turn|change|edit|convert)\b.{0,60}\b(?:nude|naked|topless)\b"]
 def _natural_greeting_reply(text, from_number=None):
     """Return a provider-preference-specific reply for a standalone greeting.
 
@@ -2325,16 +2562,16 @@ def _natural_greeting_reply(text, from_number=None):
     greeting = re.sub(r"\s+aria$", "", greeting).strip()
     choice = get_user_chat_model(from_number) if from_number else "groq"
     companion_replies = {
-        "hi": "Hey 🙂 What's up?",
-        "hello": "Hey 🙂 What's on your mind?",
+        "hi": "Hey. What's up?",
+        "hello": "Hey, good to see your message. What's going on?",
         "hey": "Hey 🙂 What's happening?",
-        "yo": "Yo 🙂 What's good?",
-        "sup": "Yo 🙂 What's happening?",
-        "good morning": "Morning 🙂 How's your day starting?",
-        "good afternoon": "Hey, how's your day going?",
-        "good evening": "Evening 🙂 How's it going?",
-        "how are you": "I'm good—ready to think things through with you. How are you?",
-        "how are you doing": "Doing well 🙂 How's your day going?",
+        "yo": "Yo, what's good?",
+        "sup": "Hey, what's up?",
+        "good morning": "Morning. How's the day looking so far?",
+        "good afternoon": "Hey, how's your afternoon treating you?",
+        "good evening": "Evening. How's your day been?",
+        "how are you": "Doing alright—ready for a good conversation. How about you?",
+        "how are you doing": "Pretty good in the AI sense 😄 How's your day going?",
     }
     groq_replies = {
         "hi": "Hi, how can I help you?",
@@ -2358,7 +2595,7 @@ def get_menu():return f"""〔 ARIA {VERSION} 〕
 
 AI & STUDY
 • .model — choose the main Groq model, Groq companion, or Auto
-• .model 1 (GPT-OSS-120B main) | .model 2 (GPT-OSS-20B companion) | .model 3 (Auto)
+• .model 1 (GPT-OSS-120B main) | .model 2 (Qwen 3.8 27B companion) | .model 3 (Auto)
 • .ask <question>
 • Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
 • Maths: plain-text working and readable equations across normal chat and image solving
@@ -2383,11 +2620,14 @@ IMAGE TOOLS — CREATE A NEW IMAGE
 • .imagine <prompt> (legacy alias for .create)
 
 IMAGE TOOLS — FIND EXISTING IMAGES
-• .photo <query> (Unsplash)
-• .wallpaper <query> (Wallhaven, then configured fallbacks)
-• .anime <character> (Danbooru)
-• .comic <query> (ComicVine)
-• .pinterest <query> (requires working Pinterest API access)
+• .pint photo <query> — real photographs
+• .pint wallpaper <query> — existing wallpapers/backgrounds
+• .pint anime <character> — existing anime art; also `.pint pfp <character>`
+• .pint comic <query> — comic/character results
+• .pint edu <subject> — educational diagrams
+• .pint pinterest <query> — requires working Pinterest API access
+• Shortcuts: .photo, .wallpaper, .anime, .comic, .edu, .pinterest
+• `.pint <query>` defaults to real photo search; PINT never generates a substitute image.
 
 IMAGE TOOLS — ANALYZE AN IMAGE
 1. Send ARIA an image first.
@@ -2437,7 +2677,7 @@ OWNER
 Legacy .pint1–.pint6 routes remain available.
 """
 def get_status():
-    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq GPT-OSS-20B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
+    local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq Qwen 3.8 27B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
 *Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation/Editing:* Cloudflare {CLOUDFLARE_IMAGE_MODEL} {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Gemini is vision-only; no fallback; Pollinations not used\n"""
 def check_groq_chat_health():
     if not client:return "NOT CONFIGURED"
@@ -2686,10 +2926,62 @@ def _verify_claims(user,media_id,mime):
         return "\n\n〔 *LIVE FACT-CHECK* 〕\n"+res
     except Exception as e:print("[VERIFY LIVE ERROR]",repr(e)); return "\n\n🌐 Live fact-check failed. Try `.verify <claim>` instead."
 
+PENDING_IMAGE_KEY_PREFIX = "aria:pending_image:"
+
+def save_pending_image(user, saved):
+    """Cache a pending image locally and in Upstash so .edit works across workers."""
+    if not user or not isinstance(saved, dict) or not saved.get("media_id"):
+        return False
+    record = {
+        "media_id": str(saved.get("media_id")),
+        "mime_type": str(saved.get("mime_type") or "image/jpeg"),
+        "saved_at": float(saved.get("saved_at") or time.time()),
+    }
+    user_waiting_image[user] = record
+    if REMOTE_ENABLED:
+        try:
+            remote_cmd("SET", PENDING_IMAGE_KEY_PREFIX + str(user), json.dumps(record, separators=(",", ":")), "EX", int(IMAGE_WAIT_TIMEOUT))
+        except Exception as exc:
+            print("[PENDING IMAGE SAVE ERROR]", type(exc).__name__)
+            return False
+    return True
+
+
+def load_pending_image(user):
+    """Load a recent image from shared storage first, then use the local cache if needed."""
+    if REMOTE_ENABLED:
+        try:
+            value = remote_cmd("GET", PENDING_IMAGE_KEY_PREFIX + str(user))
+            if value:
+                record = json.loads(value) if isinstance(value, str) else value
+                if isinstance(record, dict) and record.get("media_id"):
+                    record = {"media_id": str(record["media_id"]), "mime_type": str(record.get("mime_type") or "image/jpeg"), "saved_at": float(record.get("saved_at") or 0)}
+                    if time.time() - record["saved_at"] <= IMAGE_WAIT_TIMEOUT:
+                        user_waiting_image[user] = record
+                        return record
+                try: remote_cmd("DEL", PENDING_IMAGE_KEY_PREFIX + str(user))
+                except Exception: pass
+        except Exception as exc:
+            print("[PENDING IMAGE LOAD ERROR]", type(exc).__name__)
+    saved = user_waiting_image.get(user)
+    if saved and time.time() - saved.get("saved_at", 0) <= IMAGE_WAIT_TIMEOUT:
+        return saved
+    if saved:
+        user_waiting_image.pop(user, None)
+    return None
+
+
+def clear_pending_image(user):
+    user_waiting_image.pop(user, None)
+    if REMOTE_ENABLED:
+        try: remote_cmd("DEL", PENDING_IMAGE_KEY_PREFIX + str(user))
+        except Exception as exc: print("[PENDING IMAGE CLEAR ERROR]", type(exc).__name__)
+
+
 def _recent_image_for_user(user):
-    saved=user_waiting_image.get(user)
-    if saved and time.time()-saved.get("saved_at",0)>IMAGE_WAIT_TIMEOUT:
-        user_waiting_image.pop(user,None)
+    saved = load_pending_image(user)
+    if saved and time.time() - saved.get("saved_at", 0) > IMAGE_WAIT_TIMEOUT:
+        clear_pending_image(user)
         return None
     return saved
 
@@ -2722,13 +3014,55 @@ def _looks_like_image_edit_request(text):
     t = re.sub(r"\s+", " ", str(text or "")).strip().lower()
     if not t or t.startswith(".") or len(t) > 500:
         return False
+    # A natural-language question about a possible edit is a question, not an edit command.
+    if _caption_is_question(t):
+        return False
     patterns = (
         r"\b(edit|modify|alter|retouch|redesign|restyle|transform)\b.{0,80}\b(this|that|the|my|it|image|photo|picture|pic)\b",
-        r"\b(change|replace|remove|add|erase|swap)\b.{0,120}\b(background|color|clothes|hair|sky|object|person|text|lighting|style|wall|setting|outfit)\b",
+        r"\b(change|replace|remove|add|erase|swap|make|turn|set)\b.{0,120}\b(background|color|clothes|hair|sky|object|person|text|lighting|style|wall|setting|outfit|eyes|lighting|scene)\b",
         r"^(make|turn|convert)\s+(this|that|it|the photo|the picture|the image)\b",
         r"\b(make it|turn it|change it|put me|place me|remove the|replace the|add a|add an)\b",
+        r"\b(make|turn|convert|restyle)\b.{0,80}\b(anime|cartoon|comic|painting|watercolor|sketch|cinematic|photorealistic)\b",
     )
     return any(re.search(p, t) for p in patterns)
+
+def _caption_is_question(text):
+    """Avoid interpreting ordinary questions about an image as edit instructions."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    return bool(re.match(r"^(?:what|why|when|where|who|which|how|is|are|am|do|does|did|can|could|would|should|will|may|might|has|have|had)\b", t))
+
+
+def _image_edit_caption_details(text):
+    """Return (edit prompt, explicit style) for clear image-edit captions."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not t or _caption_is_question(t):
+        return None, None
+    explicit_style = None
+    # Style can be supplied in a caption as either `.edit --style realistic ...` or `--style realistic ...`.
+    sm = re.match(r"^(?:\.edit\s+)?--style\s+(anime|realistic|fantasy|poster|diagram|general)(?:\s+|$)(.*)$", t, re.I)
+    if sm:
+        explicit_style, t = sm.group(1).lower(), sm.group(2).strip()
+        if not t:
+            return None, explicit_style
+    if re.match(r"^\.edit(?:\s|$)", t, re.I):
+        prompt = re.sub(r"^\.edit(?:\s+|$)", "", t, count=1, flags=re.I).strip()
+        return (prompt, explicit_style) if prompt else (None, explicit_style)
+    if _looks_like_image_edit_request(t):
+        return t, explicit_style
+    return None, explicit_style
+
+
+def _image_edit_caption_prompt(text):
+    return _image_edit_caption_details(text)[0]
+
+
+def _is_image_edit_caption(text):
+    return _image_edit_caption_prompt(text) is not None
+
 
 def _looks_like_image_question(text):
     """True only when the message clearly refers to the picture itself (not just any question)."""
@@ -2843,7 +3177,7 @@ def get_diagnostics(user):
     checks.append(("Webhook verify token",bool(VERIFY_TOKEN)))
     checks.append(("Owner number",bool(OWNER_NUMBER)))
     checks.append(("Groq chat/vision key",bool(GROQ_API_KEY)))
-    checks.append(("Groq companion model selection",GROQ_COMPANION_MODEL == "openai/gpt-oss-20b"))
+    checks.append(("Groq companion model selection",GROQ_COMPANION_MODEL == "qwen/qwen3.8-27b"))
     checks.append(("Gemini vision key",bool(GEMINI_API_KEY)))
     checks.append(("Exa key (optional)",bool(EXA_API_KEY)))
     checks.append(("Persistent Upstash storage",bool(REMOTE_ENABLED)))
@@ -2860,7 +3194,7 @@ def get_diagnostics(user):
     lines.append("✓ Tool selection uses bounded routes to existing handlers; no arbitrary shell/code execution is exposed.")
     lines.append("✓ Owner/admin commands are checked by backend handlers; ordinary users cannot run owner diagnostics or access commands.")
     lines.append("✓ Webhook signature verification is configured.") if APP_SECRET else lines.append("⚠ ALLOW_UNSIGNED_WEBHOOKS is on and WHATSAPP_APP_SECRET is unset: forged webhook requests are accepted. Set the secret." if ALLOW_UNSIGNED_WEBHOOKS else "⚠ WHATSAPP_APP_SECRET is unset: all incoming webhook requests are being rejected. Set it so ARIA can receive messages.")
-    lines.append("⚠ Multi-worker deployments can desynchronize in-memory rate limits, image context, workflow state, and deduplication; use one worker unless state is moved to shared storage.")
+    lines.append("⚠ Multi-worker deployments can desynchronize in-memory rate limits, workflow state, and deduplication. Pending image context is shared through Upstash when configured; without Upstash, image context remains local to each worker.")
     lines.append("⚠ A configured key or model name is not proof that a provider endpoint works; use the live checks above.")
     return "\n".join(lines)
 
@@ -2868,8 +3202,7 @@ _CONTROL_PREFIXES=(".pending",".deny",".access",".livetest",".allow",".unallow",
 def _is_control_command(tl):return tl.startswith(_CONTROL_PREFIXES)
 
 def _send_vision_for_user(user,command):
-    saved=user_waiting_image.get(user)
-    if saved and time.time()-saved.get("saved_at",0)>IMAGE_WAIT_TIMEOUT:user_waiting_image.pop(user,None);saved=None
+    saved=_recent_image_for_user(user)
     if not saved:return send_text(user,"No recent image is waiting. Send an image first.")
     if not _vision_allowed(user):return send_text(user,VISION_LIMIT_MSG)
     u=saved.get("media_id"); mime=saved.get("mime_type","image/jpeg")
@@ -2887,7 +3220,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Cloudflare-only image generation; prompt-based Cloudflare image editing; Gemini retained for vision only (not chat, live search, or image generation); separate Groq 120B main and 20B companion; strict .model 1/2/3 routing; existing security and memory preserved"
+    "Cloudflare-only image generation; prompt-based Cloudflare image editing; Gemini retained for vision only (not chat, live search, or image generation); GPT-OSS-120B main plus Qwen conversational companion with strengthened natural-conversation policy; strict .model 1/2/3 routing; existing security and memory preserved"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -3081,6 +3414,12 @@ def process_webhook(data):
             if not dispatch_lock.get("ok") or dispatch_lock.get("locked"):
                 send_text(user, "🔒 ARIA is temporarily unavailable while its security lock is active or cannot be verified.")
                 return "OK",200
+        # Captions are separate from msg.text.body in WhatsApp image messages; safety-check both
+        # before quota charging or image generation/vision dispatch.
+        image_caption_for_safety = str((msg.get("image") or {}).get("caption") or "").strip() if msg.get("type") == "image" else ""
+        if is_explicit_request(text) or is_explicit_request(image_caption_for_safety):
+            send_text(user, safety_block_message())
+            return "OK",200
         # Enforce atomic Redis-backed per-user and global quotas before any provider-consuming route.
         quota_category = classify_security_category(text, msg, user)
         if quota_category:
@@ -3107,7 +3446,7 @@ def process_webhook(data):
         if reply_record:
             # Replying to an older inbound image should restore that exact image, not whichever was sent most recently.
             if reply_record.get("type")=="image" and reply_record.get("media_id"):
-                user_waiting_image[user]={"media_id":reply_record.get("media_id"),"mime_type":reply_record.get("mime_type") or "image/jpeg","saved_at":time.time()}
+                save_pending_image(user,{"media_id":reply_record.get("media_id"),"mime_type":reply_record.get("mime_type") or "image/jpeg","saved_at":time.time()})
             if reply_record.get("type")=="document" and reply_record.get("text"):
                 store_document_context(user,"replied-document",reply_record.get("text"))
             _reply_context_local.prompt = _reply_context_for_prompt(reply_record)
@@ -3116,7 +3455,6 @@ def process_webhook(data):
                                            "Do not guess its content; ask the user to restate it if needed.]")
         _maybe_warn_expiry(user)
         if user==OWNER_NUMBER and tl!=".pending":_owner_nudge()
-        if is_explicit_request(text):send_text(user,safety_block_message());return "OK",200
         if tl.startswith(".ban ") or tl.startswith(".unban "):
             if user!=OWNER_NUMBER:return send_text(user,"Owner only command.") or "OK"
             target=re.sub(r"\D","",text.split(None,1)[1])
@@ -3156,16 +3494,24 @@ def process_webhook(data):
         if msg.get("type")=="image":
             d=msg.get("image") or {}; mid=d.get("id"); caption=str(d.get("caption") or "").strip(); mime=d.get("mime_type") or "image/jpeg"
             if not mid:return send_text(user,"I couldn't retrieve that image.") or "OK"
-            user_waiting_image[user]={"media_id":mid,"mime_type":mime,"saved_at":time.time()}
-            if caption and _looks_like_image_edit_request(caption):
-                security_ok, security_reason = security_quota_check(user, "create")
-                if not security_ok:
-                    send_text(user, "Image editing is paused by ARIA's usage protection. Please wait for the quota window to reset or contact the owner.")
-                    return "OK",200
-                imagine_edit(user, caption, None)
+            pending_image_saved = save_pending_image(user,{"media_id":mid,"mime_type":mime,"saved_at":time.time()})
+            if REMOTE_ENABLED and not pending_image_saved:
+                send_text(user, "⚠️ I received the image, but shared image memory is temporarily unavailable. An immediate edit may work, but a follow-up `.edit` may not work across Render workers until storage recovers.")
+            edit_caption_prompt, edit_caption_style = _image_edit_caption_details(caption) if caption else (None, None)
+            if caption.strip().lower() == ".edit":
+                send_text(user, "Usage: `.edit <what to change>`. Example: `.edit change the background to blue`.")
+                return "OK",200
+            if edit_caption_prompt is not None:
+                # Redis create quota was already charged (or blocked) by classify_security_category
+                # using the image caption; do not charge that same Redis quota a second time here.
+                imagine_edit(user, edit_caption_prompt, edit_caption_style)
                 return "OK",200
             if caption:
                 # Process image + caption as one incoming task; no second message is needed.
+                # Enforce the same vision quota that standalone .image / .describe paths use.
+                if not _vision_allowed(user):
+                    send_text(user, VISION_LIMIT_MSG)
+                    return "OK",200
                 image_prompt=caption
                 if image_prompt.lower().startswith(".image "):image_prompt=image_prompt[7:].strip()
                 if not image_prompt:image_prompt="Describe this image accurately and mention any readable text."
@@ -3224,7 +3570,8 @@ def process_webhook(data):
                 return "OK",200
             task,when=parse_reminder(text)
             if not task or not when:return send_text(user,"I couldn't understand that reminder (or the time has already passed).\n\nTry:\n`.remind me to study at 8pm`\n`.remind me tomorrow at 7am to call John`\n`.remind me in 30 minutes to check the oven`\n`.remind me on friday at 5pm to pay rent`\n`.remind me to pray at noon`") or "OK"
-            if user not in ({OWNER_NUMBER}|ADMIN_NUMBERS) and len(list_reminders(user))>=MAX_REMINDERS_PER_USER:return send_text(user,f"You already have {MAX_REMINDERS_PER_USER} active reminders. Cancel one with `.remind cancel <id>`.") or "OK"
+            privileged = set(ADMIN_NUMBERS); privileged.update({n for n in (OWNER_NUMBER,) if n})
+            if user not in privileged and len(list_reminders(user))>=MAX_REMINDERS_PER_USER:return send_text(user,f"You already have {MAX_REMINDERS_PER_USER} active reminders. Cancel one with `.remind cancel <id>`.") or "OK"
             rid=create_reminder(user,task,when);warn="" if (when-datetime.now(_tz())).total_seconds()<23*3600 or REMINDER_TEMPLATE_NAME else "\n\n⚠️ WhatsApp only lets ARIA message you within 24h of your last message to it. Send ARIA any message on the day (e.g. 'hi') or this reminder may not be delivered."
             send_text(user,f"⏰ Reminder set.\n\n*{task}*\n{when.astimezone(_tz()).strftime('%d %b %Y, %I:%M %p')}\nID: `{rid}`{warn}");return "OK",200
 
@@ -3272,13 +3619,12 @@ def process_webhook(data):
             send_text(user,"〔 IMAGE / VISION HELP 〕\n\nTo ask about an image: send the image first, then use `.image <your question>` or ask a question naturally.\n\n`.describe` gives a general description; `.read` extracts text; `.solve`/`.math` solve visible problems; `.verify` checks visible credibility indicators and may fact-check claims.\n\nTo generate a NEW image, use `.create <prompt>` or `.imagine <prompt>`.")
             return "OK",200
         if tl.startswith(".describe ask "):
-            saved=user_waiting_image.get(user)
+            saved=_recent_image_for_user(user)
             if not saved:return send_text(user,"No recent image is waiting. Send an image first.") or "OK"
             if not _vision_allowed(user):send_text(user,VISION_LIMIT_MSG);return "OK",200
             q=text[len(".describe ask "):].strip();r=vision_call(saved["media_id"],f"Answer this follow-up question about the image. Do not invent details.\n\nQuestion: {q}",saved.get("mime_type"));add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         if tl in {".describe",".describe detailed",".verify",".solve",".math",".read"}:
-            saved=user_waiting_image.get(user)
-            if saved and time.time()-saved.get("saved_at",0)>IMAGE_WAIT_TIMEOUT:user_waiting_image.pop(user,None);saved=None
+            saved=_recent_image_for_user(user)
             if not saved:return send_text(user,"No recent image is waiting. Send an image first.") or "OK"
             cmd=tl
             if cmd==".describe detailed" and not _vision_allowed(user):send_text(user,VISION_LIMIT_MSG);return "OK",200
@@ -3287,11 +3633,15 @@ def process_webhook(data):
                 _send_vision_for_user(user,cmd);return "OK",200
             add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
+        if tl == ".pint" or tl.startswith(".pint "):
+            handle_pint_command(user, text)
+            return "OK",200
+
         for command,handler in [(".photo",pint1_unsplash),(".wallpaper",pint2_pexels),(".anime",pint3_anime),(".comic",pint4_comics),(".edu",pint5_education),(".pinterest",pint_pinterest)]:
             if tl.startswith(command+" "):handler(user,text[len(command):].strip());return "OK",200
         _usage={".photo":"`.photo <query>`",".wallpaper":"`.wallpaper <query>`",".anime":"`.anime <character>`",".comic":"`.comic <query>`",".edu":"`.edu <subject>` (educational diagrams), e.g. `.edu human heart`",".pinterest":"`.pinterest <query>`"}
         if tl in _usage:send_text(user,f"Usage: {_usage[tl]}");return "OK",200
-        if tl==".pint":send_text(user,"〔 PINT 〕\n\nChoose `.photo`, `.wallpaper`, `.anime`, `.comic`, `.edu`, or `.pinterest`.");return "OK",200
+        if tl==".pint":send_text(user,pint_usage_text());return "OK",200
         for i,handler in enumerate([pint1_unsplash,pint2_pexels,pint3_anime,pint4_comics,pint5_education,pint_pinterest],1):
             if tl.startswith(f".pint{i} "):handler(user,text[len(f".pint{i}"):].strip());return "OK",200
 
@@ -3299,7 +3649,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".edit":"Send an image first, then `.edit <what to change>`, e.g. `.edit turn this into anime art and keep the same person recognizable`.",".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate a new image with Cloudflare: `.create <prompt>`. Optional style: `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`. Gemini is reserved for vision only; live search uses Exa.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Edit it with `.edit <instructions>`. Generate a new image with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’. Image generation/editing uses Cloudflare; Gemini is vision-only.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (GPT-OSS-20B companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".pint":pint_usage_text(),"pint":pint_usage_text(),".photo":"Usage: `.photo <query>` — find a real photo.",".wallpaper":"Usage: `.wallpaper <query>` — find an existing wallpaper.",".anime":"Usage: `.anime <character>` — find existing anime art.",".comic":"Usage: `.comic <character or title>` — find comic/character results.",".edit":"Send an image first, then `.edit <what to change>`, e.g. `.edit turn this into anime art and keep the same person recognizable`.",".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate a new image with Cloudflare: `.create <prompt>`. Optional style: `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`. Gemini is reserved for vision only; live search uses Exa.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Edit it with `.edit <instructions>`. Generate a new image with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’. Image generation/editing uses Cloudflare; Gemini is vision-only.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (Qwen 3.8 27B companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".edit ") or tl == ".edit":
@@ -3310,7 +3660,7 @@ def process_webhook(data):
                 explicit_style=sm.group(1).lower(); args=sm.group(2).strip()
             imagine_edit(user,args,explicit_style);return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
-            args=text.split(None,1)[1].strip()[:1200]; explicit_style=None; explicit_provider=None
+            args=text.split(None,1)[1].strip()[:1600]; explicit_style=None; explicit_provider=None
             # Accept provider/style options in either order before the actual prompt.
             while args.startswith("--"):
                 if re.match(r"^--provider\s+gemini(?:\s+|$)",args,re.I):
@@ -3410,7 +3760,7 @@ def process_webhook(data):
             q=re.sub(r"^\.?(?:ask\s+)?(?:document|doc)(?:\s+|$)","",text,flags=re.I).strip() or "Summarize the document."
             r=ask_about_document(user,q);add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
         # Natural-language editing of the most recent image, using Cloudflare only.
-        if _image_is_fresh(user, IMAGE_WAIT_TIMEOUT) and _looks_like_image_edit_request(text):
+        if _looks_like_image_edit_request(text) and _image_is_fresh(user, IMAGE_WAIT_TIMEOUT):
             imagine_edit(user,text,None);return "OK",200
         # Natural-language image generation: users do not need to know .create/.imagine.
         natural_image_prompt = _natural_image_generation_prompt(text)
@@ -3460,6 +3810,18 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
