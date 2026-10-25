@@ -7,10 +7,11 @@ from groq import Groq
 
 # ============================================================
 # ARIA - Advanced Responsive Intelligent Assistant
-# VERSION v18.0.4-candidate (unified .pint command router)
+# VERSION v18.0.6-candidate (Qwen companion and reliability upgrade)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v18.0.4-candidate"
+VERSION = "v18.0.6-candidate-credits"
+# Pinterest OAuth route intentionally unchanged/on hold. Credits require persistent Upstash storage.
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v26.0")
@@ -768,9 +769,204 @@ def _owner_nudge():
     with _access_lock:n=sum(1 for p in pending_requests.values() if p.get("status")!="denied")
     if n:_owner_nudge_ts=time.time(); send_text(OWNER_NUMBER,f"🔔 {n} pending access request(s). Send `.pending` to review.")
 
+
+
+# ============================================================
+# INTERNAL CREDITS (persistent, atomic, separate from provider quotas)
+# ============================================================
+try: CREDIT_MONTHLY_ALLOWANCE = max(0, min(10000, int(os.getenv("CREDIT_MONTHLY_ALLOWANCE", "40"))))
+except (TypeError, ValueError): CREDIT_MONTHLY_ALLOWANCE = 40
+try: CREDIT_DAILY_CAP = max(1, min(10000, int(os.getenv("CREDIT_DAILY_CAP", "12"))))
+except (TypeError, ValueError): CREDIT_DAILY_CAP = 12
+CREDIT_KEY_PREFIX = "aria:credits:v1:"
+CREDIT_LEDGER_PREFIX = "aria:credits:ledger:v1:"
+CREDIT_COSTS = {"edu": 2, "research": 3, "image_generate": 5, "image_edit": 5,
+                "docx_short": 2, "docx_standard": 4, "docx_detailed": 7, "docx_extensive": 10}
+_CREDIT_LOCK = threading.RLock()
+
+def _credit_month_day():
+    now=datetime.utcnow()
+    return now.strftime("%Y-%m"), now.strftime("%Y-%m-%d")
+
+def _credit_key(user):
+    return CREDIT_KEY_PREFIX + re.sub(r"\D", "", str(user or ""))
+
+def _credit_ledger(user, event):
+    # Best-effort audit append after atomic balance change. Never include message content.
+    try:
+        remote_cmd("LPUSH", CREDIT_LEDGER_PREFIX + re.sub(r"\D", "", str(user or "")), json.dumps(event, separators=(",", ":")))
+        remote_cmd("LTRIM", CREDIT_LEDGER_PREFIX + re.sub(r"\D", "", str(user or "")), "0", "99")
+    except Exception as exc:
+        print("[CREDIT LEDGER ERROR]", type(exc).__name__)
+
+def credits_available():
+    return bool(REMOTE_ENABLED)
+
+def credit_status(user):
+    if not REMOTE_ENABLED:
+        return None, "Credits are temporarily unavailable because persistent storage is not configured. No credits were charged."
+    month, day = _credit_month_day()
+    try:
+        raw=remote_cmd("HMGET", _credit_key(user), "month", "balance", "day", "daily_spent", "total_spent")
+        raw=raw or [None]*5
+        current_month, balance, current_day, daily_spent, total_spent = (raw+[None]*5)[:5]
+        if current_month != month:
+            # Monthly allowance refreshes on first access in a new month; no rollover.
+            remote_cmd("HSET", _credit_key(user), "month", month, "balance", str(CREDIT_MONTHLY_ALLOWANCE), "daily_spent", "0")
+            balance, daily_spent = str(CREDIT_MONTHLY_ALLOWANCE), "0"
+        if current_day != day:
+            remote_cmd("HSET", _credit_key(user), "day", day, "daily_spent", "0")
+            daily_spent="0"
+        return {"balance":int(balance or 0),"daily_spent":int(daily_spent or 0),"total_spent":int(total_spent or 0),"month":month,"daily_cap":CREDIT_DAILY_CAP,"monthly_allowance":CREDIT_MONTHLY_ALLOWANCE}, None
+    except Exception as exc:
+        print("[CREDIT STATUS ERROR]", type(exc).__name__)
+        return None, "Credits are temporarily unavailable. Please try again later; no credits were charged."
+
+_CREDIT_DEBIT_LUA = r"""local month=ARGV[1]; local day=ARGV[2]; local allowance=tonumber(ARGV[3]); local cost=tonumber(ARGV[4]); local dailycap=tonumber(ARGV[5]); local desc=ARGV[6]
+local storedmonth=redis.call('HGET',KEYS[1],'month')
+if storedmonth ~= month then redis.call('HSET',KEYS[1],'month',month,'balance',allowance,'daily_spent',0) end
+if redis.call('HGET',KEYS[1],'day') ~= day then redis.call('HSET',KEYS[1],'day',day,'daily_spent',0) end
+local bal=tonumber(redis.call('HGET',KEYS[1],'balance') or '0'); local ds=tonumber(redis.call('HGET',KEYS[1],'daily_spent') or '0')
+if bal < cost then return {0,'BALANCE',bal,ds} end
+if ds+cost > dailycap then return {0,'DAILY_CAP',bal,ds} end
+bal=bal-cost; ds=ds+cost
+redis.call('HSET',KEYS[1],'balance',bal,'daily_spent',ds); redis.call('HINCRBY',KEYS[1],'total_spent',cost)
+redis.call('LPUSH',KEYS[2],cjson.encode({ts=ARGV[7],type='charge',cost=cost,description=desc,balance=bal})); redis.call('LTRIM',KEYS[2],0,99)
+return {1,'OK',bal,ds}"""
+_CREDIT_REFUND_LUA = r"""local month=ARGV[1]; local day=ARGV[2]; local cost=tonumber(ARGV[3]); local desc=ARGV[4]
+if redis.call('HGET',KEYS[1],'month') ~= month then return {0,'MONTH_CHANGED'} end
+local bal=redis.call('HINCRBY',KEYS[1],'balance',cost); local ds=tonumber(redis.call('HGET',KEYS[1],'day') == day and redis.call('HGET',KEYS[1],'daily_spent') or '0'); ds=math.max(0,ds-cost); redis.call('HSET',KEYS[1],'daily_spent',ds)
+redis.call('LPUSH',KEYS[2],cjson.encode({ts=ARGV[5],type='refund',cost=cost,description=desc,balance=bal})); redis.call('LTRIM',KEYS[2],0,99); return {1,'OK',bal,ds}"""
+
+def charge_credits(user, cost, description):
+    """Atomically reserve credits. Returns (reservation_id, user_message); owner bypasses internal credits."""
+    if user == OWNER_NUMBER:
+        return {"user":user,"cost":0,"month":_credit_month_day()[0],"owner_bypass":True}, None
+    if cost <= 0:
+        return {"user":user,"cost":0,"month":_credit_month_day()[0]}, None
+    if not REMOTE_ENABLED:
+        return None, "Credits are temporarily unavailable because persistent storage is not configured. This task was not started."
+    month,day=_credit_month_day()
+    try:
+        result=remote_cmd("EVAL",_CREDIT_DEBIT_LUA,"2",_credit_key(user),CREDIT_LEDGER_PREFIX+re.sub(r"\D","",str(user)),month,day,str(CREDIT_MONTHLY_ALLOWANCE),str(int(cost)),str(CREDIT_DAILY_CAP),str(description)[:80],str(int(time.time())))
+        if not result or int(result[0]) != 1:
+            reason=(result[1] if result and len(result)>1 else "ERROR")
+            if reason == "BALANCE": return None, f"You need {cost} credits for this task, but your balance is {result[2] if len(result)>2 else 0}. Check `.credits` or ask the owner for an allowance."
+            if reason == "DAILY_CAP": return None, f"This would exceed your daily credit limit of {CREDIT_DAILY_CAP}. Try again tomorrow."
+            return None, "I couldn't reserve credits safely, so I didn't start the task. Please try again later."
+        return {"user":user,"cost":int(cost),"month":month,"description":str(description)[:80]}, None
+    except Exception as exc:
+        print("[CREDIT CHARGE ERROR]", type(exc).__name__)
+        return None, "Credits are temporarily unavailable. I didn't start the task or charge you. Please try again later."
+
+def refund_credits(reservation, reason="task failed"):
+    if not reservation or reservation.get("owner_bypass") or not reservation.get("cost") or not REMOTE_ENABLED: return True
+    month,day=_credit_month_day()
+    if month != reservation.get("month"):
+        print("[CREDIT REFUND SKIPPED] month boundary crossed")
+        return False
+    try:
+        result=remote_cmd("EVAL",_CREDIT_REFUND_LUA,"2",_credit_key(reservation["user"]),CREDIT_LEDGER_PREFIX+re.sub(r"\D","",str(reservation["user"])),month,day,str(reservation["cost"]),str(reason)[:80],str(int(time.time())))
+        return bool(result and int(result[0]) == 1)
+    except Exception as exc:
+        print("[CREDIT REFUND ERROR]", type(exc).__name__)
+        return False
+
+def _docx_credit_cost(request_text):
+    t=(request_text or "").lower()
+    if len(t)>850 or any(w in t for w in ("comprehensive", "extensive", "full textbook", "very detailed", "complete course")): return CREDIT_COSTS["docx_extensive"]
+    if len(t)>400 or any(w in t for w in ("detailed", "in-depth", "in depth", "chapter-by-chapter")): return CREDIT_COSTS["docx_detailed"]
+    if len(t)<160 and not re.search(r"\b(diagram|illustration|image|table|tables|references|citations)\b",t): return CREDIT_COSTS["docx_short"]
+    return CREDIT_COSTS["docx_standard"]
+
+def _credit_command(user, text, owner=False):
+    parts=(text or "").split()
+    if len(parts)==1 or parts[0].lower()==".credits":
+        status,err=credit_status(user)
+        if err:return err
+        return (f"〔 ARIA CREDITS 〕\n\nBalance: *{status['balance']} credits*\nSpent today: {status['daily_spent']}/{status['daily_cap']}\nMonthly allowance: {status['monthly_allowance']} (resets monthly; unused credits don't roll over)\n\nTypical costs: `.edu` 2 · image 5 · short Word file 2 · standard Word file 4 · detailed Word file 7 · extensive Word file 10. Provider API limits and quotas are separate.")
+    if len(parts)>=4 and parts[0].lower()==".credits" and parts[1].lower() in {"grant","set"}:
+        if not owner:return "Owner only: `.credits grant <number> <amount>` or `.credits set <number> <amount>`."
+        target=re.sub(r"\D","",parts[2])
+        try: amount=int(parts[3])
+        except ValueError:return "Amount must be a whole number from 0 to 10000."
+        if not target or target==OWNER_NUMBER or amount<0 or amount>10000:return "Use a valid user number and an amount from 0 to 10000."
+        if not REMOTE_ENABLED:return "Credits cannot be changed because Upstash persistent storage is not configured."
+        try:
+            month,day=_credit_month_day(); key=_credit_key(target)
+            # Initialize/reset the month before a grant so first status lookup cannot erase it.
+            credit_status(target)
+            if parts[1].lower()=="grant": remote_cmd("HINCRBY",key,"balance",str(amount)); action=f"Granted {amount} credits"
+            else: remote_cmd("HSET",key,"month",month,"balance",str(amount),"day",day,"daily_spent","0"); action=f"Set balance to {amount} credits"
+            _credit_ledger(target,{"ts":int(time.time()),"type":parts[1].lower(),"cost":amount,"description":"owner adjustment"})
+            return f"{action} for {target}."
+        except Exception as exc:
+            print("[CREDIT ADMIN ERROR]",type(exc).__name__);return "I couldn't confirm the credit change. Check storage before retrying."
+    return "Usage: `.credits` · owner: `.credits grant <number> <amount>` or `.credits set <number> <amount>`."
+
+
+# Last inbound WhatsApp activity: persisted in Upstash so the owner can see when each
+# number last messaged ARIA, including users who have not completed access approval.
+LAST_INBOUND_KEY = "aria:last_inbound_registry"
+_last_inbound_local = {}
+_last_inbound_lock = threading.RLock()
+
+def record_last_inbound(user, timestamp=None):
+    """Record only activity time; do not store message text in this activity registry."""
+    number = re.sub(r"\D", "", str(user or ""))
+    if not number:
+        return False
+    ts = int(timestamp or time.time())
+    with _last_inbound_lock:
+        _last_inbound_local[number] = ts
+    if REMOTE_ENABLED:
+        try:
+            remote_cmd("HSET", LAST_INBOUND_KEY, number, str(ts))
+            return True
+        except Exception as exc:
+            print("[LAST INBOUND STORE ERROR]", type(exc).__name__)
+    return False
+
+def get_last_inbound_registry():
+    data = {}
+    if REMOTE_ENABLED:
+        try:
+            raw = remote_cmd("HGETALL", LAST_INBOUND_KEY)
+            if isinstance(raw, dict):
+                data.update(raw)
+            elif isinstance(raw, list):
+                data.update({str(raw[i]): raw[i+1] for i in range(0, len(raw)-1, 2)})
+        except Exception as exc:
+            print("[LAST INBOUND READ ERROR]", type(exc).__name__)
+    with _last_inbound_lock:
+        for number, ts in _last_inbound_local.items():
+            data.setdefault(number, ts)
+    out = {}
+    for number, ts in data.items():
+        try: out[re.sub(r"\D", "", str(number))] = int(ts)
+        except (ValueError, TypeError): pass
+    return {number: ts for number, ts in out.items() if number}
+
+def _last_inbound_label(timestamp):
+    if not timestamp:
+        return "never recorded"
+    try:
+        when = datetime.fromtimestamp(int(timestamp), _tz())
+        now = datetime.now(_tz())
+        delta = max(0, int((now - when).total_seconds()))
+        if delta < 60: relative = "just now"
+        elif delta < 3600: relative = f"{delta // 60}m ago"
+        elif delta < 86400: relative = f"{delta // 3600}h ago"
+        elif delta < 604800: relative = f"{delta // 86400}d ago"
+        else: relative = when.strftime("%d %b %Y")
+        return f"{when.strftime('%d %b %Y, %H:%M')} ({relative})"
+    except Exception:
+        return "unknown"
+
 def get_users_list():
     with _access_lock:grants=dict(access_grants); pend=dict(pending_requests)
-    users=set(grants)|set(pend)|set(conversation_memory)|set(user_profile)|set(ALLOWED_USERS)|set(ADMIN_NUMBERS); users.discard(OWNER_NUMBER)
+    last_inbound = get_last_inbound_registry()
+    users=set(grants)|set(pend)|set(conversation_memory)|set(user_profile)|set(ALLOWED_USERS)|set(ADMIN_NUMBERS)|set(last_inbound); users.discard(OWNER_NUMBER)
     if not users:return "〔 *ARIA USERS* 〕\n\nNo users recorded."
     def status(n):
         if n in BANNED_USERS:return "BANNED"
@@ -780,7 +976,7 @@ def get_users_list():
         if n in pend:return "DENIED" if pend[n].get("status")=="denied" else "PENDING"
         return "NO ACCESS"
     lines=["〔 *ARIA USERS* 〕","",f"*Active access:* {sum(1 for n in grants if has_access(n))}",f"*Pending requests:* {sum(1 for p in pend.values() if p.get('status')!='denied')}",f"*Banned:* {len(BANNED_USERS)}",f"*Default access length:* {_days_label(ACCESS_DAYS)}",""]
-    lines+=[f"• {n} - {status(n)}" for n in sorted(users)]
+    lines+=[f"• {n} - {status(n)}\n  Last message: {_last_inbound_label(last_inbound.get(n))}" for n in sorted(users)]
     return "\n".join(lines)
 
 # ============================================================
@@ -1752,13 +1948,13 @@ def create_docx_for_user(user, request_text):
             add_to_memory(user, "assistant", f"[Created DOCX: {filename}]\n{content[:DOCUMENT_CONTEXT_LIMIT]}")
             if attached_image and image_bytes:
                 clear_pending_image(user)
-            image_note = " and an embedded image" if image_bytes else ("; no suitable diagram could be downloaded, so no image was embedded" if wants_diagram else "")
+            image_note = " and an embedded image" if image_bytes else ("; the diagram could not be downloaded, so this file contains text only" if wants_diagram else "")
             send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting{image_note}. Review facts/references before submitting or publishing.")
             return True
         return False
     except Exception as e:
         print("[DOCX GENERATION ERROR]", type(e).__name__, str(e)[:600])
-        send_text(user, "I couldn't finish the Word document. Check the server log for the DOCX generation error.")
+        send_text(user, "I couldn't finish the Word document this time. No file was sent; try again shortly. The technical details are saved in the server log.")
         return False
 
 # ============================================================
@@ -2021,8 +2217,8 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
-def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024,temperature=0.7):
-    """Use the Qwen companion on Groq; slightly warmer sampling than Model 1 for natural chat."""
+def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=320,temperature=0.82):
+    """Use Qwen for lightweight, natural companion chat with a conservative output budget."""
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
     started=time.perf_counter()
     temp = max(0.2, min(1.2, float(temperature)))
@@ -2030,8 +2226,8 @@ def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024,temp
         model=GROQ_COMPANION_MODEL,
         messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
         temperature=temp,
-        max_tokens=max(1,min(8192,int(max_tokens))),
-        top_p=.80,
+        max_tokens=max(1,min(480,int(max_tokens))),
+        top_p=.88,
         stream=False,
     )
     text=_extract_groq_text(c)
@@ -2046,6 +2242,14 @@ def get_user_chat_model(from_number):
         choice = "companion"
         user_profile.setdefault(from_number,{})["chat_model"] = choice
     return choice if choice in {"groq","companion","auto"} else "groq"
+
+
+def model_onboarding_text():
+    return ("👋 Welcome to ARIA! First, choose how you'd like to chat.\n\n"
+            "*1 — Thinker*\nGPT-OSS-120B: deeper reasoning, learning, and problem-solving.\n\n"
+            "*2 — Companion*\nQwen 3.8 27B: casual conversation, gist, and a relaxed chat.\n\n"
+            "Reply with `.model 1` or `.model 2`. You can change your choice any time with `.model`.\n"
+            "Your choice is saved for your account. Model 3 (Auto) is also available later via `.model 3`.")
 
 
 def model_command_reply(from_number, argument=""):
@@ -2101,19 +2305,28 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
     privileged = set(ADMIN_NUMBERS); privileged.update({n for n in (OWNER_NUMBER,) if n})
     if from_number not in privileged and not check_rate_limit(from_number,"ai"):
         return "You've reached the hourly AI limit. Please try again in a while."
-    ctx=build_memory_context(from_number,prompt,skip_last_user=True)
-    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {str(prompt)[:MAX_PROMPT_CHARS]}"
-    errors=[]; failures=[]
     preference=get_user_chat_model(from_number)
+    raw_prompt=str(prompt or "").strip()
+    topic_reset=bool(re.search(r"(?i)\b(?:that's enough|that is enough|moving on|change the subject|new topic|forget that for now)\b", raw_prompt))
+    if preference == "companion":
+        ctx = "" if topic_reset else build_memory_context(from_number,prompt,skip_last_user=True,max_chars=1400,recent_messages=6)
+        max_output_tokens = min(max(160,int(max_output_tokens or 320)), 320)
+    else:
+        ctx=build_memory_context(from_number,prompt,skip_last_user=True)
+    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {raw_prompt[:MAX_PROMPT_CHARS]}"
+    errors=[]; failures=[]
     tool_context=build_tool_awareness_context()
     main_system=system+"\n\n"+tool_context
     # Model 2: prioritize natural chat. Slim identity + companion policy.
     # Skip the full tool catalog on ordinary chat so replies do not sound like a menu.
     # Attach tool awareness only when the user is clearly asking about capabilities/commands.
     companion_base=(
-        "You are ARIA, a WhatsApp companion AI for Philimon Dean's instance. "
-        "Be intelligent, direct, and conversational. Do not pretend to be human or claim tools, files, or memories you were not given. "
-        "Never invent sources. For maths, use plain phone-friendly text (3/4, x^2, sqrt(9)), not LaTeX."
+        "You are ARIA, a WhatsApp AI companion. Talk like a sharp, relaxed conversation partner, not a service desk. "
+        "Respond to the actual thought first; be specific, occasionally witty when it fits, and willing to have an opinion with a reason. "
+        "Usually use one to three concise sentences. Do not force a question or offer help at the end of every reply. "
+        "Use recent context only when it clearly relates; if the user changes topic, follow the new topic immediately. "
+        "Do not pretend to be human or invent personal experiences, memories, tools, or sources. "
+        "For maths, use phone-friendly plain text (3/4, x^2, sqrt(9)), not LaTeX."
     )
     _need_tools=bool(re.search(
         r"(?i)\b(?:what can you do|your (?:commands|features|tools|capabilities)|how do i (?:use|make|create)|\.menu|\.help|\.create|\.edit|\.search|\.docx|\.remind|\.task)\b",
@@ -2633,89 +2846,29 @@ def safety_block_message():return "I can help with educational, medical, safety,
 def get_about():return f"""〔 ABOUT ARIA 〕\n\nARIA stands for Advanced Responsive Intelligent Assistant.\n\nARIA is a WhatsApp AI assistant designed for conversation, question-driven vision, image fetching/generation, study help, documents, reminders, guided workflows and diagnostics.\n\nVersion reported by this running process: {VERSION}\nDeployment commit: {DEPLOY_COMMIT or 'not exposed by host'}\nProcess started (UTC): {STARTED_AT_UTC}\nOwner: Philimon Dean\nOwner protection: ENABLED\nContent safety: ENABLED\nReply-to-message context: 48-hour retention (when message was indexed)\nMath formatting: WhatsApp-friendly plain text\nVoice: CONFIGURABLE\n"""
 def get_menu():return f"""〔 ARIA {VERSION} 〕
 
-AI & STUDY
-• .model — choose the main Groq model, Groq companion, or Auto
-• .model 1 (GPT-OSS-120B main) | .model 2 (Qwen 3.8 27B companion) | .model 3 (Auto)
-• .ask <question>
-• Reply to any recent message in WhatsApp and ask a question to use it as context (48-hour retention)
-• Maths: plain-text working and readable equations across normal chat and image solving
-• .explain <topic>
-• .summarize <text>
-• .translate <language> <text>
-• .define <word>
-• .study <topic>
-• .quiz <topic>
-• .edu <subject> (one Wikimedia Commons educational diagram; no alternate-source or AI fallback)
+*AI & CHAT*
+• `.model 1` main · `.model 2` casual companion · `.model 3` auto
+• `.ask <question>` · `.describe` · `.explain <topic>`
 
-LIVE WEB (Exa only)
-• .search <question> (current web lookup)
-• .news <topic>
-• .verify <claim> (fact-check a written claim)
-• Time-sensitive questions may trigger automatic live search
+*STUDY & DOCS*
+• `.define` · `.study` · `.quiz` · `.solve` · `.math` · `.edu`
+• `.docx <request>` create Word file · `.doc <question>` ask about a document
 
-IMAGE TOOLS — CREATE A NEW IMAGE
-• .create <prompt> (Cloudflare only; image style auto-detected)
-• .create --style anime|realistic|fantasy|poster|diagram|general <prompt>
-• .edit <instructions> (send an image first; edits it with Cloudflare)
-• .imagine <prompt> (legacy alias for .create)
+*SEARCH & IMAGES*
+• `.search <question>` · `.news <topic>` · `.summarize <text>` · `.translate <language> <text>`
+• `.create <prompt>` generate · `.edit <instructions>` edit an image
+• `.pint <query>` find existing images; Pinterest OAuth route is on hold
 
-IMAGE TOOLS — FIND EXISTING IMAGES
-• .pint photo <query> — real photographs
-• .pint wallpaper <query> — existing wallpapers/backgrounds
-• .pint anime <character> — existing anime art; also `.pint pfp <character>`
-• .pint comic <query> — comic/character results
-• .pint edu <subject> — educational diagrams
-• .pint pinterest <query> — requires working Pinterest API access
-• Shortcuts: .photo, .wallpaper, .anime, .comic, .edu, .pinterest
-• `.pint <query>` defaults to real photo search; PINT never generates a substitute image.
+*PERSONAL TOOLS*
+• `.remind` · `.reminders` · `.task <goal>`
 
-IMAGE TOOLS — ANALYZE AN IMAGE
-1. Send ARIA an image first.
-2. Ask a question naturally or use .image <question>.
-3. Use .describe for a description, .read for text, .solve/.math for problems.
-• .verify (checks visible AI/editing indicators and may fact-check claims in the image)
+*ACCOUNT*
+• `.access` · `.status` · `.health` · `.credits` · `.usage` · `.about`
+• Owner: `.users` · `.credits grant/set` · `.pending` · `.allow` · `.deny` · `.ban` · `.unban` · `.security`
 
-DOCUMENTS
-• .docx <request> (create an editable Word document)
-• Send PDF/DOCX/TXT/MD/CSV/XLSX/PPTX
-• Ask questions about the latest document
-• .doc <question>
-
-REMINDERS
-• .remind me to study at 8pm
-• .remind me tomorrow at 7am to call John
-• .remind me in 30 minutes to check
-• .reminders
-• .remind cancel <id>
-
-JARVIS WORKFLOWS
-• .task <goal> (create a guided plan)
-• .task next / done / status / cancel
-• .diagnostics (owner/admin only)
-
-SYSTEM
-• .access (your access status)
-• .about
-• .health
-• .voice on/off
-• .status
-• .menu
-• .help <command>
-
-OWNER
-• .users
-• .pending
-• .allow <number> [days] (0 = never expires)
-• .deny <number>
-• .unallow <number>
-• .livetest
-• .ban <number>
-• .unban <number>
-• .lock / .unlock (owner-only emergency lock)
-• .security (owner-only security and quota status)
-
-Legacy .pint1–.pint6 routes remain available.
+Tip: send a command followed by what you need. Use `.help <command>` for details.
 """
+
 def get_status():
     local=datetime.now(_tz()).strftime("%I:%M %p"); return f"""〔 *ARIA STATUS* 〕\n\n*Version (running process):* {VERSION}\n*Started (UTC):* {STARTED_AT_UTC}\n*Runtime:* {get_runtime()}\n*Local Time:* {local}\n*Graph API:* {GRAPH_API_VERSION}\n\n〔 *PROVIDERS* 〕\n*Groq:* {'CONFIGURED' if client else 'NOT CONFIGURED'}\n*Groq Chat:* {CHAT_MODEL}\n*Groq Companion:* {GROQ_COMPANION_MODEL}\n*Groq Vision:* {VISION_MODEL}\n*Chat Companion:* Groq Qwen 3.8 27B (same GROQ_API_KEY)\n*Gemini:* {'CONFIGURED' if GEMINI_API_KEY else 'NOT CONFIGURED'}\n*Gemini Vision Model:* {GEMINI_MODEL}\n*Pinterest:* {'CONFIGURED' if PINTEREST_ACCESS_TOKEN else 'NOT CONFIGURED'}\n*Voice Mode:* {VOICE_MODE}\n*STT:* {STT_MODEL}\n*TTS:* {TTS_MODEL} / {TTS_VOICE}\n\n〔 *SYSTEMS* 〕\n*WhatsApp:* {'CONFIGURED' if WHATSAPP_TOKEN and PHONE_NUMBER_ID else 'NOT CONFIGURED'}\n*Memory / Upstash:* {upstash_status_line()}
 *Compact Profile Memory:* {'PRESENT' if os.path.exists(PROFILE_MEMORY_FILE) else 'WILL BE CREATED ON SAVE'}\n*Exa Search:* {'KEY PRESENT' if EXA_API_KEY else 'NOT CONFIGURED'}\n*Live Search Status:* {live_status_line() if LIVE_ENABLED else 'OFF'}\n*Jarvis Routing:* {'ON' if JARVIS_ENABLED else 'OFF'}\n*Pending Images:* {len(user_waiting_image)}\n*Pending Documents:* {len(document_context)}\n*Reply Context Records:* {len(reply_context_records)} (48h retention; Upstash {'configured' if REMOTE_ENABLED else 'not configured'})\n*Reminders:* {len(reminders)} ({'Upstash configured; connection status above' if REMOTE_ENABLED else 'LOCAL ONLY - lost on redeploy'})\n*Live Search:* {'ON (Exa)' if LIVE_ENABLED else 'OFF - needs EXA_API_KEY and EXA_DAILY_LIMIT > 0'}\n*Image Generation/Editing:* Cloudflare {CLOUDFLARE_IMAGE_MODEL} {'ENABLED' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'DISABLED/NOT CONFIGURED'}; Gemini is vision-only; no fallback; Pollinations not used\n"""
@@ -3414,6 +3567,9 @@ def process_webhook(data):
         user=msg.get("from");
         if not user or is_duplicate(msg.get("id")):return "OK",200
         user = re.sub(r"\D", "", str(user))
+        # Track inbound activity before access checks so the owner can see when a
+        # pending/denied/unauthorized number last contacted the bot. No message text is stored.
+        record_last_inbound(user, msg.get("timestamp") or time.time())
         text=(msg.get("text") or {}).get("body","").strip(); tl=text.lower()
         # Read persistent lock before access-request/authentication handling. If Redis
         # cannot confirm the state, non-owner requests fail closed and cannot call providers.
@@ -3445,6 +3601,12 @@ def process_webhook(data):
             parts = text.split(None, 1)
             arg = parts[1] if len(parts) > 1 else ""
             send_text(user, model_command_reply(user, arg))
+            return "OK",200
+        # First-time model onboarding: each user chooses their own default once.
+        # Existing saved preferences are preserved; users can change later with .model.
+        saved_profile = user_profile.get(user, {}) if isinstance(user_profile, dict) else {}
+        if user != OWNER_NUMBER and not saved_profile.get("chat_model"):
+            send_text(user, model_onboarding_text())
             return "OK",200
         _authed=user
         # Recheck immediately before dispatch. An operation already in flight when the
@@ -3530,6 +3692,12 @@ def process_webhook(data):
         if tl==".pending":send_text(user,get_pending_list() if user==OWNER_NUMBER else "Owner only command.");return "OK",200
         if tl==".access":send_text(user,get_access_status(user));return "OK",200
         if tl==".users":send_text(user,get_users_list() if user==OWNER_NUMBER else "Owner only command.");return "OK",200
+        if tl==".credits" or tl.startswith(".credits "):
+            send_text(user,_credit_command(user,text,owner=(user==OWNER_NUMBER)));return "OK",200
+        if tl==".usage":
+            status,err=credit_status(user)
+            send_text(user,err if err else f"〔 ARIA USAGE 〕\nCredits left: *{status['balance']}*\nDaily use: {status['daily_spent']}/{status['daily_cap']}\nProvider quotas (Groq, Cloudflare, Wikimedia) are separate and may still limit a task.")
+            return "OK",200
 
         if msg.get("type")=="image":
             d=msg.get("image") or {}; mid=d.get("id"); caption=str(d.get("caption") or "").strip(); mime=d.get("mime_type") or "image/jpeg"
@@ -3564,7 +3732,7 @@ def process_webhook(data):
             d=msg.get("document") or {}; mid=d.get("id"); filename=d.get("filename") or "document.txt"
             try:
                 r=requests.get(graph_url(mid),headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=20);r.raise_for_status();info=r.json();url=info.get("url");mime=info.get("mime_type") or "application/octet-stream";rawdoc=requests.get(url,headers={"Authorization":f"Bearer {WHATSAPP_TOKEN}"},timeout=30);rawdoc.raise_for_status();textdoc=parse_document(filename,rawdoc.content,mime);record_message_context(msg.get("id"),user,"inbound","document",textdoc,mid,mime);note=f"\n\nNote: this document is long, so I will use the first {DOCUMENT_CONTEXT_LIMIT:,} characters." if len(textdoc)>DOCUMENT_CONTEXT_LIMIT else "";store_document_context(user,filename,textdoc);send_text(user,f"Document received: *{filename}*\n\nI extracted the readable text. Ask me anything about it, or use `.doc <question>`.{note}")
-            except Exception as e:print("[DOCUMENT ERROR]",repr(e));send_text(user,f"I couldn't read that document.\n\n{str(e)[:500]}")
+            except Exception as e:print("[DOCUMENT ERROR]",type(e).__name__,str(e)[:400]);send_text(user,"I couldn't read that document. Please try a supported DOCX, PDF, TXT or image-based file. The technical details were kept in the server log.")
             return "OK",200
         if msg.get("type")=="audio":
             routed=False
@@ -3647,8 +3815,16 @@ def process_webhook(data):
         if tl.startswith((".search ",".news ")):
             cmd,_,q=text.partition(" ");q=q.strip()[:500]
             if not LIVE_ENABLED:send_text(user,"Live search isn't configured. Add EXA_API_KEY.");return "OK",200
+            reservation,err=charge_credits(user,CREDIT_COSTS["research"],"live research")
+            if err:send_text(user,err);return "OK",200
             send_text(user,"🌐 Searching...")
-            r=smart_ask(f"What is the latest news on: {q}? Give 3-5 short bullet points, each with its date." if cmd.lower()==".news" else q,user,force=True,query=q)
+            try:
+                r=smart_ask(f"What is the latest news on: {q}? Give 3-5 short bullet points, each with its date." if cmd.lower()==".news" else q,user,force=True,query=q)
+            except Exception as exc:
+                print("[RESEARCH TASK ERROR]",type(exc).__name__);r="I couldn't complete that research request just now. Please try again later."
+            if str(r).lower().startswith(("i couldn't complete", "live search isn't configured", "search failed", "provider unavailable")):
+                if not refund_credits(reservation,"research failed"):
+                    send_text(user,"Research failed and I couldn't confirm the credit refund. Please contact the owner before retrying.")
             add_to_memory(user,"assistant",r);send_ai_reply(user,r);return "OK",200
 
         if tl.startswith(".image "):
@@ -3678,7 +3854,16 @@ def process_webhook(data):
             return "OK",200
 
         for command,handler in [(".photo",pint1_unsplash),(".wallpaper",pint2_pexels),(".anime",pint3_anime),(".comic",pint4_comics),(".edu",pint5_education),(".pinterest",pint_pinterest)]:
-            if tl.startswith(command+" "):handler(user,text[len(command):].strip());return "OK",200
+            if tl.startswith(command+" "):
+                if command==".edu":
+                    reservation,err=charge_credits(user,CREDIT_COSTS["edu"],"education diagram")
+                    if err:send_text(user,err);return "OK",200
+                    try: ok=handler(user,text[len(command):].strip())
+                    except Exception as exc: print("[EDU TASK ERROR]",type(exc).__name__);ok=False
+                    if ok is False and not refund_credits(reservation,"education task failed"):
+                        print("[CREDIT REFUND WARNING] education task refund needs manual review")
+                else: handler(user,text[len(command):].strip())
+                return "OK",200
         _usage={".photo":"`.photo <query>`",".wallpaper":"`.wallpaper <query>`",".anime":"`.anime <character>`",".comic":"`.comic <query>`",".edu":"`.edu <subject>` (educational diagrams), e.g. `.edu human heart`",".pinterest":"`.pinterest <query>`"}
         if tl in _usage:send_text(user,f"Usage: {_usage[tl]}");return "OK",200
         if tl==".pint":send_text(user,pint_usage_text());return "OK",200
@@ -3698,7 +3883,14 @@ def process_webhook(data):
             sm=re.match(r"^--style\s+(anime|realistic|fantasy|poster|diagram|general)(?:\s+|$)(.*)$",args,re.I)
             if sm:
                 explicit_style=sm.group(1).lower(); args=sm.group(2).strip()
-            imagine_edit(user,args,explicit_style);return "OK",200
+            reservation,err=charge_credits(user,CREDIT_COSTS["image_edit"],"image edit")
+            if err:send_text(user,err);return "OK",200
+            try: ok=imagine_edit(user,args,explicit_style)
+            except Exception as exc: print("[IMAGE EDIT TASK ERROR]",type(exc).__name__);ok=False
+            if ok is False:
+                if refund_credits(reservation,"image edit failed"):send_text(user,"No credits were kept for the failed edit.")
+                else:send_text(user,"The edit failed. Your credit refund could not be confirmed; please contact the owner before retrying.")
+            return "OK",200
         if tl.startswith(".create ") or tl.startswith(".imagine "):
             args=text.split(None,1)[1].strip()[:1600]; explicit_style=None; explicit_provider=None
             # Accept provider/style options in either order before the actual prompt.
@@ -3714,14 +3906,38 @@ def process_webhook(data):
                 break
             if not args:send_text(user,"Usage: `.create <prompt>`. Optional style: `--style anime|realistic|fantasy|poster|diagram|general`.");return "OK",200
             if not check_rate_limit(user,"create"):send_text(user,"You've reached the hourly image limit. Try again later.");return "OK",200
-            imagine_generate(user,args,explicit_style,explicit_provider);return "OK",200
+            reservation,err=charge_credits(user,CREDIT_COSTS["image_generate"],"image generation")
+            if err:send_text(user,err);return "OK",200
+            try: ok=imagine_generate(user,args,explicit_style,explicit_provider)
+            except Exception as exc: print("[IMAGE GENERATION TASK ERROR]",type(exc).__name__);ok=False
+            if ok is False:
+                if refund_credits(reservation,"image generation failed"):send_text(user,"No credits were kept for the failed image generation.")
+                else:send_text(user,"Image generation failed. Your credit refund could not be confirmed; please contact the owner before retrying.")
+            return "OK",200
         if tl in {".create",".imagine"}:send_text(user,"Usage: `.create <prompt>` (Cloudflare only). Gemini is reserved for vision.");return "OK",200
         if tl.startswith((".docx ",".word ")) or tl in {".docx",".word"}:
             request_text=text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ""
-            create_docx_for_user(user,request_text);return "OK",200
+            if not request_text:
+                send_text(user,"Usage: `.docx <what to write>` — add a topic or document request first.");return "OK",200
+            reservation,err=charge_credits(user,_docx_credit_cost(request_text),"Word document")
+            if err:send_text(user,err);return "OK",200
+            try: ok=create_docx_for_user(user,request_text)
+            except Exception as exc: print("[DOCX TASK ERROR]",type(exc).__name__);ok=False
+            if ok is False:
+                if refund_credits(reservation,"Word document failed"):send_text(user,"No credits were kept for the failed document.")
+                else:send_text(user,"Document creation failed. Your credit refund could not be confirmed; please contact the owner before retrying.")
+            return "OK",200
         if re.match(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b",tl):
             request_text=re.sub(r"^(?:please\s+)?(?:make|create|write|generate|prepare)\s+(?:me\s+)?(?:a\s+)?(?:docx|word document|word file)\b", "", text, count=1, flags=re.I).strip(" :,-")
-            create_docx_for_user(user,request_text or "Create a concise document based on my request.");return "OK",200
+            request_text=request_text or "Create a concise document based on my request."
+            reservation,err=charge_credits(user,_docx_credit_cost(request_text),"Word document")
+            if err:send_text(user,err);return "OK",200
+            try: ok=create_docx_for_user(user,request_text)
+            except Exception as exc: print("[DOCX TASK ERROR]",type(exc).__name__);ok=False
+            if ok is False:
+                if refund_credits(reservation,"Word document failed"):send_text(user,"No credits were kept for the failed document.")
+                else:send_text(user,"Document creation failed. Your credit refund could not be confirmed; please contact the owner before retrying.")
+            return "OK",200
         if tl.startswith(".explain") or re.match(r"^explain\s+.+\s+[1-6]$",tl):
             ct=text[1:] if text.startswith(".") else text; sp=ct.split(None,1); args=sp[1].strip() if len(sp)>1 else ""
             mm=re.match(r"^(.+?)\s+([1-6])$",args)
@@ -3850,38 +4066,6 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
