@@ -987,7 +987,11 @@ def send_image_url(to,image_url,caption=""):
             return True
         raise RuntimeError(s.text[:1000])
     except Exception as e:
-        print("[WHATSAPP IMAGE ERROR]",repr(e))
+        print("[WHATSAPP IMAGE ERROR]", type(e).__name__, str(e)[:500])
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 429 or "429 Client Error" in str(e) or "Too Many Requests" in str(e):
+            send_text(to, "The image source is temporarily limiting downloads (HTTP 429). I couldn't deliver this image. Please try again later; I haven't switched to another source.")
+            return False
         try:
             s=requests.post(message_url,headers=headers,json={"messaging_product":"whatsapp","to":to,"type":"image","image":{"link":image_url,"caption":caption[:1024]}},timeout=30)
             if s.ok:
@@ -1684,6 +1688,39 @@ def create_docx_for_user(user, request_text):
         attached_image = None
     image_bytes = None
     image_mime = None
+    # If no user image is attached but the request explicitly asks for a diagram/image,
+    # try one Wikimedia Commons educational image. Do not use AI generation or another provider.
+    wants_diagram = bool(re.search(r"\b(diagram|illustration|educational image|labelled image|labeled image|figure)\b", request_text, re.I))
+    if not attached_image and wants_diagram:
+        try:
+            topic = re.sub(r"\b(include|embed|insert|add|relevant|educational|labelled|labeled|diagram|illustration|image|figure|inside|within|document|word|docx|please|a|an|the)\b", " ", request_text, flags=re.I)
+            topic = re.sub(r"\s+", " ", topic).strip()[:100] or request_text[:100]
+            matches = [x for x in _wikimedia_edu_candidates(topic) if x.get("score", -1) >= 1 and x.get("url")]
+            if matches:
+                chosen = sorted(matches, key=lambda x: x.get("score", -1), reverse=True)[0]
+                img_resp = requests.get(chosen["url"], headers={"User-Agent":"ARIA-Bot/1.0"}, timeout=20)
+                img_resp.raise_for_status()
+                candidate_bytes = img_resp.content
+                candidate_mime = _guess_image_mime(img_resp.headers.get("Content-Type"), chosen["url"])
+                if candidate_bytes and len(candidate_bytes) <= 5 * 1024 * 1024 and candidate_mime not in {"image/jpeg", "image/png"}:
+                    # Word embeds JPEG/PNG reliably; convert GIF/WebP/SVG previews when Pillow supports them.
+                    try:
+                        from PIL import Image
+                        with Image.open(io.BytesIO(candidate_bytes)) as im:
+                            im.seek(0)
+                            converted = io.BytesIO()
+                            im.convert("RGB").save(converted, format="PNG")
+                            candidate_bytes, candidate_mime = converted.getvalue(), "image/png"
+                    except Exception as convert_error:
+                        print("[DOCX DIAGRAM CONVERT ERROR]", type(convert_error).__name__, str(convert_error)[:200])
+                if candidate_bytes and len(candidate_bytes) <= 5 * 1024 * 1024 and candidate_mime in {"image/jpeg", "image/png"}:
+                    image_bytes, image_mime = candidate_bytes, candidate_mime
+                    diagram_caption = f"Educational diagram: {chosen.get('title','Wikimedia Commons image')} (Wikimedia Commons)"
+                else:
+                    print("[DOCX DIAGRAM] Wikimedia result had unsupported format or size")
+        except Exception as e:
+            print("[DOCX DIAGRAM ERROR]", type(e).__name__, str(e)[:250])
+            # Text document can still be delivered; never claim a diagram was embedded.
     if attached_image:
         try:
             image_b64, image_mime = download_whatsapp_image(attached_image.get("media_id"), attached_image.get("mime_type"))
@@ -1706,13 +1743,17 @@ def create_docx_for_user(user, request_text):
             return send_text(user, "I couldn't generate the document content because the AI provider is unavailable or rate-limited. No file was created.")
         title_match = re.search(r"(?m)^#\s+(.+)$", content)
         title = title_match.group(1).strip()[:180] if title_match else request_text[:100]
-        data = build_docx_bytes(title, content, image_bytes=image_bytes, image_mime=image_mime,
-                                image_caption="Image supplied by the user for this document" if image_bytes else "")
+        image_caption = ("Image supplied by the user for this document" if attached_image else locals().get("diagram_caption", "Relevant educational diagram")) if image_bytes else ""
+        data = build_docx_bytes(title, content, image_bytes=image_bytes, image_mime=image_mime, image_caption=image_caption)
         filename = _docx_filename(title)
         if send_docx_bytes(user, data, filename, f"{title}\nEditable Microsoft Word document created by ARIA."):
-            if image_bytes:
+            # Keep the just-created document available to .doc follow-ups in this process.
+            store_document_context(user, filename, content)
+            add_to_memory(user, "assistant", f"[Created DOCX: {filename}]\n{content[:DOCUMENT_CONTEXT_LIMIT]}")
+            if attached_image and image_bytes:
                 clear_pending_image(user)
-            send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting" + (" plus your embedded image." if image_bytes else ".") + " Review facts/references before submitting or publishing.")
+            image_note = " and an embedded image" if image_bytes else ("; no suitable diagram could be downloaded, so no image was embedded" if wants_diagram else "")
+            send_text(user, f"✅ Word document sent: *{filename}*\n\nIt includes editable headings and formatting{image_note}. Review facts/references before submitting or publishing.")
             return True
         return False
     except Exception as e:
@@ -1790,7 +1831,7 @@ def build_tool_awareness_context():
     capabilities = [
         "Automatic vision Q&A: after a user sends an image, `.image <question>` asks the vision model about that image. Ordinary image-related questions can also be routed to the recent image. `.describe` summarizes the image; `.read` extracts text; `.solve` and `.math` solve visible problems; `.verify` analyzes image credibility and can fact-check visible claims.",
         "Image generation: `.create <prompt>` uses Cloudflare only. Gemini is reserved for vision only; live search uses Exa. `.edit <instructions>` edits the most recently sent image using Cloudflare FLUX.2; send a JPG/PNG first. The original stays in chat. No automatic provider fallback. Diagram prompts receive technical instructions but can still contain errors. Pollinations is not in the generation route. `.image` is NOT image generation.",
-        "Image fetching: `.photo <query>` uses Unsplash; `.wallpaper <query>` tries Wallhaven and configured fallbacks; `.anime <character>` uses Danbooru; `.comic <query>` uses ComicVine; `.edu <subject>` searches Wikimedia Commons for one relevant educational diagram only; if it fails, ARIA reports the failure without trying another source or generating an AI substitute; `.pinterest <query>` requires working Pinterest API access. Natural-language requests to find/show an image may be routed to these existing handlers. Clear requests for study help, quizzes, explanations, translation, summaries, reminders and guided plans can also use natural-language routing.",
+        "Images: `.photo <query>`, `.wallpaper <query>`, `.anime <character>`, `.comic <query>`, `.edu <subject>` (Wikimedia Commons only), `.pinterest <query>`. `.edu` never uses alternate sources or AI-generated fallbacks. Study, translation, summaries, reminders and guided plans can also be requested naturally.",
         "Learning: `.explain <topic>`, `.summarize <text>`, `.translate <language> <text>`, `.define <word>`, `.study <topic>`, `.quiz <topic>`. General math answers should use WhatsApp-friendly plain-text notation.",
         "Native WhatsApp reply context: when a user replies to a stored recent message, use that quoted message as context for the new question. The message index is retained for 48 hours; old/unindexed references must not be guessed.",
         "Documents: `.docx <request>` creates an editable Word file and sends it back in WhatsApp. DOCX generation supports headings, bullets, numbered lists, tables, quotes and code blocks. Send PDF, DOCX, TXT, MD, CSV, XLSX, or PPTX to ask questions about it; `.doc <question>` remains available.",
@@ -1991,7 +2032,6 @@ def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024,temp
         temperature=temp,
         max_tokens=max(1,min(8192,int(max_tokens))),
         top_p=.80,
-        reasoning_effort="none",
         stream=False,
     )
     text=_extract_groq_text(c)
@@ -3810,6 +3850,13 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
 
 
 
