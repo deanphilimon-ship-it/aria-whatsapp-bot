@@ -10,7 +10,7 @@ from groq import Groq
 # VERSION v18.0.7-candidate (Qwen textured memory and owner credits display)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v18.1.0-candidate-memory-hardening-memory-images-roleplay"
+VERSION = "v18.1.1-candidate-deepseek-companion-cutoff-docx"
 # Pinterest OAuth route intentionally unchanged/on hold. Credits require persistent Upstash storage.
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -65,6 +65,9 @@ VERIFY_TOKEN = _env("VERIFY_TOKEN")
 APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "").strip()
 ALLOW_UNSIGNED_WEBHOOKS = os.getenv("ALLOW_UNSIGNED_WEBHOOKS", "false").strip().lower() in {"1", "true", "yes", "on"}
 GROQ_API_KEY = _env("GROQ_API_KEY")
+DEEPSEEK_API_KEY = _env("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 # The companion is Qwen 3.8 27B on Groq, using the same GROQ_API_KEY/account as the primary.
 # CHAT_MODEL remains the primary model; this model gets a distinct conversational style layer.
@@ -2063,7 +2066,7 @@ def build_tool_awareness_context():
     availability = [
         f"Groq chat/vision provider: {'key present' if client else 'key missing'}; chat model={CHAT_MODEL}; vision model={VISION_MODEL}.",
         f"Gemini API: {'key present' if GEMINI_API_KEY else 'key missing'}; vision model={GEMINI_MODEL}; image generation disabled (Cloudflare only); Exa handles live search.",
-        f"Groq companion model: {GROQ_COMPANION_MODEL}; uses the same GROQ_API_KEY as the main model.",
+        f"Companion model: DeepSeek ({DEEPSEEK_MODEL}); Qwen on Groq is retained as an Auto fallback.",
         f"Exa Search API: {'key present' if EXA_API_KEY else 'key missing'}; search type={EXA_SEARCH_TYPE}; daily limit={EXA_DAILY_LIMIT}; Exa handles live search.",
         f"Image search: Unsplash={'configured' if UNSPLASH_KEY else 'not configured'}, ComicVine={'configured' if COMICVINE_KEY else 'not configured'}, Pinterest={'configured' if PINTEREST_ACCESS_TOKEN else 'not configured'}; Wallhaven/Danbooru/Wikimedia/Openverse are public endpoints.",
         f"Image generation/editing: Cloudflare {CLOUDFLARE_IMAGE_MODEL} {'enabled' if ALLOW_CLOUDFLARE_IMAGE_GENERATION and CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else 'disabled/not configured'}; Gemini is vision-only; live search uses Exa; no image-generation fallback; Pollinations is not used.",
@@ -2359,6 +2362,24 @@ def groq_chat_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=1024):
     if not text:raise ValueError("Groq returned an empty response")
     return text
 
+def deepseek_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=900,temperature=0.75):
+    """Call the separately configured DeepSeek companion API."""
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY is missing")
+    started=time.perf_counter()
+    payload={"model":DEEPSEEK_MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":prompt}],
+             "temperature":max(0.1,min(1.2,float(temperature))),"max_tokens":max(1,min(8192,int(max_tokens))),"stream":False}
+    response=requests.post(DEEPSEEK_API_URL,headers={"Authorization":f"Bearer {DEEPSEEK_API_KEY}","Content-Type":"application/json"},json=payload,timeout=90)
+    if not response.ok:
+        raise requests.HTTPError(f"DeepSeek HTTP {response.status_code}: {(response.text or '')[:500]}",response=response)
+    data=response.json(); choices=data.get("choices") or []
+    text=((choices[0].get("message") or {}).get("content") or "").strip() if choices else ""
+    finish=(choices[0].get("finish_reason") or "unknown") if choices else "unknown"
+    usage=data.get("usage") or {}
+    print(f"[AI LATENCY] provider=deepseek model={DEEPSEEK_MODEL} seconds={time.perf_counter()-started:.2f} prompt_chars={len(prompt)} output_chars={len(text)} finish_reason={finish} input_tokens={usage.get('prompt_tokens','n/a')} output_tokens={usage.get('completion_tokens','n/a')}")
+    if not text: raise ValueError(f"DeepSeek companion model {DEEPSEEK_MODEL} returned an empty response")
+    return text
+
 def groq_companion_call(prompt,system=DEFAULT_SYSTEM_PROMPT,max_tokens=320,temperature=0.82):
     """Use Qwen for lightweight, natural companion chat with a conservative output budget."""
     if not client:raise RuntimeError("GROQ_API_KEY is missing")
@@ -2398,22 +2419,22 @@ def model_command_reply(from_number, argument=""):
     choice=argument.strip().lower()
     if not choice:
         current=get_user_chat_model(from_number)
-        current_label={"groq":"Groq main (GPT-OSS-120B)","companion":"Groq companion (Qwen 3.8 27B)","auto":"Automatic"}.get(current,current.title())
+        current_label={"groq":"Groq main (GPT-OSS-120B)","companion":"DeepSeek companion","auto":"Automatic"}.get(current,current.title())
         availability=f"Groq main: {'ready' if client else 'not configured'}\nGroq companion: {GROQ_COMPANION_MODEL if client else 'not configured (needs GROQ_API_KEY)'}\nAPI key: {'present' if GROQ_API_KEY else 'missing'}"
         return (f"〔 ARIA CHAT MODEL 〕\n\nYour choice: *{current_label}*\n\n"
-                "Switch with one number:\n`.model 1` — GPT-OSS-120B, main assistant\n`.model 2` — Qwen 3.8 27B, casual companion chat\n`.model 3` — Auto, main first then companion fallback\n\n"
+                "Switch with one number:\n`.model 1` — GPT-OSS-120B, main assistant\n`.model 2` — DeepSeek, casual companion chat\n`.model 3` — Auto, main first then companion fallback\n\n"
                 f"Provider status:\n{availability}\n\n"
-                "Both models use the same GROQ_API_KEY. The companion has a separate conversational style; it is not a separate provider or extra unlimited quota.")
+                "The main model uses GROQ_API_KEY; the companion uses DEEPSEEK_API_KEY. Qwen remains available as an Auto fallback.")
     aliases={"1":"groq","2":"companion","3":"auto","default":"groq","openai":"groq","automatic":"auto","second":"companion","router":"companion",
              "g":"groq","main":"groq","primary":"groq","groq":"groq","llama":"companion","gemma":"companion","companion":"companion","friend":"companion","or":"companion","o":"companion","openrouter":"companion","a":"auto","both":"auto","auto":"auto"}
     choice=aliases.get(choice,choice)
     if choice not in {"groq","companion","auto"}:
-        return "Choose `.model 1` (GPT-OSS-120B main), `.model 2` (Qwen 3.8 27B companion), or `.model 3` (Auto)."
+        return "Choose `.model 1` (GPT-OSS-120B main), `.model 2` (DeepSeek companion), or `.model 3` (Auto)."
     if choice in {"groq","companion","auto"} and not client:
         return "Groq isn't configured. Add GROQ_API_KEY before selecting a chat model. Your current preference hasn't changed."
     user_profile.setdefault(from_number,{})["chat_model"]=choice
     save_memory()
-    choice_label={"groq":"GPT-OSS-120B main","companion":"Qwen 3.8 27B companion","auto":"Automatic (main then companion)"}.get(choice,choice.title())
+    choice_label={"groq":"GPT-OSS-120B main","companion":"DeepSeek companion","auto":"Automatic (main then companion)"}.get(choice,choice.title())
     return f"Done — your chat model is now *{choice_label}*. Saved for your account only.\n\nSwitch any time: `.model 1` · `.model 2` · `.model 3`."
 
 def _provider_quota_notice(provider, exc, fallback=None):
@@ -2458,7 +2479,12 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
         max_output_tokens = min(max(160,int(max_output_tokens or 320)), 320)
     else:
         ctx=build_memory_context(from_number,prompt,skip_last_user=True)
-    full=f"Current date/time: {_now_str()}\n\n"+(ctx+"\n\n" if ctx else "")+f"User: {raw_prompt[:MAX_PROMPT_CHARS]}"
+    profile=user_profile.get(from_number,{}) if isinstance(user_profile.get(from_number,{}),dict) else {}
+    saved_name=str(profile.get("name") or "").strip()
+    runtime_model=(f"DeepSeek ({DEEPSEEK_MODEL})" if preference=="companion" else (f"Groq ({CHAT_MODEL})" if preference=="groq" else "Auto routing: main GPT-OSS first, then DeepSeek, then Qwen fallback"))
+    identity_context=(f"AUTHORITATIVE PROFILE: The user's saved name is {saved_name!r}. Use it only when natural. Do not infer or invent a different name. If absent, do not address them by a name.\n" if saved_name else "AUTHORITATIVE PROFILE: No name is saved. Do not guess or use names from stale conversation snippets.\n")
+    runtime_context=f"ARIA runtime model selection: {preference}; current route: {runtime_model}. Be accurate if asked which model is responding.\n\n"
+    full=f"Current date/time: {_now_str()}\n\n"+identity_context+runtime_context+(ctx+"\n\n" if ctx else "")+f"User: {raw_prompt[:MAX_PROMPT_CHARS]}"
     errors=[]; failures=[]
     tool_context=build_tool_awareness_context()
     main_system=system+"\n\n"+tool_context
@@ -2493,18 +2519,20 @@ def ai_call(prompt,from_number,system=DEFAULT_SYSTEM_PROMPT,max_output_tokens=10
         if _need_tools: companion_system += "\n\n"+tool_context
     groq_primary_request=lambda:groq_chat_call(full,main_system,max_tokens=max_output_tokens)
     groq_companion_request=lambda:groq_companion_call(full,companion_system,max_tokens=max_output_tokens)
-    if not client:
-        return "AI is not configured.\n\nAdd GROQ_API_KEY to Render."
+    deepseek_companion_request=lambda:deepseek_companion_call(full,companion_system,max_tokens=max_output_tokens)
     if preference=="companion":
-        # Explicit Model 2 means Qwen is the only model allowed to answer.
-        # Never silently substitute the 120B; report failure if the companion fails.
-        providers=[("Groq companion Qwen 3.8 27B",groq_companion_request)]
+        if not DEEPSEEK_API_KEY:
+            return "DeepSeek companion is not configured. Add DEEPSEEK_API_KEY to Render; your selected model has not been changed."
+        # Explicit Model 2 uses DeepSeek only; no silent switch to the main model.
+        providers=[(f"DeepSeek companion {DEEPSEEK_MODEL}",deepseek_companion_request)]
+    elif not client:
+        return "AI is not configured.\n\nAdd GROQ_API_KEY to Render."
     elif preference=="groq":
         # Explicit Model 1 means the 120B is the only model allowed to answer.
         providers=[("Groq main GPT-OSS-120B",groq_primary_request)]
     else:
         # Auto alone uses the main first, then companion as fallback.
-        providers=[("Groq main GPT-OSS-120B",groq_primary_request),("Groq companion Qwen 3.8 27B",groq_companion_request)]
+        providers=[("Groq main GPT-OSS-120B",groq_primary_request),(f"DeepSeek companion {DEEPSEEK_MODEL}",deepseek_companion_request),("Groq Qwen companion fallback",groq_companion_request)]
     configured=[]
     for provider,call_provider in providers:
         configured.append(provider)
@@ -3610,7 +3638,7 @@ RELEASE_ANNOUNCEMENT_VERSION = VERSION
 # Update this environment value as new release features are added; comma-separated items.
 RELEASE_ANNOUNCEMENT_FEATURES = os.getenv(
     "RELEASE_ANNOUNCEMENT_FEATURES",
-    "Cloudflare-only image generation; prompt-based Cloudflare image editing; Gemini retained for vision only (not chat, live search, or image generation); GPT-OSS-120B main plus Qwen conversational companion with strengthened natural-conversation policy; strict .model 1/2/3 routing; existing security and memory preserved"
+    "Cloudflare-only image generation; prompt-based Cloudflare image editing; Gemini retained for vision only (not chat, live search, or image generation); GPT-OSS-120B main plus DeepSeek conversational companion (Qwen retained as Auto fallback) with strengthened natural-conversation policy; strict .model 1/2/3 routing; existing security and memory preserved"
 ).strip()
 RELEASE_ANNOUNCEMENT_ENABLED = os.getenv("RELEASE_ANNOUNCEMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -4075,7 +4103,7 @@ def process_webhook(data):
         if tl==".about":send_text(user,get_about());return "OK",200
         if tl==".status":send_text(user,get_status());return "OK",200
         if tl.startswith(".help"):
-            c=text[5:].strip().lower(); helpmap={".pint":pint_usage_text(),"pint":pint_usage_text(),".photo":"Usage: `.photo <query>` — find a real photo.",".wallpaper":"Usage: `.wallpaper <query>` — find an existing wallpaper.",".anime":"Usage: `.anime <character>` — find existing anime art.",".comic":"Usage: `.comic <character or title>` — find comic/character results.",".edit":"Send an image first, then `.edit <what to change>`, e.g. `.edit turn this into anime art and keep the same person recognizable`.",".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate a new image with Cloudflare: `.create <prompt>`. Optional style: `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`. Gemini is reserved for vision only; live search uses Exa.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Edit it with `.edit <instructions>`. Generate a new image with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’. Image generation/editing uses Cloudflare; Gemini is vision-only.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (Qwen 3.8 27B companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
+            c=text[5:].strip().lower(); helpmap={".pint":pint_usage_text(),"pint":pint_usage_text(),".photo":"Usage: `.photo <query>` — find a real photo.",".wallpaper":"Usage: `.wallpaper <query>` — find an existing wallpaper.",".anime":"Usage: `.anime <character>` — find existing anime art.",".comic":"Usage: `.comic <character or title>` — find comic/character results.",".edit":"Send an image first, then `.edit <what to change>`, e.g. `.edit turn this into anime art and keep the same person recognizable`.",".solve":"Send an image, then `.solve`.",".math":"Send an image, then `.math`. For ordinary typed maths, ask naturally in chat; answers use plain-text notation.",".read":"Send an image, then `.read`.",".describe":"Send an image, then `.describe`; use `.describe ask <question>` for a question about that image.",".verify":"Send an image, then `.verify` (checks edits/AI signs and fact-checks text claims live), or use `.verify <claim>`.",".create":"Generate a new image with Cloudflare: `.create <prompt>`. Optional style: `.create --style anime|realistic|fantasy|poster|diagram|general <prompt>`. Gemini is reserved for vision only; live search uses Exa.",".image":"Send an image, then ask `.image <question>`; use `.describe` for a description. Edit it with `.edit <instructions>`. Generate a new image with `.create <prompt>` or ask naturally, e.g. ‘Draw a fantasy knight’. Image generation/editing uses Cloudflare; Gemini is vision-only.",".access":"Show your own access status.",".model":"Model switch: `.model 1` (GPT-OSS-120B main), `.model 2` (DeepSeek companion), `.model 3` (Auto).",".pending":"Owner only: list pending access requests.",".allow":"Owner only: approve `.allow <number> [days]` (0 = never expires).",".deny":"Owner only: decline `.deny <number>`.",".lock":"Owner only: immediately block everyone except the owner.",".unlock":"Owner only: reopen access while keeping allowlist and quotas active.",".security":"Owner only: show lock, Redis, and usage-limit status.",".remind":"Set reminders with `.remind me to ... at 8pm`, `.remind me tomorrow at 7am to ...`, or `.remind me in 30 minutes to ...`.",".document":"Send a supported document and ask questions about it.",".docx":"Create an editable Word file with `.docx <what to write>`. For an image, send a JPG/PNG first, then send `.docx <request>`; ARIA embeds that image. Supports headings, lists, tables and code blocks."};send_text(user,"Usage: `.help <command>`\n\n"+(helpmap.get(c,"Try `.menu`.") if c else "Try `.help solve`, `.help create`, `.help remind`, or `.help document`."));return "OK",200
         if tl.startswith(".play"):
             q=text[5:].strip();send_text(user,get_youtube_link(q) if q else "Usage: `.play <song name>`");return "OK",200
         if tl.startswith(".edit ") or tl == ".edit":
@@ -4267,6 +4295,110 @@ def ping():return "pong",200
 
 if __name__=="__main__":
     port=int(os.getenv("PORT","5000"));app.run(host="0.0.0.0",port=port)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
