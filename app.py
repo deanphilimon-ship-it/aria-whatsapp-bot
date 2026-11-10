@@ -10,7 +10,7 @@ from groq import Groq
 # VERSION v18.0.7-candidate (Qwen textured memory and owner credits display)
 # ============================================================
 app = Flask(__name__)
-VERSION = "v18.1.1-candidate-deepseek-companion-cutoff-docx"
+VERSION = "v18.1.1"
 # Pinterest OAuth route intentionally unchanged/on hold. Credits require persistent Upstash storage.
 start_time = time.time()
 STARTED_AT_UTC = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
